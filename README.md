@@ -1,6 +1,9 @@
-# AgentPet v1.4.1 · 智能桌宠助手
+# AgentPet v1.4.2 · 智能桌宠助手
 
 多 Agent 智能协同桌面宠物挂件，支持 **Antigravity**（反重力）、**Codex** 与 **DeepSeek Harness**（DSH）工作状态联动与额度实时监控。
+
+## 📝 v1.4.2 更新日志
+- 修复桌面快捷方式创建和特殊路径兼容，快捷方式图标更新为新版 Claude 娘立绘。
 
 ## 📝 v1.4.1 更新日志
 - **小型视觉与拖动修正**：
@@ -115,3 +118,5 @@ AgentPet 的诞生离不开开源社区优秀前作的启发与技术滋养，�
 - **[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)**：提供 Agent 状态分级文案灵感及 DeepSeek Harness 状态联动思路。本项目遵循其二创约定附上项目地址。
 - **社区 AI 萌娘化同人创作者**：感谢 ZipZipPipe 等社区创作者为 Claude娘、GPT娘与 Gemini娘提供的原案灵感与同人设计支持。
 - **AI 辅助开发**：本项目代码、调试、测试和文档整理使用了 AI 工具辅助；代码仍由项目维护者负责审阅、测试和发布。
+
+- 参考项目：[JamesBrynes/ClaudePet](https://github.com/JamesBrynes/ClaudePet/releases/tag/win)。

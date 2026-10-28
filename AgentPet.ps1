@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.4.1"
+$script:AppVersion = "1.4.2"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================

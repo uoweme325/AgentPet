@@ -21,3 +21,4 @@
 ## 隐私说明
 
 本项目按设计在本地读取 Agent 工作状态和额度快照，不包含外部网络数据上传、遥测或数据回传逻辑；具体使用环境仍应以用户自行审阅的源码和配置为准。
+- 参考项目：[JamesBrynes/ClaudePet](https://github.com/JamesBrynes/ClaudePet/releases/tag/win)。
