@@ -32,7 +32,7 @@
   - **托盘生命周期安全管控**：退出时完整释放 NotifyIcon 与菜单句柄，沿用严格的 monitor 进程树、PID 与 Mutex 清理机制。
 
 ## 📝 v1.2.0 更新日志
-- **三路 Agent 审批与权限感知（WO-12 ~ WO-17）**：
+- **三路 Agent 审批与权限感知**：
   - **Antigravity 权限审批感知**：精准跟踪 in-flight 非终态任务，动态识别 Transcript 停滞与审批弹窗挂起，解除静态缓存封冻。
   - **Codex 审批与工具停滞检测**：基于 `closedCallIds` 实时配对 `custom_tool_call`，未决工具调用即时触发等待感知。
   - **DSH 交互停滞分析**：毫秒级跟踪 pendingCalls，动态对比停滞阈值，多任务取最新启动时间防误报。
