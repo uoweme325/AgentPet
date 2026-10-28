@@ -4,7 +4,7 @@
 
 - 修复桌面快捷方式创建，支持中文、空格和单引号路径，并改用新版 Claude 娘图标。
 - 项目首页预览更新为新版 Claude 娘立绘。
-- 增加对 [JamesBrynes/ClaudePet](https://github.com/JamesBrynes/ClaudePet/releases/tag/win) 的参考声明，保留 GPT-Niang、dsh-pet 和 AI 辅助创作说明。
+- 补充并整理 GPT-Niang、ClaudePet、dsh-pet、DeepSeek-Balance-Whale-Widget 和社区同人创作者的参考致谢，详见 README 与 THIRD_PARTY_NOTICES.md。
 
 ## 使用
 

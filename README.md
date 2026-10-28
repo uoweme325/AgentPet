@@ -86,11 +86,6 @@
 - **程序代码**：本项目代码基于 [MIT License](LICENSE) 协议开源，任何人均可自由学习、使用与分发。
 - **立绘美术与音频素材**：桌宠形象源于社区优秀的 AI 萌化衍生同人设计（Claude娘、GPT娘、Gemini娘），音频为交互音效。相关素材版权归原设计者与社区所有，**仅供个人学习与日常交流使用，严禁用于任何商业用途**。
 - 特别感谢开源社区创作者提供的灵感与二创美术支持！
-## 🙏 致谢、参考与创作说明
-
-- 本项目的桌宠形象、部分视觉方向与交互灵感参考了 [T7moris/GPT-Niang](https://github.com/T7moris/GPT-Niang/releases)，特此致谢。
-- 项目内角色立绘、预览图及部分视觉素材由 AI 辅助生成或处理；素材不主张替代原始创作者的权利，使用和再分发请遵守相关平台、模型与素材授权规则。
-- 本项目代码由作者编写，并使用 AI 工具辅助设计、实现、调试和文档整理；代码仍由项目维护者负责审阅、测试和发布。
 ## ⚖️ 免责与版权声明 (Disclaimer & Credits)
 
 1. **非官方声明 (Unofficial Project)**：
@@ -110,13 +105,23 @@
    - 本项目基于 [MIT License](LICENSE) 协议按“原样（AS-IS）”免费提供，不提供任何明示或暗示的担保。
    - 额度监控与倒计时数据来源于本地估算与快照分析，仅供参考，具体请以各平台官方仪表盘为准。使用者需自行承担使用本软件的一切操作风险。
 
-## 🙏 鸣谢与参考项目 (Acknowledgments & References)
+## 🙏 鸣谢与参考项目
 
-AgentPet 的诞生离不开开源社区优秀前作的启发与技术滋养，特此向以下项目与创作者致以感谢：
+### 技术底座与架构原型
 
-- **[T7moris/GPT-Niang](https://github.com/T7moris/GPT-Niang)**：为本项目的 WPF 悬浮窗架构、圆角菜单与基础桌面交互提供了参考。
-- **[PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)**：提供 Agent 状态分级文案灵感及 DeepSeek Harness 状态联动思路。本项目遵循其二创约定附上项目地址。
-- **社区 AI 萌娘化同人创作者**：感谢 ZipZipPipe 等社区创作者为 Claude娘、GPT娘与 Gemini娘提供的原案灵感与同人设计支持。
-- **AI 辅助开发**：本项目代码、调试、测试和文档整理使用了 AI 工具辅助；代码仍由项目维护者负责审阅、测试和发布。
+- [T7moris/GPT-Niang](https://github.com/T7moris/GPT-Niang)：为本项目提供了重要的技术底座与架构参考，包括 Windows PowerShell + WPF 轻量架构、透明悬浮窗、右键菜单、工作区贴边交互，以及 `press.wav` / `release.wav` 提示音。
 
-- 参考项目：[JamesBrynes/ClaudePet](https://github.com/JamesBrynes/ClaudePet/releases/tag/win)。
+### 功能机制与状态联动
+
+- [JamesBrynes/ClaudePet](https://github.com/JamesBrynes/ClaudePet)：额度看板、工作和思考状态切换立绘，以及空闲时打瞌睡等交互的灵感来源。
+- [PC2005-cloud/dsh-pet](https://github.com/PC2005-cloud/dsh-pet)：DeepSeek Harness（DSH）状态分级与多会话联动的参考来源。
+
+### 陪伴台词
+
+- [MeteorNOX/DeepSeek-Balance-Whale-Widget](https://github.com/MeteorNOX/DeepSeek-Balance-Whale-Widget)：`assets/quotes.json` 中部分休息提醒和拆解问题类陪伴台词的灵感来源；相关来源亦由上游 `quotes-LICENSE.txt` 致谢。
+
+### 角色美术与同人人设
+
+- ZipZipPipe 等社区同人创作者：感谢 Claude 娘橘白礼服与向日葵发饰、GPT 娘白龙娘设定及 Gemini 娘双子形象等同人设计与原案灵感。
+
+角色立绘及部分视觉素材由 AI 辅助生成或处理；代码、调试、测试和文档也使用了 AI 工具辅助。项目维护者负责审阅和发布。各参考项目及其素材的权利和许可条件以各自原始声明为准。
