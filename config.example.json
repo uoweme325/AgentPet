@@ -1,0 +1,19 @@
+{
+  "Character": "claude",
+  "Pose": "auto",
+  "Scale": 1.0,
+  "BubbleScale": 1.0,
+  "FontScale": 1.0,
+  "SoundEnabled": true,
+  "SoundVolume": 850,
+  "Topmost": true,
+  "SleepSeconds": 60,
+  "AutoQuoteMinutes": 3,
+  "BubbleMode": "quota",
+  "TrayEnabled": true,
+  "StartHidden": false,
+  "StallDetectSeconds": 45,
+  "PauseMonitorUntil": 0,
+  "Left": -1,
+  "Top": -1
+}
