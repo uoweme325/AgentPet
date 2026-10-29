@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.4.2"
+$script:AppVersion = "1.5.0"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -53,6 +53,7 @@ function Write-PetLog([string]$msg) {
 
 $script:LastThrottledLogs = @{}
 function Log-Throttled([string]$key, [string]$msg, [int]$intervalSec = 10) {
+    if (-not $script:LastThrottledLogs) { $script:LastThrottledLogs = @{} }
     $now = [DateTime]::UtcNow
     if (-not $script:LastThrottledLogs.ContainsKey($key) -or ($now - $script:LastThrottledLogs[$key]).TotalSeconds -ge $intervalSec) {
         $script:LastThrottledLogs[$key] = $now
@@ -69,6 +70,8 @@ $ConfigBakPath = Join-Path $BaseDir "config.json.bak"
 $RuntimeStatusPath = Join-Path $BaseDir "runtime-status.json"
 $RuntimeQuotaPath = Join-Path $BaseDir "runtime-quota.json"
 $RefreshFlagPath = Join-Path $BaseDir "refresh-quota.flag"
+$RuntimeBalancePath = Join-Path $BaseDir "runtime-balance.json"
+$RefreshBalanceFlagPath = Join-Path $BaseDir "refresh-balance.flag"
 $MonitorScript = Join-Path (Join-Path $BaseDir "runtime") "agent-monitor.mjs"
 $script:AppPidPath = Join-Path (Join-Path $BaseDir "runtime") "app.pid"
 $script:MonPidPath = Join-Path (Join-Path $BaseDir "runtime") "monitor.pid"
@@ -115,7 +118,7 @@ $NativeCode = @"
 using System;
 using System.Runtime.InteropServices;
 
-public static class NiangPetNative {
+public static class AgentPetNative {
     public const int GWL_EXSTYLE = -20;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
     public const int WS_EX_NOACTIVATE = 0x08000000;
@@ -148,6 +151,86 @@ public static class NiangPetNative {
         int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
         SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
     }
+
+    public static int[] ComputeAlphaBounds(byte[] bytes, int width, int height, int stride) {
+        int minX = width, maxX = 0, minY = height, maxY = 0;
+        for (int y = 0; y < height; y++) {
+            int row = y * stride;
+            for (int x = 0; x < width; x++) {
+                if (bytes[row + (x * 4) + 3] > 12) {
+                    if (x < minX) minX = x;
+                    if (x > maxX) maxX = x;
+                    if (y < minY) minY = y;
+                    if (y > maxY) maxY = y;
+                }
+            }
+        }
+        if (minX > maxX) { minX = 0; maxX = width - 1; minY = 0; maxY = height - 1; }
+        return new int[] { minX, minY, maxX, maxY };
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct RECT {
+        public int Left;
+        public int Top;
+        public int Right;
+        public int Bottom;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct MONITORINFO {
+        public int cbSize;
+        public RECT rcMonitor;
+        public RECT rcWork;
+        public uint dwFlags;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct POINT {
+        public int x;
+        public int y;
+    }
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr MonitorFromPoint(POINT pt, uint dwFlags);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool GetMonitorInfo(IntPtr hMonitor, ref MONITORINFO lpmi);
+
+    [DllImport("shcore.dll", SetLastError = true)]
+    public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
+
+    public static double[] GetMonitorWorkAreaDIP(int physicalX, int physicalY) {
+        try {
+            POINT pt = new POINT { x = physicalX, y = physicalY };
+            IntPtr hMon = MonitorFromPoint(pt, 2); // 2 = MONITOR_DEFAULTTONEAREST
+            if (hMon != IntPtr.Zero) {
+                MONITORINFO mi = new MONITORINFO();
+                mi.cbSize = Marshal.SizeOf(typeof(MONITORINFO));
+                if (GetMonitorInfo(hMon, ref mi)) {
+                    uint dpiX = 96, dpiY = 96;
+                    try {
+                        GetDpiForMonitor(hMon, 0, out dpiX, out dpiY); // 0 = MDT_EFFECTIVE_DPI
+                    } catch {
+                        dpiX = 96; dpiY = 96;
+                    }
+                    if (dpiX == 0) dpiX = 96;
+                    if (dpiY == 0) dpiY = 96;
+                    double scaleX = dpiX / 96.0;
+                    double scaleY = dpiY / 96.0;
+                    return new double[] {
+                        mi.rcWork.Left / scaleX,
+                        mi.rcWork.Top / scaleY,
+                        mi.rcWork.Right / scaleX,
+                        mi.rcWork.Bottom / scaleY,
+                        scaleX,
+                        scaleY
+                    };
+                }
+            }
+        } catch {}
+        return null;
+    }
 }
 "@
 Add-Type -TypeDefinition $NativeCode -ReferencedAssemblies WindowsBase
@@ -166,13 +249,18 @@ $DefaultConfig = [ordered]@{
     Topmost           = $true
     SleepSeconds      = 60
     AutoQuoteMinutes  = 3          # 0 = off, else minutes between random idle quotes
-    BubbleMode        = "quota"    # "quota" or "quote"
-    TrayEnabled       = $true       # show a notification-area icon
-    StartHidden       = $false      # start with the pet hidden but tray available
-    StallDetectSeconds = 45         # 0 = disable stalled inference
-    PauseMonitorUntil  = 0          # UTC milliseconds; 0 = normal broadcasting
-    Left              = -1
-    Top               = -1
+    BubbleMode             = "quota"    # "quota", "deepseek", or "quote"
+    TrayEnabled            = $true       # show a notification-area icon
+    StartHidden            = $false      # start with the pet hidden but tray available
+    StallDetectSeconds     = 45         # 0 = disable stalled inference
+    PauseMonitorUntil      = 0          # UTC milliseconds; 0 = normal broadcasting
+    LowBalanceAlertEnabled = $true
+    LowBalanceCnyThreshold = 5.0
+    DeepSeekBalanceEnabled    = $true    # enable DeepSeek balance via DSH host
+    DshPort                   = 0        # 0 = auto discover
+    DshBaseUrl                = ""       # optional explicit loopback base url
+    Left                   = -1
+    Top                    = -1
 }
 
 $Config = [ordered]@{}
@@ -247,6 +335,9 @@ function Load-Config {
     } else {
         foreach ($k in $DefaultConfig.Keys) { $Config[$k] = $DefaultConfig[$k] }
         Save-Config
+    }
+    if ($Config.BubbleMode -notin @("quota", "deepseek", "quote")) {
+        $Config.BubbleMode = "quota"
     }
     $bs = if ($Config.BubbleScale) { [double]$Config.BubbleScale } else { 1.0 }
     $Config.BubbleScale = [Math]::Max(0.8, [Math]::Min(1.3, $bs))
@@ -364,7 +455,6 @@ function Get-RandomCharacterQuote([string]$charKey) {
 # 5. Load XAML & Bind UI Controls
 # ============================================================================
 $XamlPath = Join-Path $BaseDir "AgentPet.xaml"
-if (-not (Test-Path $XamlPath)) { $XamlPath = Join-Path $BaseDir "NiangPet.xaml" }
 if (-not (Test-Path $XamlPath)) {
     Write-PetLog "FATAL: AgentPet.xaml not found in $BaseDir"
     [System.Windows.Forms.MessageBox]::Show("找不到 AgentPet.xaml 文件，请检查安装完整性！`n路径: $BaseDir", "AgentPet 启动失败", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
@@ -425,6 +515,25 @@ $PetHost          = $Window.FindName("PetHost")
 $PetScale         = $Window.FindName("PetScale")
 $PetImage         = $Window.FindName("PetImage")
 
+# Bind DeepSeek Panel Controls
+$DeepSeekPanel           = $Window.FindName("DeepSeekPanel")
+$DeepSeekIcon            = $Window.FindName("DeepSeekIcon")
+$DeepSeekHeader          = $Window.FindName("DeepSeekHeader")
+$DeepSeekBadge           = $Window.FindName("DeepSeekBadge")
+$DeepSeekBadgeText       = $Window.FindName("DeepSeekBadgeText")
+$DeepSeekStatusNotice    = $Window.FindName("DeepSeekStatusNotice")
+$RefreshDeepSeekBtn      = $Window.FindName("RefreshDeepSeekBtn")
+$DeepSeekContentGrid     = $Window.FindName("DeepSeekContentGrid")
+$DeepSeekOkPanel         = $Window.FindName("DeepSeekOkPanel")
+$DeepSeekCurrencyLabel   = $Window.FindName("DeepSeekCurrencyLabel")
+$DeepSeekAvailableNotice = $Window.FindName("DeepSeekAvailableNotice")
+$DeepSeekTotalText       = $Window.FindName("DeepSeekTotalText")
+$DeepSeekBreakdownText   = $Window.FindName("DeepSeekBreakdownText")
+$DeepSeekPricingLink     = $Window.FindName("DeepSeekPricingLink")
+$DeepSeekMsgPanel        = $Window.FindName("DeepSeekMsgPanel")
+$DeepSeekMsgTitle        = $Window.FindName("DeepSeekMsgTitle")
+$DeepSeekMsgDetail       = $Window.FindName("DeepSeekMsgDetail")
+
 # ============================================================================
 # 6. Preload All Sprites & Compute Pixel Alpha Masks (Robust Fallbacks)
 # ============================================================================
@@ -449,11 +558,18 @@ Get-ChildItem $CharDir -Filter "*.png" | ForEach-Object {
         $stride = $w * 4
         $bytes = New-Object byte[] ($stride * $h)
         $conv.CopyPixels($bytes, $stride, 0)
+        $boundsArr = [AgentPetNative]::ComputeAlphaBounds($bytes, $w, $h, $stride)
         $script:AlphaCache[$baseName] = @{
-            Width  = $w
-            Height = $h
-            Stride = $stride
-            Bytes  = $bytes
+            Width     = $w
+            Height    = $h
+            Stride    = $stride
+            Bytes     = $bytes
+            AlphaMinX = $boundsArr[0]
+            AlphaMinY = $boundsArr[1]
+            AlphaMaxX = $boundsArr[2]
+            AlphaMaxY = $boundsArr[3]
+            AlphaW    = [double]($boundsArr[2] - $boundsArr[0] + 1)
+            AlphaH    = [double]($boundsArr[3] - $boundsArr[1] + 1)
         }
     } catch {}
 }
@@ -694,24 +810,71 @@ function Update-FontScale {
     $QuoteText.LineHeight      = [Math]::Round(20.0 * $fs, 1)
 }
 
-function Get-CurrentScreenBounds([double]$x, [double]$y, [double]$w, [double]$h) {
+function Get-CharacterVisibleGeometry {
+    $sc = if ($Window.Width -gt 0) { [double]$Window.Width / 390.0 } elseif ($null -ne $Config.Scale) { [double]$Config.Scale } else { 1.0 }
+    if ($sc -lt 0.6) { $sc = 0.6 }
+    if ($sc -gt 1.8) { $sc = 1.8 }
+
+    $char = [string]$Config.Character
+    $idleKey = "$char-idle"
+    $alphaInfo = if ($script:AlphaCache.ContainsKey($idleKey)) { $script:AlphaCache[$idleKey] } else { $null }
+
+    $rawW = if ($alphaInfo -and $alphaInfo.Width -gt 0) { [double]$alphaInfo.Width } else { 384.0 }
+    $rawH = if ($alphaInfo -and $alphaInfo.Height -gt 0) { [double]$alphaInfo.Height } else { 384.0 }
+    $alphaMinX = if ($alphaInfo -and $null -ne $alphaInfo.AlphaMinX) { [double]$alphaInfo.AlphaMinX } else { 13.0 }
+    $alphaMinY = if ($alphaInfo -and $null -ne $alphaInfo.AlphaMinY) { [double]$alphaInfo.AlphaMinY } else { 13.0 }
+    $alphaW    = if ($alphaInfo -and $null -ne $alphaInfo.AlphaW) { [double]$alphaInfo.AlphaW } else { 357.0 }
+    $alphaH    = if ($alphaInfo -and $null -ne $alphaInfo.AlphaH) { [double]$alphaInfo.AlphaH } else { 367.0 }
+
+    $profile = if ($script:CharacterProfiles.ContainsKey($char)) { $script:CharacterProfiles[$char] } else { @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 } }
+    $pScale = if ($profile.Scale) { [double]$profile.Scale } else { 1.0 }
+    $pOffX = if ($profile.OffsetX) { [double]$profile.OffsetX } else { 0.0 }
+    $pOffY = if ($profile.OffsetY) { [double]$profile.OffsetY } else { 0.0 }
+
+    $fitScale = (204.0 * $pScale) / [Math]::Max($rawW, $rawH)
+    $fitOffX = $pOffX + ($alphaMinX * $fitScale)
+    $fitOffY = $pOffY + ($alphaMinY * $fitScale)
+    $visW390 = $alphaW * $fitScale
+    $visH390 = $alphaH * $fitScale
+
+    $stageBaseLeft = 8.0 + 154.0 + $fitOffX
+    $stageBaseTop  = 8.0 + 170.0 + $fitOffY
+
+    $isFlipped = ($FacingScale -and $FacingScale.ScaleX -lt 0)
+    $stageLeft = if ($isFlipped) { 390.0 - ($stageBaseLeft + $visW390) } else { $stageBaseLeft }
+    $stageTop  = $stageBaseTop
+
+    return @{
+        RelLeft   = $stageLeft * $sc
+        RelTop    = $stageTop  * $sc
+        VisWidth  = $visW390   * $sc
+        VisHeight = $visH390   * $sc
+    }
+}
+
+function Get-CurrentScreenBounds([double]$charCenterX, [double]$charCenterY) {
     try {
-        $dpiX = 1.0; $dpiY = 1.0
+        $currDpiX = 1.0; $currDpiY = 1.0
         $source = [System.Windows.PresentationSource]::FromVisual($Window)
         if ($source -and $source.CompositionTarget) {
-            $dpiX = $source.CompositionTarget.TransformToDevice.M11
-            $dpiY = $source.CompositionTarget.TransformToDevice.M22
+            $currDpiX = [double]$source.CompositionTarget.TransformToDevice.M11
+            $currDpiY = [double]$source.CompositionTarget.TransformToDevice.M22
         }
-        $cx = ($x + ($w * 0.5)) * $dpiX
-        $cy = ($y + ($h * 0.5)) * $dpiY
-        $pt = New-Object System.Drawing.Point([int]$cx, [int]$cy)
-        $scr = [System.Windows.Forms.Screen]::FromPoint($pt)
-        if ($scr) {
+
+        # Convert candidate WPF DIP center to physical screen coordinates
+        $physX = [int][Math]::Round($charCenterX * $currDpiX)
+        $physY = [int][Math]::Round($charCenterY * $currDpiY)
+
+        # Call Win32 PerMonitor DPI & working area calculation
+        $workAreaDip = [AgentPetNative]::GetMonitorWorkAreaDIP($physX, $physY)
+        if ($workAreaDip -and $workAreaDip.Length -ge 6) {
             return @{
-                Left   = $scr.WorkingArea.Left / $dpiX
-                Top    = $scr.WorkingArea.Top / $dpiY
-                Right  = $scr.WorkingArea.Right / $dpiX
-                Bottom = $scr.WorkingArea.Bottom / $dpiY
+                Left   = $workAreaDip[0]
+                Top    = $workAreaDip[1]
+                Right  = $workAreaDip[2]
+                Bottom = $workAreaDip[3]
+                DpiX   = $workAreaDip[4]
+                DpiY   = $workAreaDip[5]
             }
         }
     } catch {}
@@ -723,32 +886,50 @@ function Get-CurrentScreenBounds([double]$x, [double]$y, [double]$w, [double]$h)
         Top    = $vt
         Right  = $vl + [System.Windows.SystemParameters]::VirtualScreenWidth
         Bottom = $vt + [System.Windows.SystemParameters]::VirtualScreenHeight
+        DpiX   = 1.0
+        DpiY   = 1.0
     }
 }
 
-function Get-CharacterDragBounds([double]$x, [double]$y) {
-    $w = if ($PetImage.ActualWidth -gt 1) { [double]$PetImage.ActualWidth } else { [double]$PetImage.Width }
-    $h = if ($PetImage.ActualHeight -gt 1) { [double]$PetImage.ActualHeight } else { [double]$PetImage.Height }
-    if ($w -le 1) { $w = 204.0 }; if ($h -le 1) { $h = 204.0 }
-    $rootX = [System.Windows.Controls.Canvas]::GetLeft($Root); $rootY = [System.Windows.Controls.Canvas]::GetTop($Root)
-    $petX = [System.Windows.Controls.Canvas]::GetLeft($PetHost); $petY = [System.Windows.Controls.Canvas]::GetTop($PetHost)
-    $imgX = [System.Windows.Controls.Canvas]::GetLeft($PetImage); $imgY = [System.Windows.Controls.Canvas]::GetTop($PetImage)
-    foreach ($v in @('rootX','rootY','petX','petY','imgX','imgY')) { if ([double]::IsNaN([double](Get-Variable $v -ValueOnly))) { Set-Variable $v 0.0 } }
-    $offsetX = [double]$rootX + [double]$petX + [double]$imgX
-    $offsetY = [double]$rootY + [double]$petY + [double]$imgY
-    $bounds = Get-CurrentScreenBounds $x $y $Window.Width $Window.Height
+function Get-CharacterDragBounds([double]$candidateLeft, [double]$candidateTop) {
+    $geom = Get-CharacterVisibleGeometry
+    $charRelLeft = [double]$geom.RelLeft
+    $charRelTop  = [double]$geom.RelTop
+    $charVisW    = [double]$geom.VisWidth
+    $charVisH    = [double]$geom.VisHeight
+
+    $charCenterX = $candidateLeft + $charRelLeft + ($charVisW * 0.5)
+    $charCenterY = $candidateTop  + $charRelTop  + ($charVisH * 0.5)
+
+    $bounds = Get-CurrentScreenBounds $charCenterX $charCenterY
+
+    # Rule: Character visible body allowed to move out by at most 50% in all 4 directions
+    $minLeft = $bounds.Left   - (0.5 * $charVisW) - $charRelLeft
+    $maxLeft = $bounds.Right  - (0.5 * $charVisW) - $charRelLeft
+    $minTop  = $bounds.Top    - (0.5 * $charVisH) - $charRelTop
+    $maxTop  = $bounds.Bottom - (0.5 * $charVisH) - $charRelTop
+
+    # Robust fallback for tiny screen or inverted interval
+    if ($minLeft -gt $maxLeft) { $maxLeft = $minLeft }
+    if ($minTop  -gt $maxTop)  { $maxTop  = $minTop }
+
     return @{
-        MinLeft = $bounds.Left + ($w * 0.5) - $offsetX
-        MaxLeft = $bounds.Right - ($w * 0.5) - $offsetX
-        MinTop  = $bounds.Top + ($h * 0.5) - $offsetY
-        MaxTop  = $bounds.Bottom - ($h * 0.5) - $offsetY
+        MinLeft = $minLeft
+        MaxLeft = $maxLeft
+        MinTop  = $minTop
+        MaxTop  = $maxTop
+        Bounds  = $bounds
+        Geom    = $geom
     }
 }
 
 function Clamp-CharacterWindowPosition {
-    $b = Get-CharacterDragBounds $Window.Left $Window.Top
-    $Window.Left = [Math]::Max($b.MinLeft, [Math]::Min($b.MaxLeft, [double]$Window.Left))
-    $Window.Top  = [Math]::Max($b.MinTop, [Math]::Min($b.MaxTop, [double]$Window.Top))
+    $curLeft = if (-not [double]::IsNaN($Window.Left)) { [double]$Window.Left } elseif ($null -ne $Config.Left -and $Config.Left -ne -1) { [double]$Config.Left } else { 0.0 }
+    $curTop  = if (-not [double]::IsNaN($Window.Top))  { [double]$Window.Top }  elseif ($null -ne $Config.Top -and $Config.Top -ne -1)   { [double]$Config.Top }  else { 0.0 }
+
+    $b = Get-CharacterDragBounds $curLeft $curTop
+    $Window.Left = [Math]::Max($b.MinLeft, [Math]::Min($b.MaxLeft, $curLeft))
+    $Window.Top  = [Math]::Max($b.MinTop,  [Math]::Min($b.MaxTop,  $curTop))
 }
 
 function Update-Scale {
@@ -756,7 +937,6 @@ function Update-Scale {
     if ($sc -lt 0.6) { $sc = 0.6 }
     if ($sc -gt 1.8) { $sc = 1.8 }
 
-    # P2-UI-1: Support multi-monitor negative coordinates & edge docking without clipping
     $oldW = if ($Window.ActualWidth -gt 0) { $Window.ActualWidth } else { $Window.Width }
     $oldH = if ($Window.ActualHeight -gt 0) { $Window.ActualHeight } else { $Window.Height }
     $oldLeft = if (-not [double]::IsNaN($Window.Left)) { $Window.Left } elseif ($null -ne $Config.Left) { [double]$Config.Left } else { 0.0 }
@@ -773,32 +953,22 @@ function Update-Scale {
     $newLeft = $right - $newW
     $newTop  = $bottom - $newH
 
-    $bounds = Get-CurrentScreenBounds $oldLeft $oldTop $oldW $oldH
-    if ($newLeft -lt $bounds.Left) {
-        $newLeft = $bounds.Left
-    } elseif (($newLeft + $newW) -gt $bounds.Right) {
-        $newLeft = $bounds.Right - $newW
-    }
+    $b = Get-CharacterDragBounds $newLeft $newTop
+    $Window.Left = [Math]::Max($b.MinLeft, [Math]::Min($b.MaxLeft, $newLeft))
+    $Window.Top  = [Math]::Max($b.MinTop,  [Math]::Min($b.MaxTop,  $newTop))
 
-    if ($newTop -lt $bounds.Top) {
-        $newTop = $bounds.Top
-    } elseif (($newTop + $newH) -gt $bounds.Bottom) {
-        $newTop = $bounds.Bottom - $newH
-    }
-
-    $Window.Left = $newLeft
-    $Window.Top  = $newTop
-    $Config.Left = [Math]::Round($newLeft)
-    $Config.Top  = [Math]::Round($newTop)
+    $Config.Left = [Math]::Round($Window.Left)
+    $Config.Top  = [Math]::Round($Window.Top)
 }
 
 function Update-Facing {
     try {
-        $wa = [System.Windows.SystemParameters]::WorkArea
-        $centerX = $Window.Left + ($Window.Width * 0.5)
-        $threshold = $wa.Left + ($wa.Width * 0.42)
-        if ($centerX -lt $threshold) {
-            # Character on left side of screen -> flip horizontally so bubble faces right (into screen)
+        $geom = Get-CharacterVisibleGeometry
+        $charCenterX = $Window.Left + $geom.RelLeft + ($geom.VisWidth * 0.5)
+        $charCenterY = $Window.Top  + $geom.RelTop  + ($geom.VisHeight * 0.5)
+        $bounds = Get-CurrentScreenBounds $charCenterX $charCenterY
+        $threshold = $bounds.Left + (($bounds.Right - $bounds.Left) * 0.42)
+        if ($charCenterX -lt $threshold) {
             $FacingScale.ScaleX = -1.0
             $TextFacingScale.ScaleX = -1.0
         } else {
@@ -864,17 +1034,26 @@ function Hide-Bubble {
 }
 
 function Set-ActiveBubblePanel([string]$mode) {
+    $script:currentBubblePanel = $mode
     if ($mode -eq "work") {
         $WorkStatusPanel.Visibility = [System.Windows.Visibility]::Visible
         $QuotaPanel.Visibility      = [System.Windows.Visibility]::Collapsed
+        if ($DeepSeekPanel) { $DeepSeekPanel.Visibility = [System.Windows.Visibility]::Collapsed }
+        $QuotePanel.Visibility      = [System.Windows.Visibility]::Collapsed
+    } elseif ($mode -eq "deepseek") {
+        $WorkStatusPanel.Visibility = [System.Windows.Visibility]::Collapsed
+        $QuotaPanel.Visibility      = [System.Windows.Visibility]::Collapsed
+        if ($DeepSeekPanel) { $DeepSeekPanel.Visibility = [System.Windows.Visibility]::Visible }
         $QuotePanel.Visibility      = [System.Windows.Visibility]::Collapsed
     } elseif ($mode -eq "quote") {
         $WorkStatusPanel.Visibility = [System.Windows.Visibility]::Collapsed
         $QuotaPanel.Visibility      = [System.Windows.Visibility]::Collapsed
+        if ($DeepSeekPanel) { $DeepSeekPanel.Visibility = [System.Windows.Visibility]::Collapsed }
         $QuotePanel.Visibility      = [System.Windows.Visibility]::Visible
     } else {
         $WorkStatusPanel.Visibility = [System.Windows.Visibility]::Collapsed
         $QuotaPanel.Visibility      = [System.Windows.Visibility]::Visible
+        if ($DeepSeekPanel) { $DeepSeekPanel.Visibility = [System.Windows.Visibility]::Collapsed }
         $QuotePanel.Visibility      = [System.Windows.Visibility]::Collapsed
     }
     if ($BubbleBorder -and $BrushConv) {
@@ -899,17 +1078,17 @@ function Set-AgentPetWindowVisible([bool]$Visible) {
         $helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
         $handle = $helper.Handle
         if ($Visible) {
-            [void][NiangPetNative]::ShowWindow($handle, [NiangPetNative]::SW_SHOW)
+            [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_SHOW)
             $Window.Topmost = [bool]$Config.Topmost
             Update-Facing
             Update-Scale
-            [void][NiangPetNative]::SetForegroundWindow($handle)
+            [void][AgentPetNative]::SetForegroundWindow($handle)
             $Window.Activate()
             $script:trayWindowHidden = $false
             Trigger-PetBounce
         } else {
             Hide-Bubble
-            [void][NiangPetNative]::ShowWindow($handle, [NiangPetNative]::SW_HIDE)
+            [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_HIDE)
             $script:trayWindowHidden = $true
         }
     } catch { Log-Throttled "TrayWindow" "托盘切换窗口失败：$($_.Exception.Message)" 30 }
@@ -988,7 +1167,7 @@ function Set-TrayIconForRole {
             $icon = [System.Drawing.Icon]::FromHandle($hIcon)
             if ($script:TrayIconAsset) { try { $script:TrayIconAsset.Dispose() } catch {} }
             if ($script:TrayIconBitmap) { try { $script:TrayIconBitmap.Dispose() } catch {} }
-            if ($script:TrayIconHandle -ne [IntPtr]::Zero) { try { [NiangPetNative]::DestroyIcon($script:TrayIconHandle) } catch {} }
+            if ($script:TrayIconHandle -ne [IntPtr]::Zero) { try { [AgentPetNative]::DestroyIcon($script:TrayIconHandle) } catch {} }
             $script:TrayIconAsset = $icon
             $script:TrayIconBitmap = $thumb
             $script:TrayIconHandle = $hIcon
@@ -1022,11 +1201,19 @@ function Initialize-TrayIcon {
         $bubble = New-Object System.Windows.Forms.ToolStripMenuItem("气泡看板")
         $work = New-Object System.Windows.Forms.ToolStripMenuItem("Agent 工作状态")
         $quota = New-Object System.Windows.Forms.ToolStripMenuItem("Codex 额度")
+        $deepseek = New-Object System.Windows.Forms.ToolStripMenuItem("DeepSeek 余额")
         $quote = New-Object System.Windows.Forms.ToolStripMenuItem("随机台词")
         $bubbleHide = New-Object System.Windows.Forms.ToolStripMenuItem("隐藏气泡")
-        [void]$bubble.DropDownItems.Add($work); [void]$bubble.DropDownItems.Add($quota); [void]$bubble.DropDownItems.Add($quote)
+        [void]$bubble.DropDownItems.Add($work); [void]$bubble.DropDownItems.Add($quota); [void]$bubble.DropDownItems.Add($deepseek); [void]$bubble.DropDownItems.Add($quote)
         [void]$bubble.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator)); [void]$bubble.DropDownItems.Add($bubbleHide)
         [void]$menu.Items.Add($bubble)
+
+        $bubbleDefault = New-Object System.Windows.Forms.ToolStripMenuItem("气泡默认偏好")
+        $defQuota = New-Object System.Windows.Forms.ToolStripMenuItem("Codex 额度")
+        $defDeepseek = New-Object System.Windows.Forms.ToolStripMenuItem("DeepSeek 余额")
+        $defQuote = New-Object System.Windows.Forms.ToolStripMenuItem("随机台词")
+        [void]$bubbleDefault.DropDownItems.Add($defQuota); [void]$bubbleDefault.DropDownItems.Add($defDeepseek); [void]$bubbleDefault.DropDownItems.Add($defQuote)
+        [void]$menu.Items.Add($bubbleDefault)
 
         $broadcast = New-Object System.Windows.Forms.ToolStripMenuItem("状态播报")
         $pause10 = New-Object System.Windows.Forms.ToolStripMenuItem("暂停 10 分钟")
@@ -1035,8 +1222,27 @@ function Initialize-TrayIcon {
         [void]$broadcast.DropDownItems.Add($pause10); [void]$broadcast.DropDownItems.Add($pause30); [void]$broadcast.DropDownItems.Add($resume)
         [void]$menu.Items.Add($broadcast)
 
+        $trayLowBalItem = New-Object System.Windows.Forms.ToolStripMenuItem("DeepSeek 余额过低提醒")
+        $trayLowBalItem.CheckOnClick = $true
+        $trayLowBalItem.Checked = ($Config.LowBalanceAlertEnabled -ne $false)
+        [void]$menu.Items.Add($trayLowBalItem)
+
+        $trayDshMenu = New-Object System.Windows.Forms.ToolStripMenuItem("DeepSeek 凭据管理")
+        $trayDshEnableItem = New-Object System.Windows.Forms.ToolStripMenuItem("启用 DeepSeek 余额服务")
+        $trayDshEnableItem.CheckOnClick = $true
+        $trayDshEnableItem.Checked = ($Config.DeepSeekBalanceEnabled -ne $false)
+        $trayDshStatusItem = New-Object System.Windows.Forms.ToolStripMenuItem("DSH 状态: 检测中...")
+        $trayDshStatusItem.Enabled = $false
+        $trayDshRefreshItem = New-Object System.Windows.Forms.ToolStripMenuItem("立即刷新 DeepSeek 余额")
+
+        [void]$trayDshMenu.DropDownItems.Add($trayDshEnableItem)
+        [void]$trayDshMenu.DropDownItems.Add($trayDshStatusItem)
+        [void]$trayDshMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        [void]$trayDshMenu.DropDownItems.Add($trayDshRefreshItem)
+        [void]$menu.Items.Add($trayDshMenu)
+
         $roles = New-Object System.Windows.Forms.ToolStripMenuItem("切换角色")
-        foreach ($role in @(@{Key="claude"; Label="小克"}, @{Key="dragon"; Label="龙娘"}, @{Key="gemini"; Label="双子"})) {
+        foreach ($role in @(@{Key="claude"; Label="小克 (Claude娘)"}, @{Key="dragon"; Label="白龙 (GPT娘)"}, @{Key="gemini"; Label="双子 (Gemini娘)"})) {
             $item = New-Object System.Windows.Forms.ToolStripMenuItem($role.Label)
             $item.Tag = $role.Key
             $item.Add_Click({
@@ -1069,7 +1275,11 @@ function Initialize-TrayIcon {
         $hide.Add_Click({ Set-AgentPetWindowVisible $false })
         $work.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "work"; Show-Bubble 0 -Force })
         $quota.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "quota"; Request-QuotaRefresh; Show-Bubble 0 -Force })
+        $deepseek.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh; Show-Bubble 0 -Force })
         $quote.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; $QuoteText.Text = Get-RandomCharacterQuote $Config.Character; Set-ActiveBubblePanel "quote"; Show-Bubble 5.5 })
+        $defQuota.Add_Click({ $Config.BubbleMode = "quota"; Save-Config; if (-not $script:agentBusy) { Set-ActiveBubblePanel "quota" }; Build-ContextMenu }.GetNewClosure())
+        $defDeepseek.Add_Click({ $Config.BubbleMode = "deepseek"; Save-Config; if (-not $script:agentBusy) { Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh }; Build-ContextMenu }.GetNewClosure())
+        $defQuote.Add_Click({ $Config.BubbleMode = "quote"; Save-Config; if (-not $script:agentBusy) { Set-ActiveBubblePanel "quote" }; Build-ContextMenu }.GetNewClosure())
         $bubbleHide.Add_Click({ $script:manualBubbleHidden = $true; Hide-Bubble })
         $pause10.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 600000; Save-Config; Update-TrayTooltip -Force })
         $pause30.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1800000; Save-Config; Update-TrayTooltip -Force })
@@ -1080,6 +1290,33 @@ function Initialize-TrayIcon {
             $Config.Left = $Window.Left; $Config.Top = $Window.Top; Save-Config; Update-Facing
         })
         $full.Add_Click({ Set-AgentPetWindowVisible $true; if ($Window.ContextMenu) { $Window.ContextMenu.PlacementTarget = $PetImage; $Window.ContextMenu.IsOpen = $true } })
+        $trayLowBalItem.Add_Click({
+            $Config.LowBalanceAlertEnabled = [bool]$trayLowBalItem.Checked
+            Save-Config
+            if ($Config.LowBalanceAlertEnabled) {
+                $script:lowBalanceAlertArmed = $false          # 强制重新武装
+                if ($script:lastBalanceObject -and $script:lastBalanceObject.status -eq "ok") {
+                    # 用最近一次有效余额立即判定（$script:lastBalanceObject 在 Apply-BalanceObject:1607 保存）
+                    Check-LowBalanceAlert $script:lastBalanceObject
+                } else {
+                    Request-BalanceRefresh                      # 没有有效数据 → 先刷新，等数据回来再判定
+                }
+            }
+            Build-ContextMenu
+        }.GetNewClosure())
+        $trayDshEnableItem.Add_Click({
+            $Config.DeepSeekBalanceEnabled = [bool]$trayDshEnableItem.Checked
+            Save-Config
+            Request-BalanceRefresh
+            Build-ContextMenu
+        }.GetNewClosure())
+        $trayDshRefreshItem.Add_Click({
+            $script:manualBubbleHidden = $false
+            Set-AgentPetWindowVisible $true
+            Set-ActiveBubblePanel "deepseek"
+            Request-BalanceRefresh
+            Show-Bubble 0 -Force
+        }.GetNewClosure())
         $trayEnabledItem.Add_Click({
             $Config.TrayEnabled = [bool]$trayEnabledItem.Checked
             Save-Config
@@ -1094,6 +1331,9 @@ function Initialize-TrayIcon {
         $script:NotifyIcon.Add_DoubleClick({ Set-AgentPetWindowVisible $true })
         $menu.Add_Opening({
             Update-TrayTooltip -Force
+            $defQuota.Checked = ($Config.BubbleMode -eq "quota")
+            $defDeepseek.Checked = ($Config.BubbleMode -eq "deepseek")
+            $defQuote.Checked = ($Config.BubbleMode -eq "quote")
             $show.Text = if ($script:trayWindowHidden) { "显示 / 唤起桌宠" } else { "显示 / 唤起桌宠（当前显示）" }
             $hide.Text = if ($script:trayWindowHidden) { "隐藏桌宠（当前隐藏）" } else { "隐藏桌宠" }
             $bubbleHide.Checked = [bool]$script:manualBubbleHidden
@@ -1127,6 +1367,7 @@ function Request-AgentPetExit {
 $script:lastShortRemaining = 100
 $script:lastWeekRemaining  = 100
 $script:lastQuotaObject    = $null
+$script:refreshingUntil    = [DateTime]::MinValue
 
 function Format-ResetCountdown([long]$resetsAtEpoch) {
     if ($resetsAtEpoch -le 0) { return "实时同步中" }
@@ -1267,29 +1508,281 @@ function Apply-QuotaObject($qObj) {
 function Read-InitialQuotaSnapshot {
     if (Test-Path $RuntimeQuotaPath) {
         try {
-            $raw = Get-Content $RuntimeQuotaPath -Raw -Encoding UTF8
-            $q = $raw | ConvertFrom-Json
+            $raw = Get-Content $RuntimeQuotaPath -Raw -Encoding UTF8 -ErrorAction Stop
+            $q = $raw | ConvertFrom-Json -ErrorAction Stop
             if ($q -and $q.windows) {
                 Apply-QuotaObject $q
             }
-        } catch {}
+        } catch {
+            Log-Throttled "ReadQuotaSnapshot" "读取初始额度快照失败：$($_.Exception.Message)" 30
+        }
     }
 }
 
 function Request-QuotaRefresh {
     try {
-        $ShortReset.Text = "正在刷新..."
+        if ($ShortReset) {
+            $ShortReset.Text = "刷新中..."
+        }
         $script:refreshingUntil = [DateTime]::UtcNow.AddSeconds(14.0)
-        [System.IO.File]::WriteAllText($RefreshFlagPath, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString())
+        [System.IO.File]::WriteAllText($RefreshFlagPath, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString(), [System.Text.Encoding]::UTF8)
+    } catch {
+        Log-Throttled "QuotaRefresh" "写入 Codex 额度刷新标记失败：$($_.Exception.Message)" 30
+        if ($ShortReset) {
+            $ShortReset.Text = "请求失败"
+        }
+    }
+}
+
+# ============================================================================
+# 9.5. DeepSeek API Balance & Low Balance Alert Engine
+# ============================================================================
+$script:lastBalanceMtime   = [DateTime]::MinValue
+$script:lastBalanceObject  = $null
+$script:isLowBalance       = $false
+$script:lowBalanceHostSig  = ""
+$script:lowBalanceAlertArmed = $false
+
+$script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
+$script:balanceRequestTimeout = $null
+
+function Request-BalanceRefresh {
+    $now = [DateTime]::UtcNow
+    $span = ($now - $script:lastBalanceRefreshRequestTime).TotalSeconds
+    if ($span -lt 10.0) {
+        $rem = [int][Math]::Ceiling(10.0 - $span)
+        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "冷却中 (${rem}s)" }
+        return
+    }
+
+    $script:lastBalanceRefreshRequestTime = $now
+    $script:balanceRequestTimeout = $now.AddSeconds(15.0)
+    try {
+        [System.IO.File]::WriteAllText($RefreshBalanceFlagPath, [DateTime]::UtcNow.Ticks.ToString(), [System.Text.Encoding]::UTF8)
+        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "刷新中..." }
     } catch {}
 }
 
-$RefreshQuotaBtn.Add_Click({
-    param($s, $e)
-    $e.Handled = $true
-    Request-QuotaRefresh
-    Show-Bubble 14.0
-})
+function Check-LowBalanceAlert($balObj) {
+    if (-not $balObj -or $balObj.status -ne "ok" -or -not $balObj.balances) { return }
+
+    # 来源签名：provider + credentialSource 变化即视为"数据来源变了"
+    # 注意：它只能识别【来源变化】，不是【账户归属签名】。
+    #   同一个 provider 下换账户（例如都是 deepseek-official）无法区分；
+    #   DSH /state 目前不提供 accountId，这一层限制必须在提交说明里写明。
+    #   若宿主后续提供 accountId/accountContext，再替换本行取值来源。
+    $sig = "$([string]$balObj.provider)|$([string]$balObj.credentialSource)"
+    if ($script:lowBalanceHostSig -and $script:lowBalanceHostSig -ne $sig) {
+        $script:isLowBalance = $false
+    }
+    $script:lowBalanceHostSig = $sig
+
+    $cnyThresh = if ($null -ne $Config.LowBalanceCnyThreshold) { [decimal]$Config.LowBalanceCnyThreshold } else { [decimal]5.0 }
+    $cnyTot = [decimal]0; $hasCny = $false
+    foreach ($b in $balObj.balances) {
+        if ([string]$b.currency -eq "CNY") {
+            if ([decimal]::TryParse([string]$b.totalBalance,
+                [System.Globalization.NumberStyles]::Any,
+                [System.Globalization.CultureInfo]::InvariantCulture, [ref]$cnyTot)) { $hasCny = $true }
+            break
+        }
+    }
+
+    # 开关从"关"变"开"时重新武装：若此刻仍低额，立即提醒一次
+    #   （用户刚主动打开提醒，属于"重新要求被提醒"，不算重复打扰）
+    $alertOn = ($Config.LowBalanceAlertEnabled -ne $false)
+    if ($alertOn -and -not $script:lowBalanceAlertArmed) { $script:isLowBalance = $false }
+    $script:lowBalanceAlertArmed = $alertOn
+
+    # 无论是否被抑制，都先更新状态位（这是修漏报的关键）
+    $isLow = ($hasCny -and $cnyTot -lt $cnyThresh)
+    $wasLow = [bool]$script:isLowBalance
+    $script:isLowBalance = $isLow
+
+    if (-not $isLow) { return }
+    if ($wasLow) { return }                       # 已提醒过，不重复
+    if (-not $alertOn) { return }
+    if ($script:manualBubbleHidden) { return }
+    if ($script:agentBusy) { return }             # 主动抑制：不补提醒（见工单说明）
+    if ([DateTime]::UtcNow -lt $script:userInspectUntil) { return }
+
+    Play-ReleaseSound
+    Set-ActiveBubblePanel "deepseek"
+    Show-Bubble 6.5
+}
+
+function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
+    if (-not $balObj -or -not $DeepSeekPanel) { return }
+    $script:lastBalanceObject = $balObj
+    if ($DeepSeekIcon -and $script:AgentIcons.ContainsKey("dsh")) {
+        $DeepSeekIcon.Source = $script:AgentIcons["dsh"]
+    }
+
+    $st = [string]$balObj.status
+    if ($st -ne "ok" -and $st -ne "stale") {
+        # loading / error / dsh_not_running / unconfigured / dsh_disabled：
+        # 归属未确认，清空低额判定，避免跨账户残留
+        $script:isLowBalance = $false
+        $script:lowBalanceHostSig = ""
+    }
+    if ($st -eq "dsh_not_running") {
+        $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+        $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
+        $DeepSeekStatusNotice.Text   = "未连接"
+        $DeepSeekMsgTitle.Text       = "DSH 未运行"
+        $DeepSeekMsgDetail.Text      = "请启动 DeepSeek Harness 后查看余额"
+        return
+    }
+
+    if ($st -eq "unconfigured" -or $st -eq "dsh_disabled") {
+        $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+        $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
+        $DeepSeekStatusNotice.Text   = "已停用"
+        $DeepSeekMsgTitle.Text       = "余额服务未启用"
+        $DeepSeekMsgDetail.Text      = "可在托盘或右键菜单中开启 DeepSeek 余额服务"
+        return
+    }
+
+    if ($st -eq "loading") {
+        $DeepSeekStatusNotice.Text = "查询中..."
+        if (-not $balObj.balances -or $balObj.balances.Count -eq 0) {
+            $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+            $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+            $DeepSeekMsgTitle.Text       = "正在查询余额..."
+            $DeepSeekMsgDetail.Text      = "首次联网请求中，请稍候~"
+            return
+        }
+    }
+
+    if ($st -eq "error") {
+        if ($balObj.balances -and $balObj.balances.Count -gt 0) {
+            $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Visible
+            $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Collapsed
+            $DeepSeekStatusNotice.Text   = "更新失败"
+        } else {
+            $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+            $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+            $DeepSeekStatusNotice.Text   = "查询失败"
+            $title = "余额获取失败"
+            if ($balObj.errorCode -eq "DSH_CREDENTIAL_MISSING") { $title = "DSH 凭据未配置" }
+            elseif ($balObj.errorCode -eq "DSH_UNSUPPORTED") { $title = "服务商不支持" }
+            elseif ($balObj.errorCode -eq "DSH_NOT_RUNNING") { $title = "DSH 未运行" }
+            $DeepSeekMsgTitle.Text = $title
+            $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { "$($balObj.errorMessage)（点击 ↻ 重试）" } else { "请在 DSH 中检查服务商配置（点击 ↻ 重试）" }
+            return
+        }
+    }
+
+    if ($st -eq "ok" -or $st -eq "stale") {
+        # Strict CNY finding: first version displays ONLY CNY (RMB)
+        $cnyInfo = $null
+        if ($balObj.balances) {
+            foreach ($b in $balObj.balances) {
+                if ([string]$b.currency -eq "CNY") {
+                    $cnyInfo = $b
+                    break
+                }
+            }
+        }
+
+        if ($null -eq $cnyInfo) {
+            $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+            $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+            $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Visible
+            $DeepSeekBadgeText.Text      = "官方"
+            $DeepSeekStatusNotice.Text   = "无CNY余额"
+            $DeepSeekMsgTitle.Text       = "当前账户未返回人民币余额"
+            $DeepSeekMsgDetail.Text      = "DeepSeek 官方返回列表中未包含 CNY 余额明细"
+            return
+        }
+
+        $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Visible
+        $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Collapsed
+        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Visible
+        $DeepSeekBadgeText.Text      = "官方"
+
+        if ($balObj.errorCode -eq "COOLDOWN") {
+            $DeepSeekStatusNotice.Text = "冷却中"
+        } elseif ($balObj.errorCode -eq "RATE_LIMITED") {
+            $DeepSeekStatusNotice.Text = "频率限制"
+        } elseif ($st -eq "stale") {
+            $DeepSeekStatusNotice.Text = if ($IsInitialStartup) { "启动同步中..." } else { "上次快照" }
+        } else {
+            $updateTs = if ($balObj.updatedAt) { $balObj.updatedAt } elseif ($balObj.balanceUpdatedAt) { $balObj.balanceUpdatedAt } else { $null }
+            if ($updateTs) {
+                $timeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$updateTs).ToLocalTime()).ToString("HH:mm")
+                $DeepSeekStatusNotice.Text = "$timeStr 更新"
+                $DeepSeekStatusNotice.ToolTip = $null
+            } elseif ($balObj.fetchedAt) {
+                $timeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$balObj.fetchedAt).ToLocalTime()).ToString("HH:mm")
+                $DeepSeekStatusNotice.Text = "$timeStr 读取"
+                if ($balObj.hostCounter) {
+                    $DeepSeekStatusNotice.ToolTip = "数据版本 $($balObj.hostCounter)"
+                } else {
+                    $DeepSeekStatusNotice.ToolTip = $null
+                }
+            } else {
+                $DeepSeekStatusNotice.Text = "更新时间未知"
+                if ($balObj.hostCounter) {
+                    $DeepSeekStatusNotice.ToolTip = "数据版本 $($balObj.hostCounter)"
+                } else {
+                    $DeepSeekStatusNotice.ToolTip = $null
+                }
+            }
+        }
+
+        $DeepSeekCurrencyLabel.Text = "人民币 CNY · DSH 宿主"
+        $DeepSeekTotalText.Text = "¥ $($cnyInfo.totalBalance)"
+
+        # Safe breakdown rendering: do NOT fake 0.00 if toppedUp or granted are null
+        if ($null -ne $cnyInfo.toppedUpBalance -and $null -ne $cnyInfo.grantedBalance) {
+            $DeepSeekBreakdownText.Text = "充值: ¥ $($cnyInfo.toppedUpBalance)   赠金: ¥ $($cnyInfo.grantedBalance)"
+        } elseif ($null -ne $cnyInfo.toppedUpBalance) {
+            $DeepSeekBreakdownText.Text = "充值: ¥ $($cnyInfo.toppedUpBalance)   赠金: 未提供"
+        } elseif ($null -ne $cnyInfo.grantedBalance) {
+            $DeepSeekBreakdownText.Text = "充值: 未提供   赠金: ¥ $($cnyInfo.grantedBalance)"
+        } else {
+            $DeepSeekBreakdownText.Text = "充值/赠金明细暂不可用"
+        }
+
+        $DeepSeekAvailableNotice.Text = if ($balObj.isAvailable -eq $false) { "（账户不可用）" } else { "" }
+
+        # 开关只管提醒，判定始终执行；启动快照仍不打扰
+        if ($st -eq "ok" -and (-not $IsInitialStartup)) {
+            Check-LowBalanceAlert $balObj
+        }
+    }
+}
+
+function Read-InitialBalanceSnapshot {
+    if ($Config.DeepSeekBalanceEnabled -eq $false) {
+        Apply-BalanceObject @{
+            type = "balance"
+            provider = "unknown"
+            providerFamily = "deepseek"
+            status = "dsh_disabled"
+            balances = @()
+            isAvailable = $false
+            errorCode = "BALANCE_DISABLED"
+            errorMessage = "DeepSeek 余额服务未启用（可在菜单中开启）"
+        } -IsInitialStartup
+        return
+    }
+
+    # P1-4: Confirm active DSH session context before accepting balance amount
+    Apply-BalanceObject @{
+        type = "balance"
+        provider = "unknown"
+        providerFamily = "deepseek"
+        status = "loading"
+        balances = @()
+        isAvailable = $null
+        errorCode = $null
+        errorMessage = $null
+    } -IsInitialStartup
+}
 
 # ============================================================================
 # 10. Q-Bounce Squash & Stretch Animation + Low-Latency Audio
@@ -1406,9 +1899,9 @@ function Build-ContextMenu {
     $miCharHeader.FontWeight = "SemiBold"
 
     $chars = @(
-        @{ Key = "claude"; Label = "小克（Claude娘 · 橘白礼服）" },
-        @{ Key = "dragon"; Label = "白龙（GPT娘 · 原版）" },
-        @{ Key = "gemini"; Label = "双子（Gemini娘 · 元气）" }
+        @{ Key = "claude"; Label = "小克 (Claude娘)" },
+        @{ Key = "dragon"; Label = "白龙 (GPT娘)" },
+        @{ Key = "gemini"; Label = "双子 (Gemini娘)" }
     )
     foreach ($c in $chars) {
         $item = New-Object System.Windows.Controls.MenuItem
@@ -1486,19 +1979,24 @@ function Build-ContextMenu {
     $miShowQuota = New-Object System.Windows.Controls.MenuItem
     $miShowQuota.Header = "查看并刷新 Codex 额度"
     $miShowQuota.Add_Click({
-        $Config.BubbleMode = "quota"
-        Save-Config
         Set-ActiveBubblePanel "quota"
         Request-QuotaRefresh
         Show-Bubble 14.0
     })
     [void]$cm.Items.Add($miShowQuota)
 
+    $miShowDeepSeek = New-Object System.Windows.Controls.MenuItem
+    $miShowDeepSeek.Header = "查看并刷新 DeepSeek 余额"
+    $miShowDeepSeek.Add_Click({
+        Set-ActiveBubblePanel "deepseek"
+        Request-BalanceRefresh
+        Show-Bubble 14.0
+    })
+    [void]$cm.Items.Add($miShowDeepSeek)
+
     $miSayQuote = New-Object System.Windows.Controls.MenuItem
-    $miSayQuote.Header = "随机说一句专属台词"
+    $miSayQuote.Header = "随机台词"
     $miSayQuote.Add_Click({
-        $Config.BubbleMode = "quote"
-        Save-Config
         $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
         Set-ActiveBubblePanel "quote"
         Trigger-PetBounce
@@ -1506,6 +2004,40 @@ function Build-ContextMenu {
         Show-Bubble 5.5
     })
     [void]$cm.Items.Add($miSayQuote)
+
+    # 2.5 Bubble Default Mode Submenu
+    $miBubbleDefault = New-Object System.Windows.Controls.MenuItem
+    $miBubbleDefault.Header = "气泡默认偏好"
+    foreach ($mOpt in @(
+        @{ Key="quota"; Label="Codex 剩余额度" },
+        @{ Key="deepseek"; Label="DeepSeek 官方余额" },
+        @{ Key="quote"; Label="角色闲聊语录" }
+    )) {
+        $bOptItem = New-Object System.Windows.Controls.MenuItem
+        $bOptItem.Header = $mOpt.Label
+        $bOptItem.IsCheckable = $true
+        $bOptItem.IsChecked = ($Config.BubbleMode -eq $mOpt.Key)
+        $bOptItem.Tag = $mOpt.Key
+        $bOptItem.Add_Click({
+            param($sender, $e)
+            $Config.BubbleMode = [string]$sender.Tag
+            Save-Config
+            if (-not $script:agentBusy) {
+                Set-ActiveBubblePanel $Config.BubbleMode
+                if ($Config.BubbleMode -eq "quote") {
+                    $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
+                } elseif ($Config.BubbleMode -eq "deepseek") {
+                    Request-BalanceRefresh
+                } else {
+                    Request-QuotaRefresh
+                }
+                Show-Bubble 5.5
+            }
+            Build-ContextMenu
+        }.GetNewClosure())
+        [void]$miBubbleDefault.Items.Add($bOptItem)
+    }
+    [void]$cm.Items.Add($miBubbleDefault)
 
     [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
@@ -1601,10 +2133,10 @@ function Build-ContextMenu {
     $miFont = New-Object System.Windows.Controls.MenuItem
     $miFont.Header = "气泡字体大小 ($([int][Math]::Round($currFS * 100))%)"
     $fontPresets = @(
-        @{ Label = "紧凑 (88%)";       Val = 0.88 },
-        @{ Label = "✦ 标准清晰 (100%)"; Val = 1.00 },
-        @{ Label = "舒适清晰 (115%)";  Val = 1.15 },
-        @{ Label = "大号醒目 (130%)";  Val = 1.30 }
+        @{ Label = "88%";       Val = 0.88 },
+        @{ Label = "100%"; Val = 1.00 },
+        @{ Label = "115%";  Val = 1.15 },
+        @{ Label = "130%";  Val = 1.30 }
     )
     foreach ($fp in $fontPresets) {
         $fItem = New-Object System.Windows.Controls.MenuItem
@@ -1860,66 +2392,93 @@ $PetImage.Add_MouseLeftButtonUp({
         Save-Config
         Update-Facing
     } else {
-        # Crisp click on pet -> Q-bounce + sound + show bubble!
         Trigger-PetBounce
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(1.8)
+        $defMode = if ($Config.BubbleMode -in @("quota","deepseek","quote")) { $Config.BubbleMode } else { "quota" }
         if ($script:agentBusy) {
-            # P1-2: Allow user to temporarily view quota panel for 8 seconds during busy state
+            # Temporary view default panel for 8.0s during busy state without changing default preference
             $script:userInspectUntil = [DateTime]::UtcNow.AddSeconds(8.0)
-            Set-ActiveBubblePanel "quota"
+            if ($defMode -eq "quote") {
+                $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
+            } elseif ($defMode -eq "deepseek") {
+                Request-BalanceRefresh
+            } else {
+                Request-QuotaRefresh
+            }
+            Set-ActiveBubblePanel $defMode
             Show-Bubble 8.0
         } else {
             Set-PetSprite "happy"
             if (-not $script:isBubbleOpen) {
-                # Open bubble in preferred mode (default quota, or quote)
-                if ($Config.BubbleMode -eq "quote") {
+                if ($defMode -eq "quote") {
                     $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-                    Set-ActiveBubblePanel "quote"
+                } elseif ($defMode -eq "deepseek") {
+                    Request-BalanceRefresh
                 } else {
-                    Set-ActiveBubblePanel "quota"
                     Request-QuotaRefresh
                 }
+                Set-ActiveBubblePanel $defMode
                 Show-Bubble 5.5
             } else {
-                # Bubble is already open -> toggle between Quota and Quote!
-                if ($QuotaPanel.Visibility -eq [System.Windows.Visibility]::Visible) {
-                    $Config.BubbleMode = "quote"
-                    $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-                    Set-ActiveBubblePanel "quote"
-                    Show-Bubble 5.5
-                } else {
-                    $Config.BubbleMode = "quota"
-                    Set-ActiveBubblePanel "quota"
-                    Request-QuotaRefresh
-                    Show-Bubble 5.5
-                }
-                Save-Config
+                Show-Bubble 5.5
             }
         }
     }
     $e.Handled = $true
 })
 
-# Clicking the speech bubble cycles quote or toggles mode
+# Clicking speech bubble blank area cycles: quota -> deepseek -> quote -> quota without modifying $Config.BubbleMode
 $Bubble.Add_MouseLeftButtonUp({
     param($s, $e)
     $script:lastInteractTime = [DateTime]::UtcNow
-    if ($script:agentBusy) { return }
+    if ($script:agentBusy -and [DateTime]::UtcNow -ge $script:userInspectUntil) { return }
     Trigger-PetBounce
     Play-ReleaseSound
-    if ($QuotePanel.Visibility -eq [System.Windows.Visibility]::Visible) {
-        $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-        Show-Bubble 5.5
+
+    $cur = if ($script:currentBubblePanel) { $script:currentBubblePanel } else { "quota" }
+    $nextMode = if ($cur -eq "quota") {
+        "deepseek"
+    } elseif ($cur -eq "deepseek") {
+        "quote"
     } else {
-        $Config.BubbleMode = "quote"
-        Save-Config
-        $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-        Set-ActiveBubblePanel "quote"
-        Show-Bubble 5.5
+        "quota"
     }
+
+    if ($nextMode -eq "quote") {
+        $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
+    } elseif ($nextMode -eq "deepseek") {
+        Request-BalanceRefresh
+    } else {
+        Request-QuotaRefresh
+    }
+    Set-ActiveBubblePanel $nextMode
+    Show-Bubble 5.5
     $e.Handled = $true
 })
+
+# Button click event isolation
+if ($RefreshDeepSeekBtn) {
+    $RefreshDeepSeekBtn.Add_Click({
+        param($s, $e)
+        $e.Handled = $true
+        Request-BalanceRefresh
+    })
+}
+if ($DeepSeekPricingLink) {
+    $DeepSeekPricingLink.Add_MouseLeftButtonUp({
+        param($s, $e)
+        $e.Handled = $true
+        try { [System.Diagnostics.Process]::Start("https://api-docs.deepseek.com/quick_start/pricing/") } catch {}
+    })
+}
+if ($RefreshQuotaBtn) {
+    $RefreshQuotaBtn.Add_Click({
+        param($s, $e)
+        $e.Handled = $true
+        Request-QuotaRefresh
+    })
+}
 
 # ============================================================================
 # 14. Background Node.js Agent & Quota Monitor Integration
@@ -1958,6 +2517,27 @@ function Find-NodeExe {
             $script:CachedNodeExe = $c
             return $c
         }
+    }
+
+    $codexAppDir = Join-Path $env:LOCALAPPDATA "OpenAI\Codex\runtimes"
+    if (Test-Path $codexAppDir) {
+        try {
+            $subdirs = [System.IO.Directory]::GetDirectories($codexAppDir)
+            foreach ($sd in $subdirs) {
+                $cand = Join-Path $sd "bin\node.exe"
+                if ([System.IO.File]::Exists($cand)) {
+                    $script:CachedNodeExe = $cand
+                    return $cand
+                }
+                foreach ($ssd in [System.IO.Directory]::GetDirectories($sd)) {
+                    $cand2 = Join-Path $ssd "bin\node.exe"
+                    if ([System.IO.File]::Exists($cand2)) {
+                        $script:CachedNodeExe = $cand2
+                        return $cand2
+                    }
+                }
+            }
+        } catch {}
     }
 
     # P2-PERF-1: Fast, non-recursive sibling runtime directory check (prevents UI thread lock)
@@ -2263,6 +2843,24 @@ function Poll-AgentMonitor {
         }
     }
 
+    # 3. Watch runtime-balance.json file modification
+    if (Test-Path $RuntimeBalancePath) {
+        try {
+            $item = Get-Item $RuntimeBalancePath -ErrorAction SilentlyContinue
+            if ($item -and $item.LastWriteTimeUtc -gt $script:lastBalanceMtime) {
+                $raw = Get-Content $RuntimeBalancePath -Raw -Encoding UTF8 -ErrorAction Stop
+                $b = $raw | ConvertFrom-Json -ErrorAction Stop
+                if ($b) {
+                    $script:lastBalanceMtime = $item.LastWriteTimeUtc
+                    $script:lastBalanceObject = $b
+                    Apply-BalanceObject $b
+                }
+            }
+        } catch {
+            Log-Throttled "BalanceRead" "Failed to parse runtime-balance.json: $($_.Exception.Message)"
+        }
+    }
+
     # 2. Watch runtime-status.json file modification (atomic parse before updating mtime, Issue 11)
     if (Test-Path $RuntimeStatusPath) {
         try {
@@ -2319,16 +2917,16 @@ function Test-PetOpaqueHit([System.Windows.Point]$screenPt) {
 $Window.Add_SourceInitialized({
     try {
         $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($Window)).Handle
-        [NiangPetNative]::ApplyToolWindowStyle($hwnd)
+        [AgentPetNative]::ApplyToolWindowStyle($hwnd)
         $src = [System.Windows.Interop.HwndSource]::FromHwnd($hwnd)
         if ($src) {
             $src.AddHook({
                 param([IntPtr]$hwnd, [int]$msg, [IntPtr]$wParam, [IntPtr]$lParam, [ref]$handled)
-                if ($msg -eq [NiangPetNative]::WM_MOUSEACTIVATE) {
+                if ($msg -eq [AgentPetNative]::WM_MOUSEACTIVATE) {
                     $handled.Value = $true
-                    return [IntPtr][NiangPetNative]::MA_NOACTIVATE
+                    return [IntPtr][AgentPetNative]::MA_NOACTIVATE
                 }
-                if ($msg -eq [NiangPetNative]::WM_NCHITTEST) {
+                if ($msg -eq [AgentPetNative]::WM_NCHITTEST) {
                     try {
                         $lp = $lParam.ToInt64()
                         $x = [int][int16]($lp -band 0xFFFF)
@@ -2340,10 +2938,10 @@ $Window.Add_SourceInitialized({
                             (Test-ElementHit $TailNear $screenPt) -or
                             (Test-PetOpaqueHit $screenPt)) {
                             $handled.Value = $true
-                            return [IntPtr][NiangPetNative]::HTCLIENT
+                            return [IntPtr][AgentPetNative]::HTCLIENT
                         }
                         $handled.Value = $true
-                        return [IntPtr][NiangPetNative]::HTTRANSPARENT
+                        return [IntPtr][AgentPetNative]::HTTRANSPARENT
                     } catch {}
                 }
                 return [IntPtr]::Zero
@@ -2368,18 +2966,12 @@ $Timer.Add_Tick({
     if (Test-Path $wakeFlag) {
         try { Remove-Item $wakeFlag -Force -ErrorAction SilentlyContinue } catch {}
         Write-PetLog "Received wake signal from second launch. Restoring visibility and position."
-        $vLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
-        $vTop = [System.Windows.SystemParameters]::VirtualScreenTop
-        $vWidth = [System.Windows.SystemParameters]::VirtualScreenWidth
-        $vHeight = [System.Windows.SystemParameters]::VirtualScreenHeight
-        if ($Window.Left -lt $vLeft -or ($Window.Left + 80) -gt ($vLeft + $vWidth) -or
-            $Window.Top -lt $vTop -or ($Window.Top + 80) -gt ($vTop + $vHeight)) {
-            $Window.Left = [Math]::Max(100.0, [Math]::Min($vLeft + $vWidth - 320.0, 1400.0))
-            $Window.Top = [Math]::Max(100.0, [Math]::Min($vTop + $vHeight - 320.0, 300.0))
-            $Config.Left = [Math]::Round($Window.Left)
-            $Config.Top = [Math]::Round($Window.Top)
-            Save-Config
-        }
+        # Unified character visible boundary constraint (allowing legal negative Top at screen top edge)
+        Clamp-CharacterWindowPosition
+        $Config.Left = [Math]::Round($Window.Left)
+        $Config.Top  = [Math]::Round($Window.Top)
+        Save-Config
+
         $Window.Opacity = 1.0
         $Window.Visibility = [System.Windows.Visibility]::Visible
         $Window.Topmost = $true
@@ -2391,6 +2983,14 @@ $Timer.Add_Tick({
         $QuoteText.Text = "主人，我一直都在这里陪着您呢~"
         Set-ActiveBubblePanel "quote"
         Show-Bubble 4.0
+    }
+
+    # 0.5 Safety revert for balance refresh notice
+    if ($script:balanceRequestTimeout -and $now -gt $script:balanceRequestTimeout) {
+        $script:balanceRequestTimeout = $null
+        if ($DeepSeekStatusNotice -and $DeepSeekStatusNotice.Text -eq "刷新中...") {
+            $DeepSeekStatusNotice.Text = "已是最新"
+        }
     }
 
     # 1. Poll agent-monitor.mjs stdout & runtime-status.json
@@ -2491,24 +3091,21 @@ Update-Theme
 $initPose = if ($Config.Pose -and $Config.Pose -ne "auto") { [string]$Config.Pose } else { "idle" }
 Set-PetSprite $initPose
 Read-InitialQuotaSnapshot
+Read-InitialBalanceSnapshot
 Build-ContextMenu
 Initialize-TrayIcon
 
 $Window.Topmost = [bool]$Config.Topmost
-$vLeft = [System.Windows.SystemParameters]::VirtualScreenLeft
-$vTop = [System.Windows.SystemParameters]::VirtualScreenTop
-$vRight = $vLeft + [System.Windows.SystemParameters]::VirtualScreenWidth
-$vBottom = $vTop + [System.Windows.SystemParameters]::VirtualScreenHeight
-
-if ($null -ne $Config.Left -and $null -ne $Config.Top -and
-    $Config.Left -ge $vLeft -and $Config.Left -lt ($vRight - 60) -and
-    $Config.Top -ge $vTop -and $Config.Top -lt ($vBottom - 60)) {
+$hasSavedPos = ($null -ne $Config.Left -and $null -ne $Config.Top -and ($Config.Left -ne -1 -or $Config.Top -ne -1))
+if ($hasSavedPos) {
     $Window.Left = [double]$Config.Left
     $Window.Top  = [double]$Config.Top
+    Clamp-CharacterWindowPosition
 } else {
-    $wa = [System.Windows.SystemParameters]::WorkArea
-    $Window.Left = $wa.Right - $Window.Width - 28
-    $Window.Top  = $wa.Bottom - $Window.Height - 16
+    $bounds = Get-CurrentScreenBounds 0 0
+    $Window.Left = $bounds.Right - $Window.Width - 28
+    $Window.Top  = $bounds.Bottom - $Window.Height - 16
+    Clamp-CharacterWindowPosition
 }
 
 $Window.Add_Loaded({
@@ -2537,7 +3134,7 @@ $Window.Add_Closed({
         }
         if ($script:TrayIconAsset) { try { $script:TrayIconAsset.Dispose() } catch {}; $script:TrayIconAsset = $null }
         if ($script:TrayIconBitmap) { try { $script:TrayIconBitmap.Dispose() } catch {}; $script:TrayIconBitmap = $null }
-        if ($script:TrayIconHandle -ne [IntPtr]::Zero) { try { [NiangPetNative]::DestroyIcon($script:TrayIconHandle) } catch {}; $script:TrayIconHandle = [IntPtr]::Zero }
+        if ($script:TrayIconHandle -ne [IntPtr]::Zero) { try { [AgentPetNative]::DestroyIcon($script:TrayIconHandle) } catch {}; $script:TrayIconHandle = [IntPtr]::Zero }
     } catch {}
     try {
         if ($script:InstanceMutex) {
@@ -2560,7 +3157,8 @@ $Window.Add_Closed({
     }
     # Clean up temporary flag files & verified PID files (P0-1)
     try {
-        if (Test-Path $RefreshFlagPath) { Remove-Item -Path $RefreshFlagPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $RefreshFlagPath)        { Remove-Item -Path $RefreshFlagPath -Force -ErrorAction SilentlyContinue }
+        if (Test-Path $RefreshBalanceFlagPath) { Remove-Item -Path $RefreshBalanceFlagPath -Force -ErrorAction SilentlyContinue }
     } catch {}
     try {
         if (Test-Path $script:MonPidPath) {

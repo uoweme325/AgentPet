@@ -1,7 +1,10 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
-import { spawn, execSync } from 'node:child_process';
+import crypto from 'node:crypto';
+import { spawn, execSync, execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+const execFileAsync = promisify(execFile);
 import readline from 'node:readline';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -12,8 +15,9 @@ try {
   DatabaseSync = require('node:sqlite').DatabaseSync;
 } catch {}
 
+const argOf = name => { const i = process.argv.indexOf(name); return i !== -1 ? process.argv[i + 1] : null; };
 const appDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const logPath = path.join(appDir, 'runtime-error.log');
+const logPath = argOf('--log-file') || path.join(appDir, 'runtime-error.log');
 
 function getLocalTimestamp() {
   const d = new Date();
@@ -21,15 +25,16 @@ function getLocalTimestamp() {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${String(d.getMilliseconds()).padStart(3, '0')}`;
 }
 
-// WO-10: Unified 2MB x 3 Log Rotation
+// WO-10 & WO-21: Unified 2MB x 3 Log Rotation with derived archive paths
 function rotateLogIfNeeded() {
   try {
     if (!fs.existsSync(logPath)) return;
     const st = fs.statSync(logPath);
     if (st.size >= 2 * 1024 * 1024) { // 2MB
-      const log3 = path.join(appDir, 'runtime-error.3.log');
-      const log2 = path.join(appDir, 'runtime-error.2.log');
-      const log1 = path.join(appDir, 'runtime-error.1.log');
+      const base = logPath.replace(/\.log$/i, '');
+      const log3 = `${base}.3.log`;
+      const log2 = `${base}.2.log`;
+      const log1 = `${base}.1.log`;
       try { if (fs.existsSync(log3)) fs.unlinkSync(log3); } catch {}
       try { if (fs.existsSync(log2)) fs.renameSync(log2, log3); } catch {}
       try { if (fs.existsSync(log1)) fs.renameSync(log1, log2); } catch {}
@@ -66,7 +71,10 @@ process.on('SIGINT', () => {
   writeErrorLog('AgentMonitor received SIGINT. Shutting down gracefully.');
   process.exit(0);
 });
+const PROBE_MODE = process.argv.includes('--test-scan');
+
 process.on('exit', code => {
+  if (PROBE_MODE) return;
   writeErrorLog(`AgentMonitor process exited with code ${code}.`);
 });
 
@@ -76,6 +84,31 @@ const WAITING_MAX_AGE_MS = 300_000;
 const TERMINAL_HOLD_MS = 8_000;
 const TASK_TEXT_MAX = 40;
 const QUOTA_POLL_MS = 60_000;
+const BALANCE_POLL_MS = 300_000; // 5 minutes
+const BALANCE_BACKOFF_MS = [60_000, 120_000, 300_000, 600_000, 900_000]; // 1m, 2m, 5m, 10m, 15m
+const BALANCE_TIMEOUT_MS = 10_000;
+
+function validateLoopbackUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'http:') return null;
+    const h = u.hostname.toLowerCase();
+    if (h !== '127.0.0.1' && h !== 'localhost') return null;
+    const port = parseInt(u.port, 10);
+    if (!Number.isFinite(port) || port < 1024 || port > 65535) return null;
+    return `http://127.0.0.1:${port}`;
+  } catch {
+    return null;
+  }
+}
+
+ // 10s
+
+function getCleanSubprocessEnv() {
+  const env = { ...process.env };
+  delete env.DEEPSEEK_API_KEY;
+  return env;
+}
 
 // dsh-pet 6-tier workStatusTexts mapping (Index 0..5)
 const WORK_STATUS_TEXTS = {
@@ -203,6 +236,7 @@ function getSystemDrives() {
 
   try {
     const stdout = execSync('fsutil fsinfo drives', {
+      env: getCleanSubprocessEnv(),
       encoding: 'utf8',
       stdio: ['ignore', 'pipe', 'ignore'],
       timeout: 1000,
@@ -317,7 +351,7 @@ function resolveCodexCli() {
 
   // 4. System PATH via where.exe
   try {
-    const out = execSync('where.exe codex.exe codex', { encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
+    const out = execSync('where.exe codex.exe codex', { env: getCleanSubprocessEnv(), encoding: 'utf8', stdio: ['pipe', 'pipe', 'ignore'] });
     for (const line of out.split(/\r?\n/)) {
       if (line.trim()) checkFile(line.trim());
     }
@@ -565,10 +599,239 @@ class AgentMonitor {
     this.paths = {
       appDir,
       refreshFlag: path.join(appDir, 'refresh-quota.flag'),
+      refreshBalanceFlag: path.join(appDir, 'refresh-balance.flag'),
+      balanceFile: path.join(appDir, 'runtime-balance.json'),
       antigravity: path.join(home, '.gemini', 'antigravity', 'brain'),
       codex: process.env.CODEX_HOME || path.join(home, '.codex'),
       dshDirs: resolveDshDirs()
     };
+
+    this.balanceBusy = false;
+    this.lastBalanceAt = 0;
+    this.lastBalanceFetchAttempt = 0;
+    this.lastFlagBalanceMtime = 0;
+    this.balanceBackoffIndex = -1;
+    this.balanceRetryAfterUntil = 0;
+    this.cachedBalanceData = null;
+    this.balanceGeneration = 0;
+    this.cachedDshPort = null;
+    this.lastDshPortCheck = 0;
+    this.activeHostSignature = null;
+  }
+
+  readPetConfig() {
+    try {
+      const configPath = path.join(this.paths.appDir, 'config.json');
+      if (fs.existsSync(configPath)) {
+        const raw = fs.readFileSync(configPath, 'utf8').replace(/^\uFEFF/, '');
+        return JSON.parse(raw);
+      }
+    } catch {}
+    return {};
+  }
+
+  resolveDshHomeDir(customDir) {
+    if (customDir && typeof customDir === 'string' && customDir.trim()) {
+      const p = customDir.trim();
+      try {
+        if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return p;
+      } catch {}
+      return null;
+    }
+
+    // 1. Explicit environment variables (highest priority)
+    for (const envVar of ['DSH_HOME', 'DEEPSEEK_HARNESS_HOME', 'DSH_DIR']) {
+      const envVal = process.env[envVar];
+      if (envVal && typeof envVal === 'string') {
+        const p = envVal.trim();
+        if (p) {
+          try {
+            if (fs.existsSync(p) && fs.statSync(p).isDirectory()) return p;
+          } catch {}
+        }
+      }
+    }
+
+    // 2. Standard user home and AppData locations
+    const home = os.homedir();
+    const candidates = [
+      path.join(home, '.dsh'),
+      process.env.LOCALAPPDATA ? path.join(process.env.LOCALAPPDATA, 'dsh') : null,
+      process.env.APPDATA ? path.join(process.env.APPDATA, 'dsh') : null
+    ].filter(Boolean);
+
+    // 3. Mounted system drives
+    for (const drive of getSystemDrives()) {
+      candidates.push(path.join(`${drive}\\`, 'dsh'));
+    }
+
+    for (const c of candidates) {
+      try {
+        if (fs.existsSync(c) && fs.statSync(c).isDirectory()) {
+          return c;
+        }
+      } catch {}
+    }
+
+    return null;
+  }
+
+  invalidateBalance(reason) {
+    this.balanceGeneration++;
+    this.cachedBalanceData = null;
+    this.lastBalanceFetchAttempt = 0;
+    this.balanceRetryAfterUntil = 0;
+    this.balanceBusy = false;
+    this.activeHostSignature = null;
+    this.cachedDshPort = null;
+    writeErrorLog(`Balance invalidated: ${reason} (new gen: ${this.balanceGeneration})`);
+    this.onChange({
+      type: 'balance',
+      provider: 'unknown',
+      providerFamily: 'deepseek',
+      credentialSource: 'dsh',
+      status: 'loading',
+      isAvailable: null,
+      currency: 'CNY',
+      balances: [],
+      hostCounter: null,
+      fetchedAt: Date.now(),
+      observedAt: null,
+      lastAttemptAt: Date.now(),
+      errorCode: null,
+      errorMessage: null
+    });
+  }
+
+  async findActiveDshBaseUrl(config, deadline = 0) {
+    const getRemaining = (capMs, minReq = 100) => {
+      if (!deadline) return capMs;
+      const rem = deadline - Date.now();
+      return rem >= minReq ? Math.min(capMs, rem) : 0;
+    };
+
+    if (config.DshCredentialReuseEnabled !== undefined && !this._warnedDshReuseDeprecated) {
+      this._warnedDshReuseDeprecated = true;
+      writeErrorLog('已忽略废弃配置键 DshCredentialReuseEnabled');
+    }
+    if (config.DshPort && /^\d+$/.test(String(config.DshPort).trim())) {
+      const p = parseInt(String(config.DshPort).trim(), 10);
+      const v = validateLoopbackUrl(`http://127.0.0.1:${p}`);
+      if (v) return v;
+    }
+    if (config.DshBaseUrl && typeof config.DshBaseUrl === 'string') {
+      const v = validateLoopbackUrl(config.DshBaseUrl.replace(/\/+$/, ''));
+      if (v) return v;
+    }
+
+    if (this.cachedDshPort) {
+      const rem = getRemaining(600);
+      if (rem > 0) {
+        try {
+          const testRes = await fetch(`http://127.0.0.1:${this.cachedDshPort}/dsh-pet-7340/state`, {
+            signal: AbortSignal.timeout(rem),
+            redirect: 'error'
+          });
+          const j = await testRes.json().catch(() => null);
+          if (testRes.status === 200 && j && j.sections && j.sections.balance) {
+            this.lastDshPortCheck = Date.now();
+            return `http://127.0.0.1:${this.cachedDshPort}`;
+          } else {
+            this.cachedDshPort = null;
+          }
+        } catch {
+          this.cachedDshPort = null;
+        }
+      } else {
+        this.cachedDshPort = null;
+      }
+    }
+
+    if (getRemaining(1000) <= 0) return null;
+
+    let dshPids = new Set();
+    try {
+      const taskTimeout = getRemaining(1500, 400);
+      if (taskTimeout > 0) {
+        const { stdout: taskOut } = await execFileAsync('tasklist.exe', [
+          '/fi', 'imagename eq DeepSeek Harness.exe',
+          '/fo', 'csv',
+          '/nh'
+        ], {
+          encoding: 'utf8',
+          timeout: taskTimeout,
+          signal: AbortSignal.timeout(taskTimeout),
+          windowsHide: true
+        });
+        for (const line of taskOut.split(/\r?\n/)) {
+          const parts = line.split('","');
+          if (parts.length >= 2) {
+            const pid = parseInt(parts[1], 10);
+            if (pid) dshPids.add(pid);
+          }
+        }
+      }
+    } catch {}
+
+    if (dshPids.size === 0) {
+      this.cachedDshPort = null;
+      return null;
+    }
+
+    if (getRemaining(1000) <= 0) return null;
+
+    const candidatePorts = [];
+    try {
+      const netTimeout = getRemaining(1500, 400);
+      if (netTimeout > 0) {
+        const { stdout: netOut } = await execFileAsync('netstat.exe', [
+          '-ano',
+          '-p', 'tcp'
+        ], {
+          encoding: 'utf8',
+          timeout: netTimeout,
+          signal: AbortSignal.timeout(netTimeout),
+          windowsHide: true
+        });
+        for (const line of netOut.split(/\r?\n/)) {
+          const parts = line.trim().split(/\s+/);
+          if (parts.length >= 5 && parts[0] === 'TCP' && parts[3] === 'LISTENING') {
+            const [addr, portStr] = parts[1].split(':');
+            if (addr === '127.0.0.1') {
+              const port = parseInt(portStr, 10);
+              const pid = parseInt(parts[4], 10);
+              if (dshPids.has(pid) && port >= 1024 && port <= 65535 && !candidatePorts.includes(port)) {
+                candidatePorts.push(port);
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+
+    // Cap candidate ports to 3 to prevent unlimited sequential probe accumulation
+    const portsToProbe = candidatePorts.slice(0, 3);
+    for (const port of portsToProbe) {
+      const probeTimeout = getRemaining(800, 200);
+      if (probeTimeout <= 0) break;
+      try {
+        const resp = await fetch(`http://127.0.0.1:${port}/dsh-pet-7340/state`, {
+          signal: AbortSignal.timeout(probeTimeout),
+          redirect: 'error'
+        });
+        if (resp.status === 200) {
+          const json = await resp.json().catch(() => null);
+          if (json && json.sections && json.sections.balance) {
+            this.cachedDshPort = port;
+            this.lastDshPortCheck = Date.now();
+            return `http://127.0.0.1:${port}`;
+          }
+        }
+      } catch {}
+    }
+
+    this.cachedDshPort = null;
+    return null;
   }
 
   startParentWatchdog(parentPid) {
@@ -605,6 +868,7 @@ class AgentMonitor {
     if (this.timer) return;
     this.scan();
     this.pollQuota(true);
+    this.pollBalance(true);
     if (this.parentPid) {
       this.startParentWatchdog(this.parentPid);
     }
@@ -612,6 +876,7 @@ class AgentMonitor {
     this.timer = setInterval(() => {
       this.scan();
       this.checkQuotaTrigger();
+      this.checkBalanceTrigger();
     }, SCAN_MS);
   }
 
@@ -623,6 +888,471 @@ class AgentMonitor {
     if (this.parentWatchTimer) {
       clearInterval(this.parentWatchTimer);
       this.parentWatchTimer = null;
+    }
+  }
+
+
+  checkBalanceTrigger() {
+    const config = this.readPetConfig();
+    const configSig = `${config.DeepSeekBalanceEnabled}:${config.DshPort || 0}:${config.DshBaseUrl || ''}`;
+    if (this.lastConfigSig !== undefined && this.lastConfigSig !== configSig) {
+      this.lastConfigSig = configSig;
+      this.invalidateBalance('CONFIG_CHANGED');
+      this.pollBalance(true);
+      return;
+    }
+    this.lastConfigSig = configSig;
+    const now = Date.now();
+    let force = false;
+    try {
+      if (fs.existsSync(this.paths.refreshBalanceFlag)) {
+        const st = fs.statSync(this.paths.refreshBalanceFlag);
+        if (st.mtimeMs > this.lastFlagBalanceMtime) {
+          this.lastFlagBalanceMtime = st.mtimeMs;
+          force = true;
+        }
+        try { fs.unlinkSync(this.paths.refreshBalanceFlag); } catch {}
+      }
+    } catch {}
+
+    // 10 minutes staleness detection (2 * 5m cycle)
+    if (this.cachedBalanceData?.status === 'ok' && (now - (this.cachedBalanceData.fetchedAt || 0) > 600_000)) {
+      this.cachedBalanceData.status = 'stale';
+      this.onChange(this.cachedBalanceData);
+    }
+
+    const interval = (this.balanceBackoffIndex >= 0)
+      ? BALANCE_BACKOFF_MS[Math.min(this.balanceBackoffIndex, BALANCE_BACKOFF_MS.length - 1)]
+      : BALANCE_POLL_MS;
+
+    if (force || (now - this.lastBalanceAt >= interval)) {
+      this.pollBalance(force);
+    }
+  }
+
+  async pollBalance(force = false) {
+    if (this.balanceBusy) return;
+    const now = Date.now();
+    const config = this.readPetConfig();
+
+    const balanceEnabled = (config.DeepSeekBalanceEnabled !== false);
+    if (!balanceEnabled) {
+      this.cachedBalanceData = null;
+      const data = {
+        type: 'balance',
+        provider: 'unknown',
+        providerFamily: 'deepseek',
+        credentialSource: 'dsh',
+        status: 'dsh_disabled',
+        isAvailable: false,
+        currency: 'CNY',
+        balances: [],
+        hostCounter: null,
+        fetchedAt: Date.now(),
+        observedAt: null,
+        lastAttemptAt: now,
+        errorCode: 'BALANCE_DISABLED',
+        errorMessage: 'DeepSeek 余额服务未启用（可在菜单中开启）'
+      };
+      this.onChange(data);
+      return;
+    }
+
+    if (this.lastBalanceFetchAttempt && (now - this.lastBalanceFetchAttempt < 10_000)) {
+      if (force && this.cachedBalanceData) {
+        const sec = Math.max(1, Math.ceil((10_000 - (now - this.lastBalanceFetchAttempt)) / 1000));
+        const data = {
+          ...this.cachedBalanceData,
+          lastAttemptAt: now,
+          errorCode: 'COOLDOWN',
+          errorMessage: `刷新过于频繁，请等待 ${sec} 秒后再试`
+        };
+        this.onChange(data);
+      }
+      return;
+    }
+
+    if (this.balanceRetryAfterUntil > now) {
+      if (force && this.cachedBalanceData) {
+        const sec = Math.max(1, Math.ceil((this.balanceRetryAfterUntil - now) / 1000));
+        const data = {
+          ...this.cachedBalanceData,
+          status: 'stale',
+          lastAttemptAt: now,
+          errorCode: 'RATE_LIMITED',
+          errorMessage: `请求频率超限，重试需等待 ${sec} 秒`
+        };
+        this.onChange(data);
+      }
+      return;
+    }
+
+    this.balanceBusy = true;
+    this.lastBalanceAt = now;
+    this.lastBalanceFetchAttempt = now;
+    const currentGen = ++this.balanceGeneration;
+
+    // 全链路统一总截止时间预算：10秒（前端设置15秒期限，预留5秒调度冗余）
+    const TOTAL_BALANCE_BUDGET_MS = 10_000;
+    const deadline = now + TOTAL_BALANCE_BUDGET_MS;
+    const getRemainingBudget = (capMs = 10_000, minReq = 150) => {
+      const rem = deadline - Date.now();
+      return rem >= minReq ? Math.min(capMs, rem) : 0;
+    };
+
+    try {
+      if (getRemainingBudget(10_000, 300) <= 0) {
+        throw new Error('DSH_DEADLINE_EXCEEDED: 全链路查询预算耗尽');
+      }
+
+      const baseUrl = await this.findActiveDshBaseUrl(config, deadline);
+      if (this.balanceGeneration !== currentGen) return;
+
+      if (!baseUrl) {
+        // 未发现运行中的 DSH：清空旧金额，不残留旧账户数据
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: 'unknown',
+          providerFamily: 'deepseek',
+          credentialSource: 'dsh',
+          status: 'dsh_not_running',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: null,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode: 'DSH_NOT_RUNNING',
+          errorMessage: 'DSH 未运行，请启动 DeepSeek Harness'
+        };
+        this.onChange(data);
+        return;
+      }
+
+      let manualRefreshFailed = false;
+      if (force) {
+        const postBudget = getRemainingBudget(3500, 400);
+        if (postBudget > 0) {
+          try {
+            const postResp = await fetch(`${baseUrl}/dsh-pet-7340/balance`, {
+              method: 'POST',
+              redirect: 'error',
+              signal: AbortSignal.timeout(postBudget)
+            });
+            if (this.balanceGeneration !== currentGen) return;
+            if (postResp.status !== 200) {
+              manualRefreshFailed = true;
+              writeErrorLog(`DSH /balance POST returned HTTP ${postResp.status}`);
+            } else {
+              const postJson = await postResp.json().catch(() => null);
+              if (this.balanceGeneration !== currentGen) return;
+              if (!postJson || postJson.ok !== true) {
+                manualRefreshFailed = true;
+              }
+            }
+          } catch (postErr) {
+            if (this.balanceGeneration !== currentGen) return;
+            manualRefreshFailed = true;
+            writeErrorLog(`DSH /balance POST error: ${postErr.message}`);
+          }
+        } else {
+          manualRefreshFailed = true;
+        }
+      }
+
+      const getBudget = getRemainingBudget(5000, 300);
+      if (getBudget <= 0) {
+        throw new Error('DSH_DEADLINE_EXCEEDED: 全链路查询预算耗尽');
+      }
+
+      const stateResp = await fetch(`${baseUrl}/dsh-pet-7340/state`, {
+        method: 'GET',
+        headers: { 'Accept': 'application/json' },
+        redirect: 'error',
+        signal: AbortSignal.timeout(getBudget)
+      });
+
+      if (this.balanceGeneration !== currentGen) return;
+
+      if (stateResp.status === 429) {
+        let retrySec = 60;
+        const raHeader = stateResp.headers.get('retry-after');
+        if (raHeader) {
+          const parsedRa = parseInt(raHeader, 10);
+          if (Number.isFinite(parsedRa) && parsedRa > 0) retrySec = parsedRa;
+        }
+        this.balanceRetryAfterUntil = Date.now() + (retrySec * 1000);
+        this.balanceBackoffIndex = Math.min((this.balanceBackoffIndex >= 0 ? this.balanceBackoffIndex + 1 : 0), BALANCE_BACKOFF_MS.length - 1);
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: 'unknown',
+          providerFamily: 'deepseek',
+          credentialSource: 'dsh',
+          isAvailable: false,
+          status: 'error',
+          balances: [],
+          hostCounter: null,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: Date.now(),
+          errorCode: 'RATE_LIMITED',
+          errorMessage: `请求频率超限，重试需等待 ${retrySec} 秒`
+        };
+        this.onChange(data);
+        return;
+      }
+
+      if (stateResp.status !== 200) {
+        throw new Error(`DSH_HTTP_${stateResp.status}: DSH 状态接口返回 ${stateResp.status}`);
+      }
+
+      const stateJson = await stateResp.json();
+      if (this.balanceGeneration !== currentGen) return;
+
+      const balanceSection = stateJson?.sections?.balance;
+      if (!balanceSection || typeof balanceSection !== 'object') {
+        throw new Error('DSH_BALANCE_MISSING: DSH 响应中未包含 balance 状态块');
+      }
+
+      const counter = (typeof balanceSection.counter === 'number' && Number.isFinite(balanceSection.counter) && balanceSection.counter > 0)
+        ? balanceSection.counter
+        : null;
+
+      const result = balanceSection.data;
+      if (!result || typeof result !== 'object') {
+        throw new Error('DSH_DATA_MISSING: sections.balance 中未包含 data 结果对象');
+      }
+
+      // Handle ok === false (BalanceUnavailable / credential-missing / unsupported)
+      if (result.ok === false) {
+        const reason = String(result.reason || '');
+        let errorCode = 'DSH_FETCH_ERROR';
+        let errorMessage = 'DSH 余额获取失败';
+        if (reason === 'unsupported') {
+          errorCode = 'DSH_UNSUPPORTED';
+          errorMessage = '当前服务商不支持余额查询';
+        } else if (reason === 'credential-missing') {
+          errorCode = 'DSH_CREDENTIAL_MISSING';
+          errorMessage = '请在 DSH 中配置当前服务商凭据';
+        }
+        // P1-1: 凭据缺失或服务商不匹配时，彻底清空旧余额，不残留上一账户金额
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: result.provider || 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: counter,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode,
+          errorMessage
+        };
+        this.onChange(data);
+        return;
+      }
+
+      // Validate ok === true
+      if (result.ok !== true) {
+        throw new Error('DSH_FORMAT_ERROR: 响应缺失 ok: true 标识');
+      }
+
+      // Validate shape === 'money'
+      if (result.shape !== 'money') {
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: result.provider || 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: counter,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode: 'DSH_UNSUPPORTED_SHAPE',
+          errorMessage: `当前余额形态 (${result.shape || '未知'}) 不支持展示人民币`
+        };
+        this.onChange(data);
+        return;
+      }
+
+      // Extract wallets array
+      let rawWallets = null;
+      if (result.data && typeof result.data === 'object' && Array.isArray(result.data.wallets)) {
+        rawWallets = result.data.wallets;
+      } else if (Array.isArray(result.wallets)) {
+        rawWallets = result.wallets;
+      } else if (result.data && typeof result.data === 'object' && result.data.currency) {
+        rawWallets = [result.data];
+      }
+
+      if (!Array.isArray(rawWallets)) {
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: result.provider || 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: counter,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode: 'DSH_FORMAT_ERROR',
+          errorMessage: 'DSH 响应格式异常：缺失 wallets 钱包列表'
+        };
+        this.onChange(data);
+        return;
+      }
+
+      // Parse CNY wallet
+      const isValidDecimal = (v) => typeof v === 'string' && /^-?\d+(\.\d+)?$/.test(v.trim());
+      const balances = [];
+      let cnyFormatError = null;
+
+      for (const w of rawWallets) {
+        if (!w || typeof w !== 'object') continue;
+        const currency = String(w.currency || '').toUpperCase().trim();
+        if (currency !== 'CNY') continue;
+
+        const totalRaw = typeof w.total === 'string' ? w.total : (typeof w.total === 'number' ? String(w.total) : null);
+        if (!totalRaw || !isValidDecimal(totalRaw)) {
+          cnyFormatError = 'DSH 余额数值非法或非数字';
+          break;
+        }
+
+        const toppedUpRaw = typeof w.toppedUp === 'string' && isValidDecimal(w.toppedUp) ? w.toppedUp.trim() : null;
+        const grantedRaw = typeof w.granted === 'string' && isValidDecimal(w.granted) ? w.granted.trim() : null;
+
+        balances.push({
+          currency: 'CNY',
+          totalBalance: totalRaw.trim(),
+          toppedUpBalance: toppedUpRaw,
+          grantedBalance: grantedRaw
+        });
+      }
+
+      if (cnyFormatError) {
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: result.provider || 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: counter,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode: 'DSH_FORMAT_ERROR',
+          errorMessage: cnyFormatError
+        };
+        this.onChange(data);
+        return;
+      }
+
+      // P1-1: 账户归属判定与不透明代次
+      // 严正准则：不得将 balance.counter 当作账户标识，普通刷新改变 counter 不得误报账户切换
+      const accountOpaqueId = result.accountContext || result.accountId || result.credentialGeneration || null;
+      const hostSig = accountOpaqueId
+        ? `${baseUrl}:${result.provider || ''}:${accountOpaqueId}`
+        : `${baseUrl}:${result.provider || ''}`;
+
+      if (this.activeHostSignature !== null && this.activeHostSignature !== hostSig) {
+        writeErrorLog(`DSH host context changed: ${this.activeHostSignature} -> ${hostSig}`);
+        this.cachedBalanceData = null;
+        this.balanceBackoffIndex = -1;
+      }
+      this.activeHostSignature = hostSig;
+
+      this.balanceBackoffIndex = -1;
+
+      // P1-1: 刷新失败时账户归属无法确认，绝不沿用/输出旧快照金额，强制清空缓存并设 balances 为空
+      if (force && manualRefreshFailed) {
+        this.cachedBalanceData = null;
+        const data = {
+          type: 'balance',
+          provider: result.provider || 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: false,
+          currency: 'CNY',
+          balances: [], // 彻底清空！不可确认归属时绝不保留历史快照金额！
+          hostCounter: counter,
+          fetchedAt: Date.now(),
+          observedAt: null,
+          lastAttemptAt: now,
+          errorCode: 'REFRESH_FAILED',
+          errorMessage: '宿主刷新接口请求失败，已清空无法确认归属的历史金额（点击 ↻ 重试）'
+        };
+        this.onChange(data);
+        return;
+      }
+
+      const isAvailable = (typeof result.is_available === 'boolean') ? result.is_available : null;
+
+      const data = {
+        type: 'balance',
+        provider: result.provider || 'deepseek',
+        credentialSource: 'dsh',
+        status: 'ok',
+        isAvailable,
+        currency: 'CNY',
+        balances,
+        hostCounter: counter,
+        fetchedAt: Date.now(),
+        observedAt: null,
+        lastAttemptAt: now,
+        errorCode: null,
+        errorMessage: null
+      };
+      this.cachedBalanceData = data;
+      this.onChange(data);
+
+    } catch (err) {
+      if (this.balanceGeneration !== currentGen) return;
+      writeErrorLog(`DSH balance query error: ${err.message}`);
+      this.balanceBackoffIndex = Math.min((this.balanceBackoffIndex >= 0 ? this.balanceBackoffIndex + 1 : 0), BALANCE_BACKOFF_MS.length - 1);
+
+      // P1-1: 保守降级：查询失败时清空无法确认归属的旧金额，避免换账户后展示旧账户缓存或触发旧账户报警
+      this.cachedBalanceData = null;
+      const isTimeout = err.name === 'TimeoutError' || err.name === 'AbortError' || err.message.includes('DEADLINE') || err.message.includes('timeout') || err.message.includes('aborted');
+
+      const data = {
+        type: 'balance',
+        provider: 'unknown',
+        providerFamily: 'deepseek',
+        credentialSource: 'dsh',
+        status: 'error',
+        isAvailable: null,
+        currency: 'CNY',
+        balances: [], // 彻底清空！
+        hostCounter: null,
+        fetchedAt: Date.now(),
+        observedAt: null,
+        lastAttemptAt: now,
+        errorCode: isTimeout ? 'TIMEOUT' : 'DSH_FETCH_ERROR',
+        errorMessage: isTimeout ? '查询 DSH 余额超时（已达全链路10秒上限）' : (err.message.startsWith('DSH_') ? err.message : '连接 DSH 宿主失败')
+      };
+      this.onChange(data);
+    } finally {
+      if (this.balanceGeneration === currentGen) {
+        this.balanceBusy = false;
+      }
     }
   }
 
@@ -1783,6 +2513,8 @@ if (isMain) {
       try {
         if (data.type === 'quota') {
           atomicWriteJson(path.join(appDir, 'runtime-quota.json'), data);
+        } else if (data.type === 'balance') {
+          atomicWriteJson(path.join(appDir, 'runtime-balance.json'), data);
         } else {
           atomicWriteJson(path.join(appDir, 'runtime-status.json'), data);
         }
