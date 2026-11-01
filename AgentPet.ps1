@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.5.0"
+$script:AppVersion = "1.5.1"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -101,11 +101,16 @@ if (-not $mutexCreated) {
 }
 
 # Record own PID metadata for safe process termination & path validation (P0-1)
+$script:AppStartTimeMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+try {
+    $staleStopFlag = Join-Path (Join-Path $BaseDir "runtime") "stop.flag"
+    if (Test-Path $staleStopFlag) { Remove-Item $staleStopFlag -Force -ErrorAction SilentlyContinue }
+} catch {}
 try {
     $appPidMeta = @{
         pid = $PID
         path = (Join-Path $BaseDir "AgentPet.ps1")
-        startTime = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        startTime = $script:AppStartTimeMs
         baseDir = $BaseDir
     }
     [System.IO.File]::WriteAllText($script:AppPidPath, ($appPidMeta | ConvertTo-Json -Compress), [System.Text.Encoding]::UTF8)
@@ -1539,6 +1544,8 @@ function Request-QuotaRefresh {
 # ============================================================================
 $script:lastBalanceMtime   = [DateTime]::MinValue
 $script:lastBalanceObject  = $null
+$script:balanceStartupPending  = $false
+$script:balanceStartupDeadline = $null
 $script:isLowBalance       = $false
 $script:lowBalanceHostSig  = ""
 $script:lowBalanceAlertArmed = $false
@@ -1546,20 +1553,24 @@ $script:lowBalanceAlertArmed = $false
 $script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
 $script:balanceRequestTimeout = $null
 
-function Request-BalanceRefresh {
+function Request-BalanceRefresh([switch]$Silent) {
     $now = [DateTime]::UtcNow
     $span = ($now - $script:lastBalanceRefreshRequestTime).TotalSeconds
     if ($span -lt 10.0) {
-        $rem = [int][Math]::Ceiling(10.0 - $span)
-        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "冷却中 (${rem}s)" }
+        if (-not $Silent) {
+            $rem = [int][Math]::Ceiling(10.0 - $span)
+            if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "冷却中 (${rem}s)" }
+        }
         return
     }
 
     $script:lastBalanceRefreshRequestTime = $now
-    $script:balanceRequestTimeout = $now.AddSeconds(15.0)
+    if (-not $Silent) {
+        $script:balanceRequestTimeout = $now.AddSeconds(15.0)
+    }
     try {
         [System.IO.File]::WriteAllText($RefreshBalanceFlagPath, [DateTime]::UtcNow.Ticks.ToString(), [System.Text.Encoding]::UTF8)
-        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "刷新中..." }
+        if ((-not $Silent) -and $DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "刷新中..." }
     } catch {}
 }
 
@@ -1646,14 +1657,25 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     }
 
     if ($st -eq "loading") {
-        $DeepSeekStatusNotice.Text = "查询中..."
+        $DeepSeekStatusNotice.Text = if ($IsInitialStartup) { "启动同步中..." } else { "查询中..." }
         if (-not $balObj.balances -or $balObj.balances.Count -eq 0) {
             $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
             $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-            $DeepSeekMsgTitle.Text       = "正在查询余额..."
-            $DeepSeekMsgDetail.Text      = "首次联网请求中，请稍候~"
+            $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
+            $DeepSeekMsgTitle.Text       = if ($IsInitialStartup) { "启动同步中..." } else { "正在查询余额..." }
+            $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "首次联网请求中，请稍候~" }
             return
         }
+    }
+
+    if ($st -eq "unavailable") {
+        $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+        $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
+        $DeepSeekStatusNotice.Text   = "暂不可用"
+        $DeepSeekMsgTitle.Text       = "暂不可用"
+        $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { "$($balObj.errorMessage)（点击 ↻ 重试）" } else { "启动后未获取到余额数据（点击 ↻ 重试）" }
+        return
     }
 
     if ($st -eq "error") {
@@ -1758,6 +1780,8 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
 
 function Read-InitialBalanceSnapshot {
     if ($Config.DeepSeekBalanceEnabled -eq $false) {
+        $script:balanceStartupPending  = $false
+        $script:balanceStartupDeadline = $null
         Apply-BalanceObject @{
             type = "balance"
             provider = "unknown"
@@ -1771,7 +1795,13 @@ function Read-InitialBalanceSnapshot {
         return
     }
 
-    # P1-4: Confirm active DSH session context before accepting balance amount
+    $script:lastBalanceMtime = if (Test-Path $RuntimeBalancePath) {
+        (Get-Item $RuntimeBalancePath -ErrorAction SilentlyContinue).LastWriteTimeUtc
+    } else { [DateTime]::MinValue }
+    $script:balanceStartupPending  = $true
+    $script:balanceStartupDeadline = [DateTime]::UtcNow.AddSeconds(15)
+
+    # P1-4 & WO-35: Confirm active DSH session context before accepting balance amount
     Apply-BalanceObject @{
         type = "balance"
         provider = "unknown"
@@ -1780,8 +1810,9 @@ function Read-InitialBalanceSnapshot {
         balances = @()
         isAvailable = $null
         errorCode = $null
-        errorMessage = $null
+        errorMessage = "启动同步中..."
     } -IsInitialStartup
+    Request-BalanceRefresh -Silent
 }
 
 # ============================================================================
@@ -2843,7 +2874,7 @@ function Poll-AgentMonitor {
         }
     }
 
-    # 3. Watch runtime-balance.json file modification
+    # 3. Watch runtime-balance.json file modification (WO-35 baseline & 15s startup deadline)
     if (Test-Path $RuntimeBalancePath) {
         try {
             $item = Get-Item $RuntimeBalancePath -ErrorAction SilentlyContinue
@@ -2854,10 +2885,26 @@ function Poll-AgentMonitor {
                     $script:lastBalanceMtime = $item.LastWriteTimeUtc
                     $script:lastBalanceObject = $b
                     Apply-BalanceObject $b
+                    $script:balanceStartupPending = $false
+                    $script:balanceStartupDeadline = $null
                 }
             }
         } catch {
             Log-Throttled "BalanceRead" "Failed to parse runtime-balance.json: $($_.Exception.Message)"
+        }
+    }
+    if ($script:balanceStartupPending -and $script:balanceStartupDeadline -and ([DateTime]::UtcNow -ge $script:balanceStartupDeadline)) {
+        $script:balanceStartupPending = $false
+        $script:balanceStartupDeadline = $null
+        Apply-BalanceObject @{
+            type = "balance"
+            provider = "unknown"
+            providerFamily = "deepseek"
+            status = "unavailable"
+            balances = @()
+            isAvailable = $false
+            errorCode = "STARTUP_TIMEOUT"
+            errorMessage = "启动后未获取到余额数据"
         }
     }
 
@@ -2961,6 +3008,32 @@ $Timer.Add_Tick({
     $now = [DateTime]::UtcNow
     $script:tickCounter++
 
+    # 0.0 Check graceful stop flag from stop-agent.ps1 (with freshness & startup timestamp guard)
+    $stopFlag = Join-Path (Join-Path $BaseDir "runtime") "stop.flag"
+    if (Test-Path $stopFlag) {
+        $validStop = $false
+        try {
+            $flagItem = Get-Item $stopFlag -ErrorAction SilentlyContinue
+            $rawTs = ([System.IO.File]::ReadAllText($stopFlag, [System.Text.Encoding]::UTF8)).Trim()
+            $flagMs = [long]0
+            $nowEpochMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+            if ([long]::TryParse($rawTs, [ref]$flagMs)) {
+                if ($flagMs -ge $script:AppStartTimeMs -and ($nowEpochMs - $flagMs) -le 60000) { $validStop = $true }
+            } elseif ($flagItem) {
+                $flagMtimeMs = ([DateTimeOffset]$flagItem.LastWriteTimeUtc).ToUnixTimeMilliseconds()
+                if ($flagMtimeMs -ge $script:AppStartTimeMs -and (([DateTime]::UtcNow - $flagItem.LastWriteTimeUtc).TotalSeconds -le 60)) { $validStop = $true }
+            }
+        } catch {}
+        try { Remove-Item $stopFlag -Force -ErrorAction SilentlyContinue } catch {}
+        if ($validStop) {
+            Write-PetLog "Received graceful stop signal (stop.flag). Closing window..."
+            Request-AgentPetExit
+            return
+        } else {
+            Write-PetLog "Ignored stale stop.flag from before current process start."
+        }
+    }
+
     # 0. Check wake flag from duplicate launch (recover bounds + bring to front + bounce)
     $wakeFlag = Join-Path $BaseDir "wake.flag"
     if (Test-Path $wakeFlag) {
@@ -2974,8 +3047,7 @@ $Timer.Add_Tick({
 
         $Window.Opacity = 1.0
         $Window.Visibility = [System.Windows.Visibility]::Visible
-        $Window.Topmost = $true
-        $Window.Activate()
+        Set-AgentPetWindowVisible $true
         Trigger-PetBounce
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(2.0)
@@ -3122,6 +3194,13 @@ $Window.Add_Loaded({
     $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
     Set-ActiveBubblePanel "quote"
     Show-Bubble 5.5
+})
+
+$Window.Add_ContentRendered({
+    if ([bool]$Config.StartHidden) {
+        Set-AgentPetWindowVisible $false
+        Update-TrayTooltip -Force
+    }
 })
 
 $Window.Add_Closed({

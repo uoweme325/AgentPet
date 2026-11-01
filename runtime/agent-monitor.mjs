@@ -211,14 +211,59 @@ function formatPlanLabel(rawPlan) {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-function atomicWriteJson(filePath, data) {
+function atomicWriteJson(filePath, data, silent = false) {
   const tmpPath = `${filePath}.${process.pid}.tmp`;
   try {
     fs.writeFileSync(tmpPath, JSON.stringify(data, null, 2), 'utf8');
     fs.renameSync(tmpPath, filePath);
+    return true;
   } catch (err) {
-    writeErrorLog(`atomicWriteJson failed for ${path.basename(filePath)}: ${err.message}`);
+    if (!silent) {
+      writeErrorLog(`atomicWriteJson failed for ${path.basename(filePath)}: ${err.message}`);
+    }
     try { fs.unlinkSync(tmpPath); } catch {}
+    return false;
+  }
+}
+
+const pendingWrites = new Map();
+
+function writeJsonWithRetry(filePath, data) {
+  const json = JSON.stringify(data);
+  const prev = pendingWrites.get(filePath);
+  if (prev && prev.json === json) return false;
+  if (atomicWriteJson(filePath, data, true)) {
+    pendingWrites.delete(filePath);
+    return true;
+  }
+  pendingWrites.set(filePath, { payload: data, json, attempts: 1, nextAt: Date.now() + 100 });
+  return false;
+}
+
+function flushPendingWrites(now = Date.now()) {
+  for (const [filePath, item] of pendingWrites) {
+    if (now < item.nextAt) continue;
+    if (atomicWriteJson(filePath, item.payload, true)) {
+      pendingWrites.delete(filePath);
+      continue;
+    }
+    item.attempts += 1;
+    if (item.attempts > 2) {
+      pendingWrites.delete(filePath);
+      writeErrorLog(`write retry exhausted for ${path.basename(filePath)}, giving up (${item.json.length} bytes); file may be stale`);
+      continue;
+    }
+    item.nextAt = now + 100 * item.attempts;
+  }
+}
+
+function dispatchRuntimeWrite(baseDir, data) {
+  if (data.type === 'quota') {
+    return writeJsonWithRetry(path.join(baseDir, 'runtime-quota.json'), data);
+  } else if (data.type === 'balance') {
+    return writeJsonWithRetry(path.join(baseDir, 'runtime-balance.json'), data);
+  } else {
+    return writeJsonWithRetry(path.join(baseDir, 'runtime-status.json'), data);
   }
 }
 
@@ -473,22 +518,27 @@ function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
 function isStateFresh(state, now) {
   if (!state || !state.state) return false;
   const age = now - (state.at || 0);
+  if (isHeldState(state)) return age < WAITING_MAX_AGE_MS;
   if (state.state === 'success' || state.state === 'result' || state.state === 'error') {
     return age < TERMINAL_HOLD_MS;
-  }
-  if (state.state === 'waiting' || state.state === 'approval' || state.state === 'stalled') {
-    return age < 300000;
   }
   return age < ACTIVE_MAX_AGE_MS;
 }
 
 function refreshDynamicState(state, now, stallEnabled, stallMs) {
   if (!state) return null;
-  if (!state.inFlight) return isStateFresh(state, now) ? state : null;
+  if (!state.inFlight) {
+    if (state.nextState && now - (state.at || 0) >= TERMINAL_HOLD_MS) {
+      const next = { ...state, ...state.nextState, at: state.at, inFlight: false };
+      delete next.nextState;
+      return isStateFresh(next, now) ? next : null;
+    }
+    return isStateFresh(state, now) ? state : null;
+  }
   if (state.state === 'waiting' || state.state === 'approval') return isStateFresh(state, now) ? state : null;
   const startedAt = Number(state.startedAt || state.at || 0);
   const ageMs = now - startedAt;
-  if (ageMs < 0 || ageMs >= 300000) return null;
+  if (ageMs < 0 || ageMs >= WAITING_MAX_AGE_MS) return null;
   const stalled = Boolean(stallEnabled && ageMs >= stallMs);
   const base = state.baseTask || state.task || state.toolName || '工具';
   const ageSeconds = Math.floor(ageMs / 5000) * 5;
@@ -602,6 +652,7 @@ class AgentMonitor {
       refreshBalanceFlag: path.join(appDir, 'refresh-balance.flag'),
       balanceFile: path.join(appDir, 'runtime-balance.json'),
       antigravity: path.join(home, '.gemini', 'antigravity', 'brain'),
+      antigravityDb: path.join(home, '.gemini', 'antigravity', 'conversations'),
       codex: process.env.CODEX_HOME || path.join(home, '.codex'),
       dshDirs: resolveDshDirs()
     };
@@ -874,6 +925,7 @@ class AgentMonitor {
     }
     // Keep timer referenced so the Node.js event loop runs permanently as a background daemon
     this.timer = setInterval(() => {
+      flushPendingWrites(Date.now());
       this.scan();
       this.checkQuotaTrigger();
       this.checkBalanceTrigger();
@@ -1580,12 +1632,13 @@ class AgentMonitor {
     if (db && (db.state === 'waiting' || db.state === 'approval')) return db;
     if (tx && tx.inFlight && !db) return tx;
     if (tx && tx.inFlight && sameConversation && txIdx >= dbIdx - 1) return tx;
-    return db || tx;
+    if (sameConversation) return db || tx;
+    return this.selectBest(db, tx, now);
   }
 
   checkAntigravityDb(now) {
     if (!DatabaseSync) return null;
-    const convDir = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
+    const convDir = this.paths.antigravityDb || path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
     if (!fs.existsSync(convDir)) return null;
     let candidates = this.antigravityDbCandidates;
     if (now - this.lastAgDbScan >= 2000 || candidates === null) {
@@ -1606,12 +1659,17 @@ class AgentMonitor {
     const sessions = [];
     for (const candidate of candidates) {
       const cached = this.antigravityDbCache.get(candidate.file);
-      const ageLimit = isHeldState(cached?.state) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS;
+      const cachedState = cached?.state;
+      const ageLimit = cachedState === undefined
+        ? WAITING_MAX_AGE_MS
+        : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
       if (now - candidate.mtime >= ageLimit) continue;
-      const state = cached && cached.mtime === candidate.mtime
-        ? refreshDynamicState(cached.state, now, this.stallEnabled, this.stallMs)
-        : this.checkAntigravityDbSingle(now, candidate.file, candidate.mtime);
-      if (!cached || cached.mtime !== candidate.mtime) this.antigravityDbCache.set(candidate.file, { mtime: candidate.mtime, state });
+      let rawState = cachedState;
+      if (!cached || cached.mtime !== candidate.mtime) {
+        rawState = this.checkAntigravityDbSingle(now, candidate.file, candidate.mtime);
+        this.antigravityDbCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
+      }
+      const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
         const rawId = path.basename(candidate.file);
         sessions.push({ ...state, sessionId: rawId, rawId });
@@ -1636,8 +1694,8 @@ class AgentMonitor {
 
   checkAntigravityDbSingle(now, forcedDb = null, forcedMtime = 0) {
     if (!DatabaseSync) return null;
-    const convDir = path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
-    if (!fs.existsSync(convDir)) return null;
+    const convDir = this.paths.antigravityDb || path.join(os.homedir(), '.gemini', 'antigravity', 'conversations');
+    if (!forcedDb && !fs.existsSync(convDir)) return null;
 
     let latestDb = forcedDb;
     let latestMtime = forcedMtime;
@@ -1676,9 +1734,20 @@ class AgentMonitor {
       const inFlight = !terminal.has(Number(row.status));
       if (row.step_type === 132) {
         const baseTask = cleanSummary(p.toolSummary || p.toolName || '正在执行工具');
+        const nextTask = p.toolSummary ? `推进中 (${p.toolSummary})` : '正在分析结果并构思下一步…';
         if (inFlight) return { source: 'Antigravity', state: 'working', task: baseTask, baseTask, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
-        if (now - latestMtime < TERMINAL_HOLD_MS) return { source: 'Antigravity', state: 'result', task: p.toolSummary ? `已完成: ${p.toolSummary}` : '步骤执行完毕', at: latestMtime, stepIdx: row.idx, inFlight: false };
-        return { source: 'Antigravity', state: 'thinking', task: p.toolSummary ? `推进中 (${p.toolSummary})` : '正在分析结果并构思下一步…', at: latestMtime, stepIdx: row.idx, inFlight: false };
+        if (now - latestMtime < TERMINAL_HOLD_MS) {
+          return {
+            source: 'Antigravity',
+            state: 'result',
+            task: p.toolSummary ? `已完成: ${p.toolSummary}` : '步骤执行完毕',
+            nextState: { state: 'thinking', task: nextTask },
+            at: latestMtime,
+            stepIdx: row.idx,
+            inFlight: false
+          };
+        }
+        return { source: 'Antigravity', state: 'thinking', task: nextTask, at: latestMtime, stepIdx: row.idx, inFlight: false };
       }
       if (row.step_type === 15) {
         if (inFlight) return { source: 'Antigravity', state: 'thinking', task: '正在深度思考与规划…', baseTask: '正在深度思考与规划…', at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
@@ -1724,12 +1793,17 @@ class AgentMonitor {
     const sessions = [];
     for (const candidate of candidates) {
       const cached = this.antigravityTranscriptCache.get(candidate.file);
-      const ageLimit = isHeldState(cached?.state) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS;
+      const cachedState = cached?.state;
+      const ageLimit = cachedState === undefined
+        ? WAITING_MAX_AGE_MS
+        : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
       if (now - candidate.mtime >= ageLimit) continue;
-      const state = cached && cached.mtime === candidate.mtime
-        ? refreshDynamicState(cached.state, now, this.stallEnabled, this.stallMs)
-        : this.checkAntigravityTranscriptSingle(now, candidate.file, candidate.mtime);
-      if (!cached || cached.mtime !== candidate.mtime) this.antigravityTranscriptCache.set(candidate.file, { mtime: candidate.mtime, state });
+      let rawState = cachedState;
+      if (!cached || cached.mtime !== candidate.mtime) {
+        rawState = this.checkAntigravityTranscriptSingle(now, candidate.file, candidate.mtime);
+        this.antigravityTranscriptCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
+      }
+      const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) sessions.push({
         ...state,
         sessionId: path.basename(path.dirname(path.dirname(path.dirname(candidate.file)))),
@@ -1781,12 +1855,23 @@ class AgentMonitor {
 
       const lines = this.readTailLines(latestFile, 65536);
       let res = null;
+      const closedCallIds = new Set();
+      let seenLaterStep = false;
       for (let i = lines.length - 1; i >= 0; i--) {
         let entry;
         try { entry = JSON.parse(lines[i]); } catch { continue; }
         const type = entry.type;
         const status = entry.status;
         const toolCalls = Array.isArray(entry.tool_calls) ? entry.tool_calls : [];
+
+        if (entry.call_id) closedCallIds.add(entry.call_id);
+        if (entry.tool_call_id) closedCallIds.add(entry.tool_call_id);
+        if (Array.isArray(entry.tool_responses)) {
+          for (const tr of entry.tool_responses) {
+            if (tr?.call_id) closedCallIds.add(tr.call_id);
+            if (tr?.id) closedCallIds.add(tr.id);
+          }
+        }
 
         if (type === 'USER_INPUT' || type === 'SYSTEM_MESSAGE') {
           res = {
@@ -1800,13 +1885,39 @@ class AgentMonitor {
 
         if (type === 'PLANNER_RESPONSE') {
           if (toolCalls.length > 0) {
-            const hasAsk = toolCalls.some(tc => ['ask_question', 'ask_user', 'request_user_input', 'request_confirmation'].includes(String(tc.name || '').toLowerCase()));
-            if (hasAsk) {
+            const openToolCalls = seenLaterStep ? [] : toolCalls.filter(tc => {
+              const id = tc?.id || tc?.call_id || tc?.tool_call_id;
+              if (id && closedCallIds.has(id)) return false;
+              const tcStatus = String(tc?.status || '').toUpperCase();
+              if (tcStatus === 'COMPLETED' || tcStatus === 'DONE' || tcStatus === 'ERROR' || tc?.output !== undefined || tc?.result !== undefined) return false;
+              return true;
+            });
+            for (const tc of toolCalls) {
+              const id = tc?.id || tc?.call_id || tc?.tool_call_id;
+              if (id) closedCallIds.add(id);
+            }
+            if (openToolCalls.length > 0) {
+              const hasAsk = openToolCalls.some(tc => tc.name === 'ask_question' || tc.name === 'ask_user');
+              if (hasAsk) {
+                res = {
+                  source: 'Antigravity',
+                  state: 'waiting',
+                  task: '需要主人确认指示或选项',
+                  baseTask: '需要主人确认指示或选项',
+                  at: latestMtime,
+                  startedAt: latestMtime,
+                  stepIdx: entry.step_index ?? -1,
+                  inFlight: true
+                };
+                break;
+              }
+              const firstTool = openToolCalls[0];
+              const summary = cleanSummary(firstTool.args?.toolSummary || firstTool.toolSummary || firstTool.name || '正在执行工具');
               res = {
                 source: 'Antigravity',
-                state: 'waiting',
-                task: '需要主人确认指示或选项',
-                baseTask: '需要主人确认指示或选项',
+                state: 'working',
+                task: summary,
+                baseTask: summary,
                 at: latestMtime,
                 startedAt: latestMtime,
                 stepIdx: entry.step_index ?? -1,
@@ -1814,19 +1925,6 @@ class AgentMonitor {
               };
               break;
             }
-            const firstTool = toolCalls[0];
-            const summary = cleanSummary(firstTool.args?.toolSummary || firstTool.toolSummary || firstTool.name || '正在执行工具');
-            res = {
-              source: 'Antigravity',
-              state: 'working',
-              task: summary,
-              baseTask: summary,
-              at: latestMtime,
-              startedAt: latestMtime,
-              stepIdx: entry.step_index ?? -1,
-              inFlight: true
-            };
-            break;
           }
 
           if (status === 'DONE') {
@@ -1862,6 +1960,7 @@ class AgentMonitor {
         }
 
         if (type === 'GENERIC') {
+          const nextTask = '正在分析执行结果并构思下一步…';
           if (now - latestMtime < TERMINAL_HOLD_MS) {
             for (let j = i - 1; j >= Math.max(0, i - 5); j--) {
               try {
@@ -1872,6 +1971,7 @@ class AgentMonitor {
                     source: 'Antigravity',
                     state: 'result',
                     task: s ? `已完成: ${s}` : '步骤执行完毕，继续下一步',
+                    nextState: { state: 'thinking', task: nextTask },
                     at: latestMtime
                   };
                   break;
@@ -1883,6 +1983,7 @@ class AgentMonitor {
                 source: 'Antigravity',
                 state: 'result',
                 task: '正在整理工具返回结果…',
+                nextState: { state: 'thinking', task: nextTask },
                 at: latestMtime
               };
             }
@@ -1890,21 +1991,23 @@ class AgentMonitor {
             res = {
               source: 'Antigravity',
               state: 'thinking',
-              task: '正在分析执行结果并构思下一步…',
+              task: nextTask,
               at: latestMtime
             };
           }
           break;
         }
+
+        seenLaterStep = true;
       }
       this.cachedAg = { file: latestFile, mtime: latestMtime, state: res };
-      return (res && isStateFresh(res, now)) ? res : null;
+      return refreshDynamicState(res, now, this.stallEnabled, this.stallMs);
     } catch {}
     return null;
   }
 
   checkDsh(now) {
-    const dshDirs = resolveDshDirs();
+    const dshDirs = this.paths.dshDirs || resolveDshDirs();
     if (now - this.lastDshSessionScan >= 2000 || this.dshSessionCandidates === null) {
       this.lastDshSessionScan = now;
       const candidates = [];
@@ -1926,12 +2029,17 @@ class AgentMonitor {
     const sessions = [];
     for (const candidate of this.dshSessionCandidates) {
       const cached = this.dshStateCache.get(candidate.file);
-      const ageLimit = isHeldState(cached?.state) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS;
+      const cachedState = cached?.state;
+      const ageLimit = cachedState === undefined
+        ? WAITING_MAX_AGE_MS
+        : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
       if (now - candidate.mtime >= ageLimit) continue;
-      const state = cached && cached.mtime === candidate.mtime
-        ? refreshDynamicState(cached.state, now, this.stallEnabled, this.stallMs)
-        : this.checkDshSingle(now, candidate.file, candidate.mtime);
-      if (!cached || cached.mtime !== candidate.mtime) this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, state });
+      let rawState = cachedState;
+      if (!cached || cached.mtime !== candidate.mtime) {
+        rawState = this.checkDshSingle(now, candidate.file, candidate.mtime);
+        this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
+      }
+      const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
         const rawId = path.basename(candidate.file);
         sessions.push({ ...state, sessionId: rawId, rawId });
@@ -1955,7 +2063,7 @@ class AgentMonitor {
   }
 
   checkDshSingle(now, forcedFile = null, forcedMtime = 0) {
-    const dshDirs = resolveDshDirs();
+    const dshDirs = this.paths.dshDirs || resolveDshDirs();
     let latestFile = forcedFile;
     let latestMtime = forcedMtime;
 
@@ -2154,7 +2262,9 @@ class AgentMonitor {
         // session that becomes active again is rediscovered within the scan
         // interval without paying the idle cost on every candidate.
         const cachedState = this.codexStateCache.get(c.file)?.state;
-        const ageLimit = isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS;
+        const ageLimit = cachedState === undefined
+          ? WAITING_MAX_AGE_MS
+          : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
         if (now - c.mtime >= ageLimit) {
           refreshed.push(c);
           continue;
@@ -2169,8 +2279,10 @@ class AgentMonitor {
       refreshed.sort((a, b) => b.mtime - a.mtime);
       this.codexRolloutCandidates = refreshed;
       return refreshed.filter(c => {
-        const state = this.codexStateCache.get(c.file)?.state;
-        const limit = isHeldState(state) ? WAITING_MAX_AGE_MS : maxAgeMs;
+        const cachedState = this.codexStateCache.get(c.file)?.state;
+        const limit = cachedState === undefined
+          ? WAITING_MAX_AGE_MS
+          : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : maxAgeMs);
         return now - c.mtime < limit;
       });
     }
@@ -2210,8 +2322,10 @@ class AgentMonitor {
     candidates.sort((a, b) => b.mtime - a.mtime);
     this.codexRolloutCandidates = candidates;
     const freshCandidates = candidates.filter(c => {
-      const state = this.codexStateCache.get(c.file)?.state;
-      const limit = isHeldState(state) ? WAITING_MAX_AGE_MS : maxAgeMs;
+      const cachedState = this.codexStateCache.get(c.file)?.state;
+      const limit = cachedState === undefined
+        ? WAITING_MAX_AGE_MS
+        : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : maxAgeMs);
       return now - c.mtime < limit;
     });
     return freshCandidates;
@@ -2278,16 +2392,18 @@ class AgentMonitor {
               break;
             }
           }
-          // WO-05: Codex item_completed event with turn continuity
+          // WO-05 & WO-30: Codex item_completed event with turn continuity & cache nextState
           if (kind === 'item_completed') {
             const item = payload.item || {};
             const iType = String(item.type || '').toLowerCase();
             const summary = cleanSummary(item.name || item.command || item.tool || iType);
+            const nextTask = summary ? `推进中 (${summary})` : '正在分析执行结果并构思下一步…';
             if (now - latestMtime < TERMINAL_HOLD_MS) {
               res = {
                 source: 'Codex',
                 state: 'result',
                 task: summary ? `已完成: ${summary}` : '步骤执行完毕',
+                nextState: { state: 'thinking', task: nextTask },
                 at: latestMtime
               };
             } else {
@@ -2295,7 +2411,7 @@ class AgentMonitor {
               res = {
                 source: 'Codex',
                 state: 'thinking',
-                task: summary ? `推进中 (${summary})` : '正在分析执行结果并构思下一步…',
+                task: nextTask,
                 at: latestMtime
               };
             }
@@ -2329,24 +2445,34 @@ class AgentMonitor {
               if (callId) closedCallIds.add(callId);
               continue;
             }
+            const WAIT_TOOLS = new Set(['request_user_input', 'ask_question']);
+            const rawName = String(payload.name || payload.tool || '');
+            const bare = rawName.includes('.') ? rawName.split('.').pop() : rawName;
+            if (WAIT_TOOLS.has(bare)) {
+              const t = cleanSummary(rawName);
+              res = { source: 'Codex', state: 'waiting', task: t, baseTask: t, at: latestMtime, startedAt: latestMtime, inFlight: true };
+              break;
+            }
             const baseTask = cleanSummary(payload.name || payload.tool || '正在执行工具…');
             res = { source: 'Codex', state: 'working', task: baseTask, baseTask, at: latestMtime, startedAt: latestMtime, inFlight: true };
             break;
           }
           if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
             if (payload.call_id) closedCallIds.add(payload.call_id);
+            const nextTask = '正在分析工具返回并构思下一步…';
             if (now - latestMtime < TERMINAL_HOLD_MS) {
               res = {
                 source: 'Codex',
                 state: 'result',
                 task: '工具执行完毕，继续分析…',
+                nextState: { state: 'thinking', task: nextTask },
                 at: latestMtime
               };
             } else {
               res = {
                 source: 'Codex',
                 state: 'thinking',
-                task: '正在分析工具返回并构思下一步…',
+                task: nextTask,
                 at: latestMtime
               };
             }
@@ -2395,7 +2521,7 @@ class AgentMonitor {
         }
       }
       this.codexStateCache.set(latestFile, { mtime: latestMtime, size: latestSize, state: res });
-      return (res && isStateFresh(res, now)) ? res : null;
+      return refreshDynamicState(res, now, this.stallEnabled, this.stallMs);
     } catch {}
     return null;
   }
@@ -2511,14 +2637,10 @@ if (isMain) {
     stallSeconds,
     onChange: data => {
       try {
-        if (data.type === 'quota') {
-          atomicWriteJson(path.join(appDir, 'runtime-quota.json'), data);
-        } else if (data.type === 'balance') {
-          atomicWriteJson(path.join(appDir, 'runtime-balance.json'), data);
-        } else {
-          atomicWriteJson(path.join(appDir, 'runtime-status.json'), data);
-        }
-      } catch {}
+        dispatchRuntimeWrite(appDir, data);
+      } catch (err) {
+        writeErrorLog(`onChange write dispatch failed: ${err?.message || err}`);
+      }
     }
   });
 
@@ -2548,4 +2670,4 @@ if (isMain) {
   });
 }
 
-export { AgentMonitor };
+export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState };

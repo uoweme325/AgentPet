@@ -6,7 +6,9 @@ import { spawnSync } from 'node:child_process';
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const tests = [
   path.join(testDir, 'balance-stale.test.mjs'),
-  path.join(testDir, 'port-cache.test.mjs')
+  path.join(testDir, 'port-cache.test.mjs'),
+  path.join(testDir, 'state-machine.test.mjs'),
+  path.join(testDir, 'exit-code.test.mjs')
 ];
 
 console.log('=== Running AgentPet Test Suite ===');
@@ -18,7 +20,7 @@ for (const testFile of tests) {
 
   const res = spawnSync(process.execPath, [testFile], {
     stdio: 'inherit',
-    timeout: 10000
+    timeout: 60000
   });
 
   if (res.error) {
