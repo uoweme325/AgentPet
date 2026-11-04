@@ -641,6 +641,7 @@ class AgentMonitor {
     this.cachedAg = { mtime: 0, file: null, state: null };
     this.cachedCodex = { mtime: 0, size: 0, file: null, state: null };
     this.codexStateCache = new Map();
+    this.codexAsyncCache = new Map();
     this.codexRolloutCandidates = [];
     this.lastCodexRolloutScan = 0;
 
@@ -2247,6 +2248,111 @@ class AgentMonitor {
     return 0;
   }
 
+  codexPendingState(pending) {
+    const latest = [...pending.values()].filter(p => p.accepted).sort((a, b) => b.at - a.at)[0];
+    if (!latest) return null;
+    return {
+      source: 'Codex', state: latest.kind === 'approval' ? 'approval' : 'waiting',
+      task: latest.kind === 'approval' ? '等待主人确认权限' : '等待主人回答问题',
+      at: latest.at, startedAt: latest.at, inFlight: true
+    };
+  }
+
+  scanCodexAsyncPrompts(file, size, mtime) {
+    let item = this.codexAsyncCache.get(file);
+    if (!item) {
+      item = { offset: 0, remainder: Buffer.alloc(0), pending: new Map() };
+      this.codexAsyncCache.set(file, item);
+    }
+    if (size < item.offset) {
+      item.offset = 0;
+      item.remainder = Buffer.alloc(0);
+      item.pending.clear();
+    }
+
+    let fd = null;
+    try {
+      fd = fs.openSync(file, 'r');
+      while (item.offset < size) {
+        const chunk = Buffer.alloc(Math.min(262144, size - item.offset));
+        const count = fs.readSync(fd, chunk, 0, chunk.length, item.offset);
+        if (!count) break;
+        item.offset += count;
+        const data = Buffer.concat([item.remainder, chunk.subarray(0, count)]);
+        let lineStart = 0;
+        for (let end = data.indexOf(10, lineStart); end >= 0; end = data.indexOf(10, lineStart)) {
+          const lineBytes = data.subarray(lineStart, end);
+          lineStart = end + 1;
+          if (!lineBytes.includes('request_user_input_async') &&
+              !lineBytes.includes('request_permissions') &&
+              !lineBytes.includes('require_escalated') &&
+              !lineBytes.includes('send_user_message_question_reply') &&
+              ![...item.pending.keys()].some(id => lineBytes.includes(id))) continue;
+          let entry;
+          try { entry = JSON.parse(lineBytes.toString('utf8')); } catch { continue; }
+          if (entry.type !== 'response_item') continue;
+          const payload = entry.payload || {};
+          if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
+            const name = String(payload.name || payload.tool || '').split('.').pop();
+            if (name === 'request_user_input_async' && payload.call_id) {
+              let questionCount = 1;
+              try {
+                const args = typeof payload.arguments === 'string'
+                  ? JSON.parse(payload.arguments) : payload.arguments;
+                questionCount = Math.max(1, args?.questions?.length || 1);
+              } catch {}
+              item.pending.set(payload.call_id, {
+                at: Date.parse(entry.timestamp) || mtime, accepted: false,
+                kind: 'question', questionCount, answered: []
+              });
+            } else if (payload.call_id && (name === 'request_permissions' ||
+                       (name === 'exec' && (/\btools\.request_permissions\s*\(/.test(String(payload.input || '')) ||
+                        /\btools\.exec_command\s*\([\s\S]*?\bsandbox_permissions\s*:\s*["']require_escalated["']/.test(String(payload.input || '')))))) {
+              item.pending.set(payload.call_id, {
+                at: Date.parse(entry.timestamp) || mtime, accepted: true,
+                kind: 'approval', questionCount: 1, answered: []
+              });
+            }
+          } else if ((payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') &&
+                     item.pending.has(payload.call_id)) {
+            if (item.pending.get(payload.call_id).kind === 'approval') {
+              item.pending.delete(payload.call_id);
+              continue;
+            }
+            let output;
+            try { output = typeof payload.output === 'string' ? JSON.parse(payload.output) : payload.output; } catch {}
+            if (output?.accepted === true) item.pending.get(payload.call_id).accepted = true;
+            else item.pending.delete(payload.call_id);
+          } else if (payload.type === 'message' && payload.role === 'user') {
+            const body = Array.isArray(payload.content)
+              ? payload.content.map(c => c?.text || '').join('') : String(payload.content || '');
+            const match = body.match(/<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>/);
+            if (!match) continue;
+            try {
+              for (const reply of JSON.parse(match[1])) {
+                const questionId = typeof reply.questionItemId === 'string'
+                  ? JSON.parse(reply.questionItemId) : reply.questionItemId;
+                if (Array.isArray(questionId) && questionId[0] === 'request_user_input_async') {
+                  const prompt = item.pending.get(questionId[1]);
+                  if (prompt) {
+                    const index = Number(questionId[2]);
+                    if (Number.isInteger(index) && index >= 0 && index < prompt.questionCount &&
+                        !prompt.answered.includes(index)) prompt.answered.push(index);
+                    if (prompt.answered.length >= prompt.questionCount) item.pending.delete(questionId[1]);
+                  }
+                }
+              }
+            } catch {}
+          }
+        }
+        item.remainder = data.subarray(lineStart);
+      }
+    } catch {} finally {
+      if (fd !== null) try { fs.closeSync(fd); } catch {}
+    }
+    return this.codexPendingState(item.pending);
+  }
+
   findCodexRollouts(now, maxAgeMs = ACTIVE_MAX_AGE_MS) {
     const sessionsDir = path.join(this.paths.codex, 'sessions');
     if (!fs.existsSync(sessionsDir)) return [];
@@ -2343,6 +2449,11 @@ class AgentMonitor {
     }
 
     try {
+      const pendingQuestion = this.scanCodexAsyncPrompts(latestFile, latestSize, latestMtime);
+      if (pendingQuestion) {
+        this.codexStateCache.set(latestFile, { mtime: latestMtime, size: latestSize, state: pendingQuestion });
+        return pendingQuestion;
+      }
       const lines = this.readTailLines(latestFile, 131072);
       let res = null;
       const closedCallIds = new Set();

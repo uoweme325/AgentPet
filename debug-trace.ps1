@@ -4,7 +4,7 @@ $log = Join-Path $dir "runtime-error.log"
 "Starting..." | Set-Content $log -Encoding UTF8
 
 $psFile = Join-Path $dir "AgentPet.ps1"
-if (-not (Test-Path $psFile)) { $psFile = Join-Path $dir "NiangPet.ps1" }
+if (-not (Test-Path -LiteralPath $psFile -PathType Leaf)) { Write-Error "AgentPet.ps1 is missing. Please extract the complete AgentPet package again."; exit 1 }
 
 $global:Error.Clear()
 try {

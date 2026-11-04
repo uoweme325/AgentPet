@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.5.1"
+$script:AppVersion = "1.5.2"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -149,6 +149,7 @@ public static class AgentPetNative {
     public static extern bool DestroyIcon(IntPtr hIcon);
 
     public const int SW_HIDE = 0;
+    public const int SW_SHOWNOACTIVATE = 4;
     public const int SW_SHOW = 5;
 
     public static void ApplyToolWindowStyle(IntPtr hwnd) {
@@ -989,6 +990,7 @@ function Update-Facing {
 $script:isBubbleOpen = $false
 $script:manualBubbleHidden = $false
 $script:waitingLastAlert = $null
+$script:waitingAttentionActive = $false
 $script:bubbleAnimVersion = 0
 $script:bubbleCloseTime = [DateTime]::MaxValue
 
@@ -1084,7 +1086,7 @@ function Set-AgentPetWindowVisible([bool]$Visible) {
         $handle = $helper.Handle
         if ($Visible) {
             [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_SHOW)
-            $Window.Topmost = [bool]$Config.Topmost
+            $Window.Topmost = [bool]$Config.Topmost -or $script:waitingAttentionActive
             Update-Facing
             Update-Scale
             [void][AgentPetNative]::SetForegroundWindow($handle)
@@ -1097,6 +1099,24 @@ function Set-AgentPetWindowVisible([bool]$Visible) {
             $script:trayWindowHidden = $true
         }
     } catch { Log-Throttled "TrayWindow" "托盘切换窗口失败：$($_.Exception.Message)" 30 }
+}
+
+function Set-WaitingWindowAttention([bool]$Active) {
+    if ($Active) {
+        try {
+            if ($script:trayWindowHidden) {
+                $handle = (New-Object System.Windows.Interop.WindowInteropHelper($Window)).Handle
+                [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_SHOWNOACTIVATE)
+                $script:trayWindowHidden = $false
+            }
+            if ($script:waitingAttentionActive) { return }
+            $Window.Topmost = $true
+            $script:waitingAttentionActive = $true
+        } catch { Log-Throttled "WaitingWindow" "显示等待提醒失败：$($_.Exception.Message)" 30 }
+    } elseif ($script:waitingAttentionActive) {
+        $script:waitingAttentionActive = $false
+        $Window.Topmost = [bool]$Config.Topmost
+    }
 }
 
 function Get-TrayTooltipText {
@@ -2312,7 +2332,7 @@ function Build-ContextMenu {
     $miTop.IsChecked = [bool]$Config.Topmost
     $miTop.Add_Click({
         $Config.Topmost = -not $Config.Topmost
-        $Window.Topmost = [bool]$Config.Topmost
+        $Window.Topmost = [bool]$Config.Topmost -or $script:waitingAttentionActive
         Save-Config
         Build-ContextMenu
     })
@@ -2427,7 +2447,10 @@ $PetImage.Add_MouseLeftButtonUp({
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(1.8)
         $defMode = if ($Config.BubbleMode -in @("quota","deepseek","quote")) { $Config.BubbleMode } else { "quota" }
-        if ($script:agentBusy) {
+        if ($script:agentBusy -and $script:lastAgentState -in @("waiting", "approval")) {
+            Set-ActiveBubblePanel "work"
+            Show-Bubble 0
+        } elseif ($script:agentBusy) {
             # Temporary view default panel for 8.0s during busy state without changing default preference
             $script:userInspectUntil = [DateTime]::UtcNow.AddSeconds(8.0)
             if ($defMode -eq "quote") {
@@ -2463,6 +2486,7 @@ $PetImage.Add_MouseLeftButtonUp({
 $Bubble.Add_MouseLeftButtonUp({
     param($s, $e)
     $script:lastInteractTime = [DateTime]::UtcNow
+    if ($script:lastAgentState -in @("waiting", "approval")) { $e.Handled = $true; return }
     if ($script:agentBusy -and [DateTime]::UtcNow -ge $script:userInspectUntil) { return }
     Trigger-PetBounce
     Play-ReleaseSound
@@ -2636,11 +2660,13 @@ function Apply-AgentStatus($stObj) {
     if (-not $stObj) { return }
     $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
     if ($pauseUntil -gt [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) {
+        Set-WaitingWindowAttention $false
         if ($script:agentBusy) { $script:agentBusy = $false; $script:lastAgentState = $null; $script:waitingLastAlert = $null; Set-PetSprite "idle"; Set-ActiveBubblePanel $Config.BubbleMode; Hide-Bubble }
         return
     }
     $state = [string]$stObj.state
     if (-not $state -or $state -eq "idle") {
+        Set-WaitingWindowAttention $false
         if ($script:agentBusy) {
             $script:agentBusy = $false
             $script:lastInteractTime = [DateTime]::UtcNow
@@ -2660,6 +2686,7 @@ function Apply-AgentStatus($stObj) {
     $ageSec = ($nowMs - $atMs) / 1000.0
     $maxAgeSec = if ($state -in @("waiting", "approval", "stalled")) { 300.0 } else { 35.0 }
     if ($ageSec -gt $maxAgeSec) {
+        Set-WaitingWindowAttention $false
         if ($script:agentBusy) {
             $script:agentBusy = $false
             $script:lastInteractTime = [DateTime]::UtcNow
@@ -2707,8 +2734,6 @@ function Apply-AgentStatus($stObj) {
         $stateBrush = [System.Windows.Media.BrushConverter]::new().ConvertFromString($stateColor)
         $WorkDot.Fill = $stateBrush
         $WorkHeader.Foreground = $stateBrush
-        $BubbleBorder.BorderBrush = $stateBrush
-        $BubbleBorder.BorderThickness = if ($state -in @("waiting", "approval", "stalled")) { [System.Windows.Thickness]::new(3.4) } elseif ($state -eq "error") { [System.Windows.Thickness]::new(3.2) } else { [System.Windows.Thickness]::new(2.8) }
         if ($state -in @("waiting", "approval")) { $WorkHeader.Text = "⚠ 等待确认 · " + $hdr }
         elseif ($state -eq "stalled") { $WorkHeader.Text = "⚠ 好像卡住了 · " + $hdr }
     } catch {}
@@ -2804,6 +2829,8 @@ function Apply-AgentStatus($stObj) {
     $now = [DateTime]::UtcNow
     $isUserInspecting = ($script:userInspectUntil -and $now -lt $script:userInspectUntil)
     $isWaiting = ($state -eq "waiting" -or $state -eq "approval")
+    Set-WaitingWindowAttention $isWaiting
+    if ($isWaiting) { $script:userInspectUntil = [DateTime]::MinValue; $isUserInspecting = $false }
 
     if ((-not $script:manualBubbleHidden -and (-not $isUserInspecting)) -or $isWaiting) {
         Set-ActiveBubblePanel "work"
@@ -2828,6 +2855,10 @@ function Apply-AgentStatus($stObj) {
         $script:waitingLastAlert = $null
     }
     $script:lastAgentState = $state
+    if ($stateBrush) {
+        $BubbleBorder.BorderBrush = $stateBrush
+        $BubbleBorder.BorderThickness = if ($state -in @("waiting", "approval", "stalled")) { [System.Windows.Thickness]::new(3.4) } elseif ($state -eq "error") { [System.Windows.Thickness]::new(3.2) } else { [System.Windows.Thickness]::new(2.8) }
+    }
     $script:lastStatusHeartbeatMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
 
     # WO-01: Complete pose mapping (success/done -> happy, waiting/approval/result/thinking -> think)
@@ -3080,7 +3111,10 @@ $Timer.Add_Tick({
             $timeoutLimit = if ($isWaiting) { 60.0 } else { 35.0 }
             # Clear busy state if monitor process died OR if heartbeat timed out (P0: stale waiting cleanup)
             if ($monitorDead -or ($stAgeSec -gt $timeoutLimit)) {
+                Set-WaitingWindowAttention $false
                 $script:agentBusy = $false
+                $script:lastAgentState = $null
+                $script:waitingLastAlert = $null
                 $script:lastInteractTime = [DateTime]::UtcNow
                 Set-PetSprite "idle"
                 Set-ActiveBubblePanel $Config.BubbleMode

@@ -157,6 +157,24 @@ try {
     forbidStdout: 'All assertions passed'
   });
 
+  // 场景 7: async-question.test.mjs 原样运行与断言失败非零退出
+  runInjectedScenario({
+    label: '7a. async-question.test.mjs 原样运行',
+    baseFile: 'async-question.test.mjs',
+    expectedStatus: 0,
+    forbidStdout: 'FAILURE'
+  });
+
+  runInjectedScenario({
+    label: '7b. async-question.test.mjs 断言失败非零退出',
+    baseFile: 'async-question.test.mjs',
+    targetPattern: "assert.equal(monitor.checkCodex(t0)?.state, 'waiting', 'accepted async prompt must outrank later work');",
+    replacePattern: "assert.equal(monitor.checkCodex(t0)?.state, 'INTENTIONAL_FAIL', 'accepted async prompt must outrank later work');",
+    expectedStatus: 1,
+    expectStderr: '[async-question.test.mjs FAILURE]',
+    forbidStdout: 'PASS: question and permission prompts'
+  });
+
   console.log('=== ALL EXIT-CODE REGRESSION SCENARIOS VERIFIED SUCCESSFULLY ===');
 } catch (e) {
   console.error('[exit-code.test.mjs FAILURE]', (e && e.stack) || e);
