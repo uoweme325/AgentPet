@@ -30,7 +30,7 @@ for (const testFile of tests) {
   } else if (res.signal) {
     console.error(`>> [KILLED] ${relName} terminated with signal:`, res.signal);
     hasFailure = true;
-  } else if (res.status !== 0) {
+  } else if (res.status === null || res.status !== 0) {
     console.error(`>> [FAILED] ${relName} exited with code:`, res.status);
     hasFailure = true;
   } else {

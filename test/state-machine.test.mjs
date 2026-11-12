@@ -5,7 +5,7 @@ import os from 'node:os';
 import assert from 'node:assert';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const require = createRequire(import.meta.url);
 let DatabaseSync = null;
@@ -896,6 +896,542 @@ Write-Output "WO36_VERIFIED_OK"
     assert.ok(stopRes.stdout.includes('WO36_VERIFIED_OK'), `Missing WO36_VERIFIED_OK: ${stopRes.stdout}`);
     console.log('[PASS] Scenario 13: WO-36 退出脚本全停 / 部分停 / WMI 失败 / 无目标 及 stop.flag 时效校验 (13a~13f) 验证通过');
   }
+
+  // =========================================================================
+  // 场景 14: AP03 区分进度消息 (commentary) 与最终答复 (final_answer)
+  // =========================================================================
+  {
+    const ap03Dir = path.join(tmpRoot, 's14-ap03');
+    const sessionsDir = path.join(ap03Dir, 'codex', 'sessions', '2026', '11', '12');
+    fs.mkdirSync(sessionsDir, { recursive: true });
+
+    const makeMon = () => {
+      const m = new AgentMonitor({ isProbe: true, stallSeconds: 45 });
+      m.paths = { ...m.paths, appDir: ap03Dir, codex: path.join(ap03Dir, 'codex'), dshDirs: [] };
+      return m;
+    };
+    const writeRollout = (name, events, mtime) => {
+      const f = path.join(sessionsDir, name);
+      fs.writeFileSync(f, events.map(e => JSON.stringify({ timestamp: new Date(mtime).toISOString(), ...e })).join('\n') + '\n', 'utf8');
+      fs.utimesSync(f, mtime / 1000, mtime / 1000);
+      return f;
+    };
+    const clearDir = () => {
+      for (const f of fs.readdirSync(sessionsDir)) fs.unlinkSync(path.join(sessionsDir, f));
+    };
+
+    const tBase = Date.now();
+
+    // 14a: response_item assistant message (phase: commentary, status: completed)
+    // 立即 (0s) 与 10s 后均为活动状态 (thinking)，不产生 success/result；190s 过期归空；解析/缓存/新建重读一致
+    clearDir();
+    writeRollout('rollout-msg-commentary.jsonl', [
+      { type: 'event_msg', payload: { type: 'task_started' } },
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', status: 'completed', phase: 'commentary', content: [{ type: 'output_text', text: '正在检查文件' }] } }
+    ], tBase);
+    const m1 = makeMon();
+    const s1_0 = m1.checkCodex(tBase);
+    const s1_0_cached = m1.checkCodex(tBase);
+    const s1_10 = m1.checkCodex(tBase + 10_000);
+    const s1_re = makeMon().checkCodex(tBase + 10_000);
+    const s1_190 = m1.checkCodex(tBase + 190_000);
+    assert.strictEqual(s1_0?.state, 'thinking', 'assistant commentary at 0s must be thinking');
+    assert.strictEqual(s1_0_cached?.state, 'thinking', 'assistant commentary cached at 0s must match');
+    assert.strictEqual(s1_10?.state, 'thinking', 'assistant commentary at 10s must remain thinking');
+    assert.strictEqual(s1_re?.state, 'thinking', 'assistant commentary re-read on fresh monitor at 10s must match');
+    assert.ok(!String(s1_0?.task || '').includes('已完成'), 'commentary task must not say 已完成');
+    assert.strictEqual(s1_190, null, 'assistant commentary must expire after 180s window');
+
+    // 14b: event_msg item_completed (item.type: AgentMessage, item.phase: commentary)
+    clearDir();
+    writeRollout('rollout-item-commentary.jsonl', [
+      { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'AgentMessage', phase: 'commentary', content: [{ type: 'Text', text: '进度汇报' }] } } }
+    ], tBase);
+    const m2 = makeMon();
+    const s2_0 = m2.checkCodex(tBase);
+    const s2_10 = m2.checkCodex(tBase + 10_000);
+    const s2_re = makeMon().checkCodex(tBase + 10_000);
+    const s2_190 = m2.checkCodex(tBase + 190_000);
+    assert.strictEqual(s2_0?.state, 'thinking', 'item_completed AgentMessage commentary at 0s must be thinking, not result');
+    assert.strictEqual(s2_10?.state, 'thinking', 'item_completed AgentMessage commentary at 10s must be thinking');
+    assert.strictEqual(s2_re?.state, 'thinking', 'item_completed AgentMessage commentary fresh monitor re-read must match');
+    assert.ok(!String(s2_0?.task || '').includes('已完成'), 'item_completed commentary must not say 已完成');
+    assert.strictEqual(s2_190, null, 'item_completed AgentMessage commentary expires after 180s');
+
+    // 14c: 两种形式的 final_answer (completed) -> 0s 为 success，10s 后按 8s 终态规则归空；缓存与重读一致
+    for (const [label, evt] of [
+      ['response_item final_answer', { type: 'response_item', payload: { type: 'message', role: 'assistant', status: 'completed', phase: 'final_answer', content: [{ type: 'output_text', text: '最终答复' }] } }],
+      ['item_completed final_answer', { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'AgentMessage', phase: 'final_answer', content: [{ type: 'Text', text: '最终答复' }] } } }]
+    ]) {
+      clearDir();
+      writeRollout('rollout-final.jsonl', [evt], tBase);
+      const mf = makeMon();
+      assert.strictEqual(mf.checkCodex(tBase)?.state, 'success', `${label} at 0s should be success`);
+      assert.strictEqual(mf.checkCodex(tBase + 1000)?.state, 'success', `${label} cached at 1s should be success`);
+      assert.strictEqual(makeMon().checkCodex(tBase + 1000)?.state, 'success', `${label} fresh monitor at 1s should be success`);
+      assert.strictEqual(mf.checkCodex(tBase + 10_000), null, `${label} at 10s (>8s) should be null`);
+      assert.strictEqual(makeMon().checkCodex(tBase + 10_000), null, `${label} fresh monitor at 10s should be null`);
+    }
+
+    // 14d: status: in_progress (包括 phase: final_answer 正在生成) -> working
+    clearDir();
+    writeRollout('rollout-inprog.jsonl', [
+      { type: 'response_item', payload: { type: 'message', role: 'assistant', status: 'in_progress', phase: 'final_answer', content: [] } }
+    ], tBase);
+    assert.strictEqual(makeMon().checkCodex(tBase)?.state, 'working', 'in_progress final_answer must remain working');
+
+    // 14e: 两种消息形式缺少 phase 时均不能单独报完成或步骤完成；另有明确结束事件时正常显示完成
+    for (const [label, evt] of [
+      ['message without phase', { type: 'response_item', payload: { type: 'message', role: 'assistant', status: 'completed', content: [{ type: 'output_text', text: '无phase消息' }] } }],
+      ['item_completed AgentMessage without phase', { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'AgentMessage', content: [{ type: 'Text', text: '无phase消息' }] } } }]
+    ]) {
+      clearDir();
+      writeRollout('rollout-nophase.jsonl', [evt], tBase);
+      const mn = makeMon();
+      assert.strictEqual(mn.checkCodex(tBase)?.state, 'thinking', `${label} at 0s must be thinking (not success/result)`);
+      assert.strictEqual(mn.checkCodex(tBase + 10_000)?.state, 'thinking', `${label} at 10s must be thinking`);
+
+      clearDir();
+      writeRollout('rollout-nophase-done.jsonl', [
+        evt,
+        { type: 'event_msg', payload: { type: 'task_complete' } }
+      ], tBase);
+      assert.strictEqual(makeMon().checkCodex(tBase)?.state, 'success', `${label} followed by explicit task_complete must show success`);
+    }
+
+    // 14f: 其他非 AgentMessage 的 item_completed (如 command) 仍保留 result -> thinking
+    clearDir();
+    writeRollout('rollout-tool-item.jsonl', [
+      { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'CommandExecution', command: 'npm test' } } }
+    ], tBase);
+    const mt = makeMon();
+    assert.strictEqual(mt.checkCodex(tBase)?.state, 'result', 'non-AgentMessage item_completed at 0s is result');
+    assert.strictEqual(mt.checkCodex(tBase + 10_000)?.state, 'thinking', 'non-AgentMessage item_completed at 10s transitions to thinking');
+
+    console.log('[PASS] Scenario 14: AP03 进度消息 (commentary/缺phase) 与最终答复 (final_answer) 双路径精确区分');
+  }
+
+  // =========================================================================
+  // 场景 15: AP06 恢复离线额度历史查询七天窗口（不影响普通工作 180s 窗口与快速轮询免 stat）
+  // =========================================================================
+  {
+    const ap06Dir = path.join(tmpRoot, 's15-ap06');
+    const now0 = Date.now();
+
+    const testQuotaAtAge = (ageMs, cacheMode = 'none') => {
+      const subDir = path.join(ap06Dir, `age-${ageMs}-${cacheMode}`);
+      const sessDir = path.join(subDir, 'codex', 'sessions', '2026', '11', '05');
+      fs.mkdirSync(sessDir, { recursive: true });
+      const f = path.join(sessDir, 'rollout-quota.jsonl');
+      const evtTime = now0 - ageMs;
+      const line = JSON.stringify({
+        timestamp: new Date(evtTime).toISOString(),
+        type: 'event_msg',
+        payload: {
+          type: 'token_count',
+          rate_limits: {
+            primary: { used_percent: 37, window_minutes: 300, resets_at: Math.floor(now0 / 1000) + 3600 }
+          }
+        }
+      }) + '\n';
+      fs.writeFileSync(f, line, 'utf8');
+      fs.utimesSync(f, evtTime / 1000, evtTime / 1000);
+
+      const emissions = [];
+      const m = new AgentMonitor({ isProbe: true, onChange: v => emissions.push(v) });
+      m.paths = { ...m.paths, appDir: subDir, codex: path.join(subDir, 'codex'), dshDirs: [] };
+
+      if (cacheMode === 'normal') {
+        m.codexStateCache.set(f, { mtime: evtTime, size: Buffer.byteLength(line), state: { source: 'Codex', state: 'thinking', task: 'old', at: evtTime } });
+      } else if (cacheMode === 'waiting') {
+        m.codexStateCache.set(f, { mtime: evtTime, size: Buffer.byteLength(line), state: { source: 'Codex', state: 'waiting', task: 'wait', at: evtTime, inFlight: true } });
+      }
+
+      // 首次全量扫描 + emitFallbackQuota
+      m.emitFallbackQuota();
+      const firstCount = emissions.length;
+
+      // 5 秒内缓存路径：统计是否对历史文件重复 fs.statSync
+      const origStat = fs.statSync;
+      let fastStats = 0;
+      try {
+        fs.statSync = (target, ...rest) => {
+          if (String(target) === f) fastStats++;
+          return origStat(target, ...rest);
+        };
+        const fastCands = m.findCodexRollouts(now0 + 100, 7 * 86400_000);
+        m.emitFallbackQuota();
+        return { firstCount, secondCount: emissions.length - firstCount, fastCands: fastCands.length, fastStats, lastEmission: emissions[emissions.length - 1], m, f, evtTime };
+      } finally {
+        fs.statSync = origStat;
+      }
+    };
+
+    // 15a: 1 分钟前、1 小时前（无缓存 / 普通状态缓存 / 等待状态缓存）、6 天前均正常产出；8 天前（超 7 天）不产出
+    const r1m = testQuotaAtAge(60_000, 'none');
+    assert.strictEqual(r1m.firstCount, 1, '1m old quota should emit on full scan');
+    assert.strictEqual(r1m.secondCount, 1, '1m old quota should emit on fast scan');
+
+    for (const mode of ['none', 'normal', 'waiting']) {
+      const r1h = testQuotaAtAge(3600_000, mode);
+      assert.strictEqual(r1h.firstCount, 1, `1h old quota (${mode} cache) must emit on full scan`);
+      assert.strictEqual(r1h.secondCount, 1, `1h old quota (${mode} cache) must emit on 5s cached path`);
+      assert.strictEqual(r1h.fastStats, 0, `1h old file (${mode} cache) must NOT be re-stat'd on fast poll`);
+      assert.strictEqual(r1h.lastEmission.planLabel, '离线快照');
+      assert.strictEqual(r1h.lastEmission.observedAt, Math.round(r1h.evtTime), 'observedAt must match fixture mtime, not current time');
+      assert.strictEqual(r1h.lastEmission.windows[0].usedPercent, 37);
+      assert.strictEqual(r1h.lastEmission.windows[0].remainingPercent, 63);
+      // 1 小时前的普通工作扫描仍为空闲
+      assert.strictEqual(r1h.m.checkCodex(now0 + 200), null, '1h old session must remain idle for normal work scan');
+    }
+
+    const r6d = testQuotaAtAge(6 * 86400_000, 'none');
+    assert.strictEqual(r6d.firstCount, 1, '6d old quota must emit');
+    assert.strictEqual(r6d.secondCount, 1, '6d old quota must emit on fast path');
+    assert.strictEqual(r6d.fastStats, 0, '6d old file must NOT be re-stat on fast poll');
+
+    const r8d = testQuotaAtAge(8 * 86400_000, 'none');
+    assert.strictEqual(r8d.firstCount, 0, '8d old quota (>7d) must NOT emit');
+    assert.strictEqual(r8d.secondCount, 0, '8d old quota (>7d) must NOT emit on fast path');
+
+    // 15b: 5 秒全量发现到期后，恢复活动的旧会话可被重新发现
+    const reactivated = r1m.m;
+    const reactivatedTime = now0 + 6000;
+    const workLine = JSON.stringify({
+      timestamp: new Date(reactivatedTime).toISOString(),
+      type: 'response_item',
+      payload: { type: 'reasoning', summary: [] }
+    }) + '\n';
+    fs.appendFileSync(r1m.f, workLine, 'utf8');
+    fs.utimesSync(r1m.f, reactivatedTime / 1000, reactivatedTime / 1000);
+    assert.strictEqual(reactivated.checkCodex(reactivatedTime)?.state, 'thinking', '5s full walk must rediscover reactivated session');
+
+    console.log('[PASS] Scenario 15: AP06 离线额度 1m/1h/6d 回退恢复、>7d 过滤、快速轮询免 stat 与 5s 重发现验证通过');
+  }
+
+  // =========================================================================
+  // 场景 16: AP05 如实显示余额刷新超时（调用真实 AgentPet.ps1 函数与计时器代码块）
+  // =========================================================================
+  {
+    const ap05Dir = path.join(tmpRoot, 's16-ap05');
+    fs.mkdirSync(ap05Dir, { recursive: true });
+    const runnerAp05 = path.join(ap05Dir, 'verify-ap05.ps1');
+
+    const ap05PsLines = [
+      "Add-Type -AssemblyName PresentationCore, PresentationFramework, WindowsBase",
+      "$ErrorActionPreference = 'Stop'",
+      "$src = Get-Content -LiteralPath '" + path.join(repoRoot, 'AgentPet.ps1').replace(/'/g, "''") + "' -Raw -Encoding UTF8",
+      "$startIdx = $src.IndexOf('$script:lastBalanceMtime   = [DateTime]::MinValue')",
+      "$endMarker = '# ============================================================================' + [char]13 + [char]10 + '# 10. Q-Bounce'",
+      "$endIdx = $src.IndexOf($endMarker)",
+      "if ($startIdx -lt 0 -or $endIdx -lt 0) { throw 'Cannot locate Section 9.5' }",
+      "$sec95 = $src.Substring($startIdx, $endIdx - $startIdx)",
+      "$pollStart = $src.IndexOf('# 3. Watch runtime-balance.json file modification')",
+      "$pollEnd = $src.IndexOf('# 2. Watch runtime-status.json file modification')",
+      "$pollBlock = $src.Substring($pollStart, $pollEnd - $pollStart)",
+      "$tStart = $src.IndexOf('# 0.5 Safety revert for balance refresh notice')",
+      "$tEnd = $src.IndexOf('# 1. Poll agent-monitor.mjs stdout', $tStart)",
+      "if ($tStart -lt 0 -or $tEnd -lt 0) { throw 'Cannot locate section 0.5 timeout block' }",
+      "$timeoutBlock = $src.Substring($tStart, $tEnd - $tStart)",
+      "$RuntimeBalancePath = '" + path.join(ap05Dir, 'runtime-balance.json').replace(/'/g, "''") + "'",
+      "$RefreshBalanceFlagPath = '" + path.join(ap05Dir, 'refresh-balance.flag').replace(/'/g, "''") + "'",
+      "$Config = @{ DeepSeekBalanceEnabled = $true; LowBalanceCnyThreshold = 5.0; LowBalanceAlertEnabled = $true }",
+      "$script:AgentIcons = @{}",
+      "$script:manualBubbleHidden = $false",
+      "$script:agentBusy = $false",
+      "$script:userInspectUntil = [DateTime]::MinValue",
+      "function Make-MockCtrl { New-Object PSObject -Property @{ Text = ''; Visibility = [System.Windows.Visibility]::Collapsed; Source = $null; ToolTip = $null } }",
+      "$DeepSeekPanel = Make-MockCtrl",
+      "$DeepSeekIcon = Make-MockCtrl",
+      "$DeepSeekOkPanel = Make-MockCtrl",
+      "$DeepSeekMsgPanel = Make-MockCtrl",
+      "$DeepSeekBadge = Make-MockCtrl",
+      "$DeepSeekBadgeText = Make-MockCtrl",
+      "$DeepSeekStatusNotice = Make-MockCtrl",
+      "$DeepSeekMsgTitle = Make-MockCtrl",
+      "$DeepSeekMsgDetail = Make-MockCtrl",
+      "$DeepSeekCurrencyLabel = Make-MockCtrl",
+      "$DeepSeekTotalText = Make-MockCtrl",
+      "$DeepSeekBreakdownText = Make-MockCtrl",
+      "$DeepSeekAvailableNotice = Make-MockCtrl",
+      "function Play-ReleaseSound {}",
+      "function Set-ActiveBubblePanel([string]$p) {}",
+      "function Show-Bubble([double]$sec) {}",
+      "function Log-Throttled([string]$k, [string]$m) {}",
+      "Invoke-Expression $sec95",
+      "$pollFn = [ScriptBlock]::Create($pollBlock)",
+      "$timeoutFn = [ScriptBlock]::Create($timeoutBlock)",
+      "function Write-BalanceSnap($obj, [DateTime]$mtimeUtc) {",
+      "    $json = $obj | ConvertTo-Json -Depth 6",
+      "    [IO.File]::WriteAllText($RuntimeBalancePath, $json, [Text.Encoding]::UTF8)",
+      "    (Get-Item $RuntimeBalancePath).LastWriteTimeUtc = $mtimeUtc",
+      "}",
+      "$oldSyncMs = 1793500000000",
+      "$expectedOldTimeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds($oldSyncMs).ToLocalTime()).ToString('HH:mm')",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $oldSyncMs; fetchedAt = $oldSyncMs; lastAttemptAt = $oldSyncMs;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '18.50'; toppedUpBalance = '10.00'; grantedBalance = '8.50' })",
+      "} ([DateTime]::UtcNow.AddMinutes(-10))",
+      "& $pollFn",
+      "if ($DeepSeekTotalText.Text -ne '¥ 18.50') { throw ('Initial amount mismatch: ' + $DeepSeekTotalText.Text) }",
+      "# (1) 无结果超时 15 秒：显示 刷新超时，点击 ↻ 重试，绝不出现 已是最新，旧金额与上次快照时间可辨认",
+      "$script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-20)",
+      "Request-BalanceRefresh",
+      "$req1Ms = $script:balanceRequestStartedMs",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新中...') { throw ('Expected 刷新中..., got ' + $DeepSeekStatusNotice.Text) }",
+      "$now = $script:balanceRequestTimeout.AddSeconds(1)",
+      "& $timeoutFn",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新超时，点击 ↻ 重试') { throw ('Expected 刷新超时，点击 ↻ 重试, got ' + $DeepSeekStatusNotice.Text) }",
+      "if ($DeepSeekStatusNotice.Text -match '已是最新') { throw 'Must never display 已是最新 on timeout' }",
+      "if ($DeepSeekTotalText.Text -ne '¥ 18.50') { throw 'Old amount must be preserved on timeout' }",
+      "if ($DeepSeekCurrencyLabel.Text -notmatch ('上次快照（' + $expectedOldTimeStr + '）')) { throw ('Currency label must mark old snapshot time, got: ' + $DeepSeekCurrencyLabel.Text) }",
+      "if ($DeepSeekStatusNotice.ToolTip -notmatch ('上次快照（同步于 ' + $expectedOldTimeStr + '）')) { throw ('Tooltip must mark old snapshot time, got: ' + $DeepSeekStatusNotice.ToolTip) }",
+      "# (1b) 超时后到达不属于本次请求的旧成功结果：超时提示和快照语义保留；不能显示本次已更新；本次请求归属标记保留",
+      "$unownedOldSyncMs = $req1Ms - 11000",
+      "$unownedOldTimeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds($unownedOldSyncMs).ToLocalTime()).ToString('HH:mm')",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $unownedOldSyncMs; fetchedAt = $unownedOldSyncMs; lastAttemptAt = $unownedOldSyncMs;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '29.00'; toppedUpBalance = '29.00'; grantedBalance = '0.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(1))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新超时，点击 ↻ 重试') { throw ('After timeout, unowned old result must preserve timeout notice, got: ' + $DeepSeekStatusNotice.Text) }",
+      "if ($DeepSeekStatusNotice.Text -match '更新') { throw 'After timeout, unowned old result must NOT display updated notice' }",
+      "if ($DeepSeekCurrencyLabel.Text -notmatch ('上次快照（' + $unownedOldTimeStr + '）')) { throw ('After timeout, unowned old result must keep snapshot label, got: ' + $DeepSeekCurrencyLabel.Text) }",
+      "if ($DeepSeekStatusNotice.ToolTip -notmatch ('上次快照（同步于 ' + $unownedOldTimeStr + '）')) { throw ('After timeout, unowned old result must keep timeout tooltip, got: ' + $DeepSeekStatusNotice.ToolTip) }",
+      "if ($script:balanceRequestStartedMs -ne $req1Ms) { throw ('After timeout, unowned old result must preserve balanceRequestStartedMs, got: ' + $script:balanceRequestStartedMs) }",
+      "# (1c) 超时后到达 loading 中间态（含空余额与带旧余额但伪造新时间）：不撤销超时语义，不当作本次完成，保留的旧金额不能冒充新金额",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'loading';",
+      "    isAvailable = $null; updatedAt = $req1Ms + 3000; lastAttemptAt = $req1Ms + 100; balances = @()",
+      "} ([DateTime]::UtcNow.AddSeconds(1.5))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新超时，点击 ↻ 重试') { throw ('After timeout, loading state must NOT revoke timeout notice, got: ' + $DeepSeekStatusNotice.Text) }",
+      "if ($DeepSeekOkPanel.Visibility -ne [System.Windows.Visibility]::Visible -or $DeepSeekTotalText.Text -ne '¥ 29.00') { throw 'After timeout, empty loading state must NOT hide preserved old amount' }",
+      "if ($DeepSeekCurrencyLabel.Text -notmatch ('上次快照（' + $unownedOldTimeStr + '）')) { throw 'After timeout, loading state must NOT alter old snapshot time label' }",
+      "if ($script:balanceRequestStartedMs -ne $req1Ms) { throw 'After timeout, loading state must NOT clear balanceRequestStartedMs' }",
+      "# (2) 超时后到达属于本次请求的有效成功结果：正常显示新金额和真实时间，解除超时及旧快照标识，清除本次请求标记",
+      "$lateSyncMs = $script:balanceRequestStartedMs + 5000",
+      "$expectedLateTimeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds($lateSyncMs).ToLocalTime()).ToString('HH:mm')",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $lateSyncMs; fetchedAt = $lateSyncMs; lastAttemptAt = $script:balanceRequestStartedMs + 100;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '25.00'; toppedUpBalance = '25.00'; grantedBalance = '0.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(2))",
+      "& $pollFn",
+      "if ($DeepSeekTotalText.Text -ne '¥ 25.00') { throw ('Late valid result after timeout must update amount, got ' + $DeepSeekTotalText.Text) }",
+      "if ($DeepSeekStatusNotice.Text -ne ($expectedLateTimeStr + ' 更新')) { throw ('Late valid result must update time notice, got ' + $DeepSeekStatusNotice.Text) }",
+      "if ($DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH 宿主') { throw 'Late valid result must restore normal currency label' }",
+      "if ($null -ne $DeepSeekStatusNotice.ToolTip) { throw 'Late valid result must clear timeout tooltip' }",
+      "if ($script:balanceRequestStartedMs -ne 0) { throw 'balanceRequestStartedMs must be cleared after owned result arrives' }",
+      "# (3) 期限内得到本次结果：及时显示，经过原截止时间也不被超时提示覆盖",
+      "$script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-20)",
+      "Request-BalanceRefresh",
+      "$origDeadline = $script:balanceRequestTimeout",
+      "$inTimeSyncMs = $script:balanceRequestStartedMs + 1000",
+      "$expectedInTimeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds($inTimeSyncMs).ToLocalTime()).ToString('HH:mm')",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $inTimeSyncMs; fetchedAt = $inTimeSyncMs; lastAttemptAt = $script:balanceRequestStartedMs + 50;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '30.00'; toppedUpBalance = '30.00'; grantedBalance = '0.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(4))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne ($expectedInTimeStr + ' 更新')) { throw 'In-time result must show updated time immediately' }",
+      "if ($null -ne $script:balanceRequestTimeout) { throw 'balanceRequestTimeout must be cleared on owned result' }",
+      "$now = $origDeadline.AddSeconds(5)",
+      "& $timeoutFn",
+      "if ($DeepSeekStatusNotice.Text -ne ($expectedInTimeStr + ' 更新')) { throw 'Passed original deadline must NOT overwrite in-time result with timeout' }",
+      "# (4) 先后两次刷新：第一次旧结果或 loading 中间态在第二次等待期间到达（不取消计时），且第二次超时后收到第一次结果仍保留第二次超时状态",
+      "$script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-11)",
+      "Request-BalanceRefresh",
+      "$secondReqMs = $script:balanceRequestStartedMs",
+      "$firstReqMs = $secondReqMs - 11000",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $firstReqMs + 500; fetchedAt = $firstReqMs + 500; lastAttemptAt = $firstReqMs + 200;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '29.00'; toppedUpBalance = '29.00'; grantedBalance = '0.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(6))",
+      "& $pollFn",
+      "if ($null -eq $script:balanceRequestTimeout) { throw 'Stale result from 1st request must NOT cancel 2nd request timeout' }",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新中...') { throw ('Stale result from 1st request must keep 刷新中... notice, got ' + $DeepSeekStatusNotice.Text) }",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'loading';",
+      "    isAvailable = $null; lastAttemptAt = $secondReqMs + 10; balances = @()",
+      "} ([DateTime]::UtcNow.AddSeconds(8))",
+      "& $pollFn",
+      "if ($null -eq $script:balanceRequestTimeout) { throw 'Intermediate loading state must NOT cancel 2nd request timeout' }",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新中...') { throw 'Intermediate loading must keep 刷新中...' }",
+      "# 第二次请求已超时，随后再次收到第一次请求的结果：保留第二次超时状态，第一次结果不能完成第二次请求",
+      "$now = $script:balanceRequestTimeout.AddSeconds(1)",
+      "& $timeoutFn",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新超时，点击 ↻ 重试') { throw '2nd request should enter timeout state' }",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $firstReqMs + 800; fetchedAt = $firstReqMs + 800; lastAttemptAt = $firstReqMs + 800;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '28.00'; toppedUpBalance = '28.00'; grantedBalance = '0.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(9))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne '刷新超时，点击 ↻ 重试') { throw 'After 2nd request timeout, 1st request result must NOT clear 2nd timeout notice' }",
+      "if ($DeepSeekCurrencyLabel.Text -notmatch '上次快照') { throw 'After 2nd request timeout, 1st request result must keep snapshot label' }",
+      "if ($script:balanceRequestStartedMs -ne $secondReqMs) { throw '1st request result must NOT complete 2nd request' }",
+      "# (5) 本次有效失败或停用结果到达：显示对应状态并结束等待，不能显示更新成功",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'error';",
+      "    isAvailable = $false; lastAttemptAt = $secondReqMs + 50; balances = @(); errorCode = 'DSH_HTTP_500'; errorMessage = '上游服务错误'",
+      "} ([DateTime]::UtcNow.AddSeconds(9.5))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne '查询失败') { throw ('Owned error result must show 查询失败, got ' + $DeepSeekStatusNotice.Text) }",
+      "if ($DeepSeekStatusNotice.Text -match '更新$') { throw 'Owned error result must NOT show 更新成功' }",
+      "if ($script:balanceRequestStartedMs -ne 0) { throw 'Owned error result must end current request' }",
+      "$script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-20)",
+      "Request-BalanceRefresh",
+      "$thirdReqMs = $script:balanceRequestStartedMs",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'unknown'; credentialSource = 'dsh'; status = 'dsh_disabled';",
+      "    isAvailable = $false; lastAttemptAt = $thirdReqMs + 100; balances = @(); errorCode = 'BALANCE_DISABLED'",
+      "} ([DateTime]::UtcNow.AddSeconds(10))",
+      "& $pollFn",
+      "if ($DeepSeekStatusNotice.Text -ne '已停用') { throw ('Disabled result must show 已停用, got ' + $DeepSeekStatusNotice.Text) }",
+      "if ($null -ne $script:balanceRequestTimeout -or $script:balanceRequestStartedMs -ne 0) { throw 'Disabled terminal result must clear timeout and request start' }",
+      "# (6) 冷却期内重复点击显示冷却中且不开启新超时；没有手动请求时的正常后台更新继续可用",
+      "Request-BalanceRefresh",
+      "if ($DeepSeekStatusNotice.Text -notmatch '^冷却中 \\(\\d+s\\)$') { throw ('Cooldown click should show 冷却中 (Ns), got ' + $DeepSeekStatusNotice.Text) }",
+      "if ($null -ne $script:balanceRequestTimeout -or $script:balanceRequestStartedMs -ne 0) { throw 'Cooldown click must not set balanceRequestTimeout or balanceRequestStartedMs' }",
+      "$bgSyncMs = $thirdReqMs + 20000",
+      "$expectedBgTimeStr = ([DateTimeOffset]::FromUnixTimeMilliseconds($bgSyncMs).ToLocalTime()).ToString('HH:mm')",
+      "Write-BalanceSnap @{",
+      "    type = 'balance'; provider = 'deepseek'; credentialSource = 'dsh'; status = 'ok';",
+      "    isAvailable = $true; updatedAt = $bgSyncMs; fetchedAt = $bgSyncMs; lastAttemptAt = $bgSyncMs;",
+      "    balances = @(@{ currency = 'CNY'; totalBalance = '42.00'; toppedUpBalance = '40.00'; grantedBalance = '2.00' })",
+      "} ([DateTime]::UtcNow.AddSeconds(12))",
+      "& $pollFn",
+      "if ($DeepSeekTotalText.Text -ne '¥ 42.00' -or $DeepSeekStatusNotice.Text -ne ($expectedBgTimeStr + ' 更新') -or $DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH 宿主') { throw 'Background balance update without manual request must work normally' }",
+      "Write-Output 'AP05_VERIFIED_OK'"
+    ];
+    fs.writeFileSync(runnerAp05, '\uFEFF' + ap05PsLines.join('\r\n'), 'utf8');
+    const ap05Res = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runnerAp05], {
+      encoding: 'utf8',
+      timeout: 15000
+    });
+    assert.ifError(ap05Res.error);
+    assert.strictEqual(ap05Res.signal, null);
+    assert.strictEqual(ap05Res.status, 0, `AP05 PS verification failed: ${ap05Res.stderr || ap05Res.stdout}`);
+    assert.ok(ap05Res.stdout.includes('AP05_VERIFIED_OK'), `Missing AP05_VERIFIED_OK: ${ap05Res.stdout}`);
+    console.log('[PASS] Scenario 16: AP05 余额刷新 15s 超时如实展示、旧金额快照标识、请求归属校验与冷却联动验证通过');
+  }
+
+  // =========================================================================
+  // 场景 17: AP01 收紧退出进程匹配（全矩阵命令行解析 + 持续存活临时诱饵进程实测）
+  // =========================================================================
+  {
+    const ap01Dir = path.join(tmpRoot, 's17-ap01');
+    fs.mkdirSync(path.join(ap01Dir, 'runtime'), { recursive: true });
+    const decoyScript = path.join(ap01Dir, 'decoy-hold.mjs');
+    fs.writeFileSync(decoyScript, 'setInterval(() => {}, 1000);\n', 'utf8');
+
+    // 启动一个真正持续运行的临时诱饵进程：执行 decoy-hold.mjs，但把目标路径作为附加参数传入
+    const targetAppPath = path.join(ap01Dir, 'AgentPet.ps1');
+    const targetMonPath = path.join(ap01Dir, 'runtime', 'agent-monitor.mjs');
+    const decoyChild = spawn(process.execPath, [decoyScript, targetAppPath, targetMonPath], {
+      windowsHide: true,
+      stdio: 'ignore'
+    });
+    await new Promise((resolve, reject) => {
+      decoyChild.once('spawn', resolve);
+      decoyChild.once('error', reject);
+    });
+
+    try {
+      const runnerAp01 = path.join(ap01Dir, 'verify-ap01.ps1');
+      const ap01PsLines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$stopScript = '" + path.join(repoRoot, 'runtime', 'stop-agent.ps1').replace(/'/g, "''") + "'",
+        "$projDir = '" + ap01Dir.replace(/'/g, "''") + "'",
+        "$decoyPid = " + String(decoyChild.pid),
+        "$q = [char]34",
+        ". $stopScript -TargetDir $projDir -LibraryOnly",
+        "$expApp = Join-Path $projDir 'AgentPet.ps1'",
+        "$expMon = Join-Path (Join-Path $projDir 'runtime') 'agent-monitor.mjs'",
+        "function Test-Identity([string]$cmd, [string]$exe = '', [string]$app = $expApp, [string]$mon = $expMon) {",
+        "    $p = [PSCustomObject]@{ CommandLine = $cmd; ExecutablePath = $exe }",
+        "    return (Resolve-AgentPetProcessIdentity $p $app $mon)",
+        "}",
+        "# 1) 正常 PowerShell 主程序与正常 Node 监控器",
+        "if ((Test-Identity ('powershell.exe -NoLogo -NoProfile -STA -ExecutionPolicy Bypass -File ' + $q + $expApp + $q)) -ne 'App') { throw '1a normal App failed' }",
+        "if ((Test-Identity ('node.exe ' + $q + $expMon + $q + ' --parent-pid 1234 --stall-seconds 45')) -ne 'Monitor') { throw '1b normal Monitor failed' }",
+        "# 2) 项目目录含空格、中文；大小写及斜杠有合法差异 -> 仍能识别同一实际入口",
+        "$cnDir = 'D:\\测试 目录\\AgentPet 项目'",
+        "$cnApp = $cnDir + '\\AgentPet.ps1'",
+        "$cnMon = $cnDir + '\\runtime\\agent-monitor.mjs'",
+        "$cnAppVariant = 'd:/测试 目录/agentpet 项目/./runtime/../AGENTPET.PS1'",
+        "$cnMonVariant = 'D:/测试 目录/AgentPet 项目/runtime/./agent-monitor.mjs'",
+        "if ((Test-Identity ('C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoProfile -ExecutionPolicy Bypass -File ' + $q + $cnAppVariant + $q) '' $cnApp $cnMon) -ne 'App') { throw '2a Chinese/space/slash App failed' }",
+        "if ((Test-Identity ($q + 'C:\\Program Files\\nodejs\\node.exe' + $q + ' ' + $q + $cnMonVariant + $q + ' --parent-pid 99') '' $cnApp $cnMon) -ne 'Monitor') { throw '2b Chinese/space/slash Monitor failed' }",
+        "# 3) PowerShell 用 -Command / -EncodedCommand 读取目标文件 -> Mismatch",
+        "if ((Test-Identity ('powershell.exe -NoProfile -Command ' + $q + 'Get-Content ' + $expApp + $q)) -ne 'Mismatch') { throw '3a -Command should be Mismatch' }",
+        "if ((Test-Identity ('powershell.exe -EncodedCommand ZABpAHIA ' + $q + $expApp + $q)) -ne 'Mismatch') { throw '3b -EncodedCommand should be Mismatch' }",
+        "# 4) 编辑器打开目标文件；其他 Node 脚本把目标路径作为参数 -> Mismatch",
+        "if ((Test-Identity ($q + 'C:\\Program Files\\Microsoft VS Code\\Code.exe' + $q + ' ' + $q + $expApp + $q) 'C:\\Program Files\\Microsoft VS Code\\Code.exe') -ne 'Mismatch') { throw '4a editor should be Mismatch' }",
+        "if ((Test-Identity ('node.exe ' + $q + 'D:\\other\\runner.mjs' + $q + ' ' + $q + $expMon + $q + ' ' + $q + $expApp + $q)) -ne 'Mismatch') { throw '4b other node script with target arg should be Mismatch' }",
+        "# 5) node --title <监控脚本路径> <其他脚本> -> 不把选项值当入口，不选为停止对象",
+        "$titleRes = Test-Identity ('node.exe --title ' + $q + $expMon + $q + ' D:\\other\\worker.mjs')",
+        "if ($titleRes -eq 'Monitor' -or $titleRes -eq 'App') { throw ('5 --title option value must NOT match Monitor/App, got ' + $titleRes) }",
+        "# 6) Node -e 或 --eval 字符串中含目标路径 -> Mismatch",
+        "if ((Test-Identity ('node.exe -e ' + $q + 'console.log(1)' + $q + ' ' + $q + $expMon + $q)) -ne 'Mismatch') { throw '6a node -e must be Mismatch' }",
+        "if ((Test-Identity ('node.exe --eval ' + $q + $expMon + $q)) -ne 'Mismatch') { throw '6b node --eval must be Mismatch' }",
+        "# 7) 相似目录、其他项目、AgentPet.ps1.bak -> Mismatch",
+        "if ((Test-Identity ('powershell.exe -File ' + $q + $projDir + '2\\AgentPet.ps1' + $q)) -ne 'Mismatch') { throw '7a similar dir must be Mismatch' }",
+        "if ((Test-Identity ('powershell.exe -File ' + $q + 'D:\\other\\AgentPet.ps1' + $q)) -ne 'Mismatch') { throw '7b other project must be Mismatch' }",
+        "if ((Test-Identity ('powershell.exe -File ' + $q + $expApp + '.bak' + $q)) -ne 'Mismatch') { throw '7c .bak suffix must be Mismatch' }",
+        "# 8) 相对脚本路径且目标进程工作目录未知 -> Unknown（无法确认，不停止）",
+        "if ((Test-Identity 'powershell.exe -NoProfile -File .\\AgentPet.ps1') -ne 'Unknown') { throw '8a relative ps1 must be Unknown' }",
+        "if ((Test-Identity 'node.exe runtime\\agent-monitor.mjs --parent-pid 1') -ne 'Unknown') { throw '8b relative monitor must be Unknown' }",
+        "# 9) 真实持续运行的临时诱饵进程验证（覆盖 PID 路径与真实 stop-agent.ps1 完整执行）",
+        "$script:terminatedPids = @()",
+        "function Stop-ProcessGracefullyThenForce([int]$targetPid, [bool]$isAppProcess = $false) {",
+        "    $script:terminatedPids += $targetPid",
+        "    return $true",
+        "}",
+        "$fakeAppPidFile = Join-Path (Join-Path $projDir 'runtime') 'app.pid'",
+        "[IO.File]::WriteAllText($fakeAppPidFile, (@{ pid = $decoyPid; path = $expApp; baseDir = $projDir } | ConvertTo-Json -Compress), [Text.Encoding]::UTF8)",
+        "$pidRes = Stop-TargetProcessById $decoyPid 'App' $fakeAppPidFile",
+        "if ($pidRes -ne 'PathMismatch') { throw ('9a expected PathMismatch for live decoy PID, got ' + $pidRes) }",
+        "if ($script:terminatedPids.Count -ne 0) { throw '9a decoy must NOT be selected for termination' }",
+        "if (-not (Test-Path $fakeAppPidFile)) { throw '9a app.pid must be preserved on PathMismatch' }",
+        "# 9b: 相对路径进程模拟喂给 Stop-TargetProcessById -> CannotConfirm，保留 PID 文件",
+        "function Get-CimInstance {",
+        "    param($ClassName, $Filter, $ErrorAction)",
+        "    return [PSCustomObject]@{ ProcessId = $decoyPid; CommandLine = 'powershell.exe -NoProfile -File .\\AgentPet.ps1'; ExecutablePath = 'powershell.exe' }",
+        "}",
+        "$relRes = Stop-TargetProcessById $decoyPid 'App' $fakeAppPidFile",
+        "if ($relRes -ne 'CannotConfirm') { throw ('9b relative path in PID check must return CannotConfirm, got ' + $relRes) }",
+        "if ($script:terminatedPids.Count -ne 0) { throw '9b CannotConfirm must NOT terminate process' }",
+        "if (-not (Test-Path $fakeAppPidFile)) { throw '9b app.pid must be preserved on CannotConfirm' }",
+        "Remove-Item Function:\\Get-CimInstance -ErrorAction SilentlyContinue",
+        "# 9c: 直接对含诱饵 PID 的目录执行真实完整 stop-agent.ps1 子进程（含 PID 检查与兜底扫描），确认诱饵进程依然存活且 PID 文件保留",
+        "$realOut = (& $stopScript -TargetDir $projDir *>&1 | Out-String)",
+        "if (-not (Get-Process -Id $decoyPid -ErrorAction SilentlyContinue)) { throw '9c live decoy process was killed by real stop-agent.ps1!' }",
+        "if (-not (Test-Path $fakeAppPidFile)) { throw '9c app.pid should still be preserved after real stop-agent.ps1' }",
+        "if ($realOut -notmatch '未找到运行中的 AgentPet 进程') { throw ('9c unexpected stop-agent output: ' + $realOut) }",
+        "Write-Output 'AP01_VERIFIED_OK'"
+      ];
+      fs.writeFileSync(runnerAp01, '\uFEFF' + ap01PsLines.join('\r\n'), 'utf8');
+      const ap01Res = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runnerAp01], {
+        encoding: 'utf8',
+        timeout: 15000
+      });
+      assert.ifError(ap01Res.error);
+      assert.strictEqual(ap01Res.signal, null);
+      assert.strictEqual(ap01Res.status, 0, `AP01 PS verification failed: ${ap01Res.stderr || ap01Res.stdout}`);
+      assert.ok(ap01Res.stdout.includes('AP01_VERIFIED_OK'), `Missing AP01_VERIFIED_OK: ${ap01Res.stdout}`);
+      assert.strictEqual(decoyChild.exitCode, null, 'Decoy child process must still be alive after stop-agent checks');
+      console.log('[PASS] Scenario 17: AP01 退出进程身份匹配收紧 (PID/兜底双路径、引号反斜杠解析、--title/-e/-Command/相对路径排他与存活诱饵验证通过)');
+    } finally {
+      try { decoyChild.kill(); } catch {}
+    }
+  }
+
 
   console.log('\nAll assertions passed.');
 } catch (e) {

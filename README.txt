@@ -1,4 +1,4 @@
-AgentPet v1.5.2 · 智能桌宠使用说明
+AgentPet v1.5.3 · 智能桌宠使用说明
 
 1. 启动程序：
    直接双击运行「启动 AgentPet.bat」即可唤起。

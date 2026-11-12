@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.5.2"
+$script:AppVersion = "1.5.3"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -1572,6 +1572,8 @@ $script:lowBalanceAlertArmed = $false
 
 $script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
 $script:balanceRequestTimeout = $null
+# AP05: 本次手动刷新的发起时刻（Unix 毫秒），与监控侧 lastAttemptAt 同单位，用于判断结果归属
+$script:balanceRequestStartedMs = [long]0
 
 function Request-BalanceRefresh([switch]$Silent) {
     $now = [DateTime]::UtcNow
@@ -1587,11 +1589,138 @@ function Request-BalanceRefresh([switch]$Silent) {
     $script:lastBalanceRefreshRequestTime = $now
     if (-not $Silent) {
         $script:balanceRequestTimeout = $now.AddSeconds(15.0)
+        $script:balanceRequestStartedMs = ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds()
+        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.ToolTip = $null }
     }
     try {
         [System.IO.File]::WriteAllText($RefreshBalanceFlagPath, [DateTime]::UtcNow.Ticks.ToString(), [System.Text.Encoding]::UTF8)
         if ((-not $Silent) -and $DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "刷新中..." }
     } catch {}
+}
+
+# AP05: 结果是否属于本次手动刷新：必须是终态（非 loading），且监控侧的尝试时间不早于本次请求发起时刻
+function Test-BalanceResultOwnedByRequest($balObj) {
+    if (-not $balObj -or $script:balanceRequestStartedMs -le 0) { return $false }
+    $st = [string]$balObj.status
+    if ([string]::IsNullOrEmpty($st) -or $st -eq "loading") { return $false }
+    if ($null -eq $balObj.lastAttemptAt) { return $false }
+    $attemptMs = [double]0
+    if (-not [double]::TryParse([string]$balObj.lastAttemptAt, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$attemptMs)) { return $false }
+    return ($attemptMs -ge [double]$script:balanceRequestStartedMs)
+}
+
+function Get-BalanceSnapshotTimeText($snap) {
+    $syncMs = $null
+    if ($snap) {
+        if ($snap.updatedAt) { $syncMs = $snap.updatedAt }
+        elseif ($snap.balanceUpdatedAt) { $syncMs = $snap.balanceUpdatedAt }
+        elseif ($snap.fetchedAt) { $syncMs = $snap.fetchedAt }
+    }
+    $syncStr = "时间未知"
+    if ($syncMs) {
+        try { $syncStr = ([DateTimeOffset]::FromUnixTimeMilliseconds([long]$syncMs).ToLocalTime()).ToString("HH:mm") } catch {}
+    }
+    return $syncStr
+}
+
+function Set-BalanceTimeoutNotice {
+    if (-not $DeepSeekStatusNotice) { return }
+    $DeepSeekStatusNotice.Text = "刷新超时，点击 ↻ 重试"
+    if ($DeepSeekStatusNotice -is [System.Windows.Controls.TextBlock]) { $DeepSeekStatusNotice.FontSize = 9.5 }
+    if ($DeepSeekHeader -is [System.Windows.Controls.TextBlock]) {
+        $DeepSeekHeader.Text = "DeepSeek 余额"
+        $DeepSeekHeader.FontSize = 11.0
+    }
+    if ($DeepSeekBadge) { $DeepSeekBadge.Visibility = [System.Windows.Visibility]::Collapsed }
+    $hasAmount = ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible)
+    if ($hasAmount) {
+        $syncStr = Get-BalanceSnapshotTimeText $script:lastBalanceObject
+        $DeepSeekStatusNotice.ToolTip = "本次刷新 15 秒内未获得结果；当前金额为上次快照（同步于 $syncStr）"
+        if ($DeepSeekCurrencyLabel) {
+            $DeepSeekCurrencyLabel.Text = "人民币 CNY · 上次快照（$syncStr）"
+            if ($DeepSeekCurrencyLabel -is [System.Windows.Controls.TextBlock]) { $DeepSeekCurrencyLabel.FontSize = 11.0 }
+        }
+    } else {
+        $DeepSeekStatusNotice.ToolTip = "本次刷新 15 秒内未获得结果"
+    }
+}
+
+# AP05 & AP05-R1: 统一处理新读到的余额快照（先判定请求状态与结果归属，再决定如何更新界面与请求状态）
+function Receive-BalanceSnapshot($balObj) {
+    if (-not $balObj) { return }
+    $script:balanceStartupPending = $false
+    $script:balanceStartupDeadline = $null
+
+    $hasActiveRequest = ($script:balanceRequestStartedMs -gt 0)
+    $isWaitingRequest = ($hasActiveRequest -and ($null -ne $script:balanceRequestTimeout))
+    $isTimedOutRequest = ($hasActiveRequest -and ($null -eq $script:balanceRequestTimeout))
+    $owned = Test-BalanceResultOwnedByRequest $balObj
+
+    # 1. 尚无手动请求，或当前手动请求收到了属于本次请求的有效终态结果（无论超时前后）
+    if ((-not $hasActiveRequest) -or $owned) {
+        if ($owned) {
+            $script:balanceRequestTimeout = $null
+            $script:balanceRequestStartedMs = [long]0
+        }
+        $script:lastBalanceObject = $balObj
+        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.ToolTip = $null }
+        Apply-BalanceObject $balObj
+        return
+    }
+
+    # 2. 存在未完成的手动请求（等待中 或 已超时），但到达的是旧请求结果或 loading 中间态（$owned -eq $false）
+    $st = [string]$balObj.status
+    $hadAmountVisible = ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible)
+    $incomingHasCny = $false
+    if (($st -eq "ok" -or $st -eq "stale") -and $balObj.balances) {
+        foreach ($b in $balObj.balances) {
+            if ([string]$b.currency -eq "CNY") { $incomingHasCny = $true; break }
+        }
+    }
+
+    if ($incomingHasCny) {
+        # 旧请求携带有效金额：仅在无现有快照或旧结果不早于现有快照时更新展示的旧金额，绝不显示为本次刷新成功
+        $curSyncMs = [long]0
+        if ($script:lastBalanceObject) {
+            if ($script:lastBalanceObject.updatedAt) { $curSyncMs = [long]$script:lastBalanceObject.updatedAt }
+            elseif ($script:lastBalanceObject.balanceUpdatedAt) { $curSyncMs = [long]$script:lastBalanceObject.balanceUpdatedAt }
+            elseif ($script:lastBalanceObject.fetchedAt) { $curSyncMs = [long]$script:lastBalanceObject.fetchedAt }
+        }
+        $incSyncMs = [long]0
+        if ($balObj.updatedAt) { $incSyncMs = [long]$balObj.updatedAt }
+        elseif ($balObj.balanceUpdatedAt) { $incSyncMs = [long]$balObj.balanceUpdatedAt }
+        elseif ($balObj.fetchedAt) { $incSyncMs = [long]$balObj.fetchedAt }
+
+        if ((-not $hadAmountVisible) -or ($incSyncMs -ge $curSyncMs)) {
+            $script:lastBalanceObject = $balObj
+            Apply-BalanceObject $balObj -IsInitialStartup
+        }
+    } elseif ((-not $hadAmountVisible) -and $isWaitingRequest -and ($st -eq "loading")) {
+        Apply-BalanceObject $balObj
+    }
+
+    # 保留并锁定当前手动刷新的真实状态语义（“刷新中...” 或 “刷新超时，点击 ↻ 重试”）与旧快照标记
+    if ($isTimedOutRequest) {
+        Set-BalanceTimeoutNotice
+    } elseif ($isWaitingRequest) {
+        if ($DeepSeekStatusNotice) {
+            $DeepSeekStatusNotice.Text = "刷新中..."
+            $DeepSeekStatusNotice.ToolTip = $null
+        }
+        if ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible -and $DeepSeekCurrencyLabel) {
+            $syncStr = Get-BalanceSnapshotTimeText $script:lastBalanceObject
+            $DeepSeekCurrencyLabel.Text = "人民币 CNY · 上次快照（$syncStr）"
+            if ($DeepSeekCurrencyLabel -is [System.Windows.Controls.TextBlock]) { $DeepSeekCurrencyLabel.FontSize = 11.0 }
+        }
+    }
+}
+
+# AP05: 手动刷新 15 秒未得到本次结果时如实提示超时；旧金额标明为上次快照
+function Update-BalanceRefreshTimeout([DateTime]$now) {
+    if (-not $script:balanceRequestTimeout -or $now -le $script:balanceRequestTimeout) { return }
+    $script:balanceRequestTimeout = $null
+    # 保留 balanceRequestStartedMs：超时后本次结果到达仍能被识别并正常更新
+    Set-BalanceTimeoutNotice
 }
 
 function Check-LowBalanceAlert($balObj) {
@@ -1645,6 +1774,12 @@ function Check-LowBalanceAlert($balObj) {
 function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     if (-not $balObj -or -not $DeepSeekPanel) { return }
     $script:lastBalanceObject = $balObj
+    if ($DeepSeekHeader -is [System.Windows.Controls.TextBlock]) {
+        $DeepSeekHeader.Text = "DeepSeek 官方余额"
+        $DeepSeekHeader.FontSize = 12.5
+    }
+    if ($DeepSeekStatusNotice -is [System.Windows.Controls.TextBlock]) { $DeepSeekStatusNotice.FontSize = 11.0 }
+    if ($DeepSeekCurrencyLabel -is [System.Windows.Controls.TextBlock]) { $DeepSeekCurrencyLabel.FontSize = 12.5 }
     if ($DeepSeekIcon -and $script:AgentIcons.ContainsKey("dsh")) {
         $DeepSeekIcon.Source = $script:AgentIcons["dsh"]
     }
@@ -2914,10 +3049,7 @@ function Poll-AgentMonitor {
                 $b = $raw | ConvertFrom-Json -ErrorAction Stop
                 if ($b) {
                     $script:lastBalanceMtime = $item.LastWriteTimeUtc
-                    $script:lastBalanceObject = $b
-                    Apply-BalanceObject $b
-                    $script:balanceStartupPending = $false
-                    $script:balanceStartupDeadline = $null
+                    Receive-BalanceSnapshot $b
                 }
             }
         } catch {
@@ -3088,11 +3220,14 @@ $Timer.Add_Tick({
         Show-Bubble 4.0
     }
 
-    # 0.5 Safety revert for balance refresh notice
-    if ($script:balanceRequestTimeout -and $now -gt $script:balanceRequestTimeout) {
+    # 0.5 Safety revert for balance refresh notice (AP05: report timeout honestly, never "已是最新")
+    if (Get-Command Update-BalanceRefreshTimeout -ErrorAction SilentlyContinue) {
+        Update-BalanceRefreshTimeout $now
+    } elseif ($script:balanceRequestTimeout -and $now -gt $script:balanceRequestTimeout) {
         $script:balanceRequestTimeout = $null
-        if ($DeepSeekStatusNotice -and $DeepSeekStatusNotice.Text -eq "刷新中...") {
-            $DeepSeekStatusNotice.Text = "已是最新"
+        if ($DeepSeekStatusNotice) {
+            $DeepSeekStatusNotice.Text = "刷新超时，点击 ↻ 重试"
+            $DeepSeekStatusNotice.ToolTip = "本次刷新 15 秒内未获得结果"
         }
     }
 

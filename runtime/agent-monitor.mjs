@@ -666,6 +666,7 @@ class AgentMonitor {
     this.balanceRetryAfterUntil = 0;
     this.cachedBalanceData = null;
     this.balanceGeneration = 0;
+    this.balanceDisabledPublished = false;
     this.cachedDshPort = null;
     this.lastDshPortCheck = 0;
     this.activeHostSignature = null;
@@ -728,7 +729,7 @@ class AgentMonitor {
     return null;
   }
 
-  invalidateBalance(reason) {
+  invalidateBalance(reason, { emitLoading = true } = {}) {
     this.balanceGeneration++;
     this.cachedBalanceData = null;
     this.lastBalanceFetchAttempt = 0;
@@ -737,6 +738,7 @@ class AgentMonitor {
     this.activeHostSignature = null;
     this.cachedDshPort = null;
     writeErrorLog(`Balance invalidated: ${reason} (new gen: ${this.balanceGeneration})`);
+    if (!emitLoading) return;
     this.onChange({
       type: 'balance',
       provider: 'unknown',
@@ -947,15 +949,11 @@ class AgentMonitor {
 
   checkBalanceTrigger() {
     const config = this.readPetConfig();
+    const balanceEnabled = (config.DeepSeekBalanceEnabled !== false);
     const configSig = `${config.DeepSeekBalanceEnabled}:${config.DshPort || 0}:${config.DshBaseUrl || ''}`;
-    if (this.lastConfigSig !== undefined && this.lastConfigSig !== configSig) {
-      this.lastConfigSig = configSig;
-      this.invalidateBalance('CONFIG_CHANGED');
-      this.pollBalance(true);
-      return;
-    }
-    this.lastConfigSig = configSig;
     const now = Date.now();
+
+    // AP04: 每轮先消费手动刷新标记，再决定通知或查询，避免配置变化的早退分支留下标记
     let force = false;
     try {
       if (fs.existsSync(this.paths.refreshBalanceFlag)) {
@@ -967,6 +965,27 @@ class AgentMonitor {
         try { fs.unlinkSync(this.paths.refreshBalanceFlag); } catch {}
       }
     } catch {}
+
+    const configChanged = this.lastConfigSig !== undefined && this.lastConfigSig !== configSig;
+    this.lastConfigSig = configSig;
+    if (configChanged) {
+      if (balanceEnabled) {
+        // 重新启用或改端口：使旧在途请求失效并立即查询
+        this.invalidateBalance('CONFIG_CHANGED');
+        this.pollBalance(true);
+      } else {
+        // 切换为禁用：使旧在途请求失效，只发布一次停用结果
+        this.invalidateBalance('BALANCE_DISABLED', { emitLoading: false });
+        this.publishBalanceDisabled(now);
+      }
+      return;
+    }
+
+    if (!balanceEnabled) {
+      // 稳定禁用：不探测宿主、不发请求、不自动重复写入；手动刷新至多回写一次停用结果以结束界面等待
+      if (force || !this.balanceDisabledPublished) this.publishBalanceDisabled(now);
+      return;
+    }
 
     // 10 minutes staleness detection (2 * 5m cycle)
     if (this.cachedBalanceData?.status === 'ok' && (now - (this.cachedBalanceData.fetchedAt || 0) > 600_000)) {
@@ -983,6 +1002,28 @@ class AgentMonitor {
     }
   }
 
+  publishBalanceDisabled(now = Date.now()) {
+    this.cachedBalanceData = null;
+    this.balanceDisabledPublished = true;
+    this.lastBalanceAt = now;
+    this.onChange({
+      type: 'balance',
+      provider: 'unknown',
+      providerFamily: 'deepseek',
+      credentialSource: 'dsh',
+      status: 'dsh_disabled',
+      isAvailable: false,
+      currency: 'CNY',
+      balances: [],
+      hostCounter: null,
+      fetchedAt: now,
+      observedAt: null,
+      lastAttemptAt: now,
+      errorCode: 'BALANCE_DISABLED',
+      errorMessage: 'DeepSeek 余额服务未启用（可在菜单中开启）'
+    });
+  }
+
   async pollBalance(force = false) {
     if (this.balanceBusy) return;
     const now = Date.now();
@@ -990,26 +1031,10 @@ class AgentMonitor {
 
     const balanceEnabled = (config.DeepSeekBalanceEnabled !== false);
     if (!balanceEnabled) {
-      this.cachedBalanceData = null;
-      const data = {
-        type: 'balance',
-        provider: 'unknown',
-        providerFamily: 'deepseek',
-        credentialSource: 'dsh',
-        status: 'dsh_disabled',
-        isAvailable: false,
-        currency: 'CNY',
-        balances: [],
-        hostCounter: null,
-        fetchedAt: Date.now(),
-        observedAt: null,
-        lastAttemptAt: now,
-        errorCode: 'BALANCE_DISABLED',
-        errorMessage: 'DeepSeek 余额服务未启用（可在菜单中开启）'
-      };
-      this.onChange(data);
+      this.publishBalanceDisabled(now);
       return;
     }
+    this.balanceDisabledPublished = false;
 
     if (this.lastBalanceFetchAttempt && (now - this.lastBalanceFetchAttempt < 10_000)) {
       if (force && this.cachedBalanceData) {
@@ -2248,17 +2273,27 @@ class AgentMonitor {
     return 0;
   }
 
-  codexPendingState(pending) {
+  // AP02: 按原始提问时间实际删除已达 5 分钟上限的待答记录（边界：达到 300 秒即过期）
+  pruneCodexPending(pending, now) {
+    if (!pending || !Number.isFinite(now)) return;
+    for (const [callId, p] of pending) {
+      if (now - p.at >= WAITING_MAX_AGE_MS) pending.delete(callId);
+    }
+  }
+
+  codexPendingState(pending, now) {
+    if (!pending) return null;
+    this.pruneCodexPending(pending, now);
     const latest = [...pending.values()].filter(p => p.accepted).sort((a, b) => b.at - a.at)[0];
     if (!latest) return null;
     return {
       source: 'Codex', state: latest.kind === 'approval' ? 'approval' : 'waiting',
       task: latest.kind === 'approval' ? '等待主人确认权限' : '等待主人回答问题',
-      at: latest.at, startedAt: latest.at, inFlight: true
+      at: latest.at, startedAt: latest.at, inFlight: true, fromPending: true
     };
   }
 
-  scanCodexAsyncPrompts(file, size, mtime) {
+  scanCodexAsyncPrompts(file, size, mtime, now = Date.now()) {
     let item = this.codexAsyncCache.get(file);
     if (!item) {
       item = { offset: 0, remainder: Buffer.alloc(0), pending: new Map() };
@@ -2350,7 +2385,17 @@ class AgentMonitor {
     } catch {} finally {
       if (fd !== null) try { fs.closeSync(fd); } catch {}
     }
-    return this.codexPendingState(item.pending);
+    return this.codexPendingState(item.pending, now);
+  }
+
+  // AP06: 最终候选窗口保留显式传入的较大窗口（如离线额度回退的七天），
+  // 未知 / 等待 / 在飞候选仍至少保留现有 300 秒规则；普通工作扫描仍为 180 秒。
+  codexCandidateWindow(c, maxAgeMs) {
+    const cachedState = this.codexStateCache.get(c.file)?.state;
+    const stateWindow = (cachedState === undefined || isHeldState(cachedState))
+      ? WAITING_MAX_AGE_MS
+      : 0;
+    return Math.max(maxAgeMs, stateWindow);
   }
 
   findCodexRollouts(now, maxAgeMs = ACTIVE_MAX_AGE_MS) {
@@ -2384,13 +2429,7 @@ class AgentMonitor {
       }
       refreshed.sort((a, b) => b.mtime - a.mtime);
       this.codexRolloutCandidates = refreshed;
-      return refreshed.filter(c => {
-        const cachedState = this.codexStateCache.get(c.file)?.state;
-        const limit = cachedState === undefined
-          ? WAITING_MAX_AGE_MS
-          : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : maxAgeMs);
-        return now - c.mtime < limit;
-      });
+      return refreshed.filter(c => now - c.mtime < this.codexCandidateWindow(c, maxAgeMs));
     }
     this.lastCodexRolloutScan = now;
 
@@ -2427,13 +2466,7 @@ class AgentMonitor {
 
     candidates.sort((a, b) => b.mtime - a.mtime);
     this.codexRolloutCandidates = candidates;
-    const freshCandidates = candidates.filter(c => {
-      const cachedState = this.codexStateCache.get(c.file)?.state;
-      const limit = cachedState === undefined
-        ? WAITING_MAX_AGE_MS
-        : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : maxAgeMs);
-      return now - c.mtime < limit;
-    });
+    const freshCandidates = candidates.filter(c => now - c.mtime < this.codexCandidateWindow(c, maxAgeMs));
     return freshCandidates;
   }
 
@@ -2445,11 +2478,20 @@ class AgentMonitor {
     const { file: latestFile, mtime: latestMtime, size: latestSize } = candidate;
     const cached = this.codexStateCache.get(latestFile);
     if (cached && cached.mtime === latestMtime && cached.size === latestSize) {
-      return refreshDynamicState(cached.state, now, this.stallEnabled, this.stallMs);
+      if (!cached.state?.fromPending) {
+        return refreshDynamicState(cached.state, now, this.stallEnabled, this.stallMs);
+      }
+      // AP02: 缓存的是待答状态时，按本轮时间重新评估；仍有有效待答项则继续等待，
+      // 全部过期后不直接返回空，而是落入下方普通日志解析（文件未变化也要生效）。
+      const stillPending = this.codexPendingState(this.codexAsyncCache.get(latestFile)?.pending, now);
+      if (stillPending) {
+        this.codexStateCache.set(latestFile, { mtime: latestMtime, size: latestSize, state: stillPending });
+        return stillPending;
+      }
     }
 
     try {
-      const pendingQuestion = this.scanCodexAsyncPrompts(latestFile, latestSize, latestMtime);
+      const pendingQuestion = this.scanCodexAsyncPrompts(latestFile, latestSize, latestMtime, now);
       if (pendingQuestion) {
         this.codexStateCache.set(latestFile, { mtime: latestMtime, size: latestSize, state: pendingQuestion });
         return pendingQuestion;
@@ -2507,6 +2549,18 @@ class AgentMonitor {
           if (kind === 'item_completed') {
             const item = payload.item || {};
             const iType = String(item.type || '').toLowerCase();
+            // AP03: AgentMessage 先按 phase 区分；进度消息（commentary 或缺少 phase）不产生步骤完成提示
+            if (iType === 'agentmessage') {
+              const phase = String(item.phase ?? '').trim().toLowerCase();
+              if (phase === 'final_answer') {
+                if (now - latestMtime < TERMINAL_HOLD_MS) {
+                  res = { source: 'Codex', state: 'success', task: '回复已生成完毕', at: latestMtime };
+                }
+              } else {
+                res = { source: 'Codex', state: 'thinking', task: '正在汇报进度并继续推进…', at: latestMtime };
+              }
+              break;
+            }
             const summary = cleanSummary(item.name || item.command || item.tool || iType);
             const nextTask = summary ? `推进中 (${summary})` : '正在分析执行结果并构思下一步…';
             if (now - latestMtime < TERMINAL_HOLD_MS) {
@@ -2600,7 +2654,9 @@ class AgentMonitor {
               break;
             }
             if (payload.role === 'assistant') {
-              if (payload.status === 'in_progress') {
+              const msgStatus = String(payload.status ?? '').trim().toLowerCase();
+              const msgPhase = String(payload.phase ?? '').trim().toLowerCase();
+              if (msgStatus === 'in_progress') {
                 res = {
                   source: 'Codex',
                   state: 'working',
@@ -2609,14 +2665,26 @@ class AgentMonitor {
                 };
                 break;
               }
-              if (now - latestMtime < TERMINAL_HOLD_MS) {
-                res = {
-                  source: 'Codex',
-                  state: 'success',
-                  task: '回复已生成完毕',
-                  at: latestMtime
-                };
+              // AP03: 只有明确的最终答复（phase=final_answer 且 status=completed）才算回复完成；
+              // commentary 进度消息、缺少或无法确认 phase/status 的消息都按普通活动处理，
+              // 回合是否结束交给明确的 task_complete / turn_complete 等结束事件判断。
+              if (msgPhase === 'final_answer' && msgStatus === 'completed') {
+                if (now - latestMtime < TERMINAL_HOLD_MS) {
+                  res = {
+                    source: 'Codex',
+                    state: 'success',
+                    task: '回复已生成完毕',
+                    at: latestMtime
+                  };
+                }
+                break;
               }
+              res = {
+                source: 'Codex',
+                state: 'thinking',
+                task: '正在汇报进度并继续推进…',
+                at: latestMtime
+              };
               break;
             }
             if (payload.role === 'user') {
@@ -2638,6 +2706,8 @@ class AgentMonitor {
   }
 
   checkCodex(now) {
+    // AP02: 已不在候选窗口内的会话也按原始时间清理过期待答记录，避免旧记录滞留内存
+    for (const item of this.codexAsyncCache.values()) this.pruneCodexPending(item.pending, now);
     const candidates = this.findCodexRollouts(now, ACTIVE_MAX_AGE_MS);
     if (!candidates.length) return null;
 

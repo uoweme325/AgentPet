@@ -46,10 +46,10 @@ function runInjectedScenario({ label, baseFile, targetPattern, replacePattern, e
       throw new Error(`[SYNTAX CHECK FAILED] Injected script syntax is invalid: ${checkRes.stderr}`);
     }
 
-    // 运行故障子进程，限时 15000ms，捕获输出
+    // 运行故障子进程，限时 30000ms，捕获输出
     res = spawnSync(nodeExe, [tmpScript], {
       encoding: 'utf8',
-      timeout: 15000
+      timeout: 30000
     });
   } finally {
     try { if (fs.existsSync(tmpScript)) fs.unlinkSync(tmpScript); } catch {}
@@ -59,11 +59,16 @@ function runInjectedScenario({ label, baseFile, targetPattern, replacePattern, e
   if (res.stdout) console.log(`   Stdout: ${res.stdout.trim().split('\n')[0]}`);
   if (res.stderr) console.log(`   Stderr: ${res.stderr.trim().split('\n')[0]}`);
 
+  // 严格断言：res.error、信号终止、超时或空退出码均不能算通过
+  assert.ifError(res.error);
+  assert.strictEqual(res.signal, null, `Scenario '${label}' must not terminate by signal (got ${res.signal})`);
+  assert.notStrictEqual(res.status, null, `Scenario '${label}' exit status must not be null`);
+
   // 断言退出码
   if (expectedStatus === 0) {
-    assert.equal(res.status, 0, `Scenario '${label}' should exit with 0`);
+    assert.strictEqual(res.status, 0, `Scenario '${label}' should exit with 0`);
   } else {
-    assert.notEqual(res.status, 0, `Scenario '${label}' should exit with non-zero (got ${res.status})`);
+    assert.strictEqual(res.status, expectedStatus, `Scenario '${label}' should exit with ${expectedStatus} (got ${res.status})`);
   }
 
   // 断言 stderr
