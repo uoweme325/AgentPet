@@ -1,4 +1,8 @@
-# 🐾 AgentPet
+# 🐾 AgentPet — Windows Desktop Pet for Antigravity, Codex & DeepSeek Harness
+
+> **Windows 桌面联动桌宠**：实时显示 **Antigravity（反重力）、Codex、DeepSeek Harness（DSH）** 的思考 / 工作 / 等待确认状态，自带 **Codex 额度看板** 与 **DeepSeek 余额明细提醒**，包含 **小克（Claude娘）、白龙（GPT娘）、双子（Gemini娘）** 三位角色。
+>
+> **English Summary:** A lightweight portable **Windows (WPF + PowerShell)** desktop companion pet that monitors live coding states for **Antigravity, Codex, and DeepSeek Harness (DSH)**, displaying interactive bubble cards for Codex usage quotas, DeepSeek balance reminders, and character status animations.
 
 把 Agent 的工作状态带到桌面上，让等待 Agent 工作的时间少一些无聊。
 
