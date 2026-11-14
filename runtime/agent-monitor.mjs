@@ -82,6 +82,14 @@ const SCAN_MS = 500;
 const ACTIVE_MAX_AGE_MS = 180_000;
 const WAITING_MAX_AGE_MS = 300_000;
 const TERMINAL_HOLD_MS = 8_000;
+const HANDOFF_MAX_AGE_MS = 15 * 60_000;
+const APPROVAL_INFER_DELAY_MS = 8_000;
+const CUA_ELICIT_APIS = [
+  /\.setFiles\s*\(/,
+  /\.downloadMedia\s*\(/,
+  /\.waitForEvent\s*\(\s*['"]download['"]\s*\)/
+];
+const CUA_HANDOFF_API = /\.markHandoff\s*\(/;
 const TASK_TEXT_MAX = 40;
 const DETAIL_MAX_CODE_POINTS = 700;
 const DETAIL_TRUNCATE_SUFFIX = '…（已节选）';
@@ -112,7 +120,7 @@ function getCleanSubprocessEnv() {
   return env;
 }
 
-// Character-aligned 7-tier work status texts (claude / gemini / dragon)
+// Character-aligned 7-tier work status texts (claude / gemini / dragon / deepseek / zcode)
 const WORK_STATUS_TEXTS_BY_CHARACTER = {
   claude: {
     thinking: [
@@ -278,6 +286,116 @@ const WORK_STATUS_TEXTS_BY_CHARACTER = {
       '发现一处烂代码报错，看我三两下把它修老实。',
       '小场面，等我顺着堆栈把这只臭虫拍飞！'
     ]
+  },
+  deepseek: {
+    thinking: [
+      '脑袋顶上的呆毛正在竖起来，深海推理中…',
+      '托腮拿着小筷子琢磨中，怎么写最划算呢？',
+      '正在海底打捞上下文线索，很快就能浮上水面~',
+      '咕噜咕噜……脑海里的推导泡泡正一串串冒出来！',
+      '正在对照需求仔细推演，马上给出漂亮解法~',
+      '先在深水区把边界算清楚，待会儿动笔才不返工！'
+    ],
+    working: [
+      '蓝鲸笔记本全速运转中，一边敲代码一边盯终端~',
+      '小指一点，全息代码屏刷刷展开——全速干活中！',
+      '大肥鱼正在认真改文件，小饭碗都顾不上扒两口啦！',
+      '正在把逻辑一行行捞起来理顺，主人稍安勿躁~',
+      '海蓝光标飞速跳动中，剩下的杂活包在我身上！',
+      '鲸尾轻轻拍打节拍——构建与修改同步推进中~'
+    ],
+    waiting: [
+      '双手捧着空空的小白碗——主人，这里等您拍板投喂许可呢！',
+      '咕……端着空碗眼巴巴望着您，点一下确认就继续~',
+      '碰到关键分岔口啦，等主人发个话我再接着干活！',
+      '小鲸尾停下来晃了晃，请主人过目这一步权限确认~',
+      '饭碗先举到屏幕前啦！您点个头我就立马开动~',
+      '等主人做出选择呢，选好我继续潜下去帮您码字！'
+    ],
+    stalled: [
+      '海面有点起雾，对面响应慢悠悠的，我浮着替您守着…',
+      '这一步好像卡在深水区了，我捧着饭碗继续盯着日志…',
+      '工具还没回信呢，先晃晃鲸尾耐心等一会儿~'
+    ],
+    result: [
+      '终端结果打捞上岸啦，正在为您盛进结果碗里~',
+      '气泡里裹着关键输出浮上来咯，容我整理呈上！',
+      '这一小步顺顺当当跑通了，正在串联下一段内容…',
+      '数据已经捞齐，正在过滤杂鱼留干货给主人看~',
+      '工具交差啦，容大肥鱼再对照需求核实一遍！',
+      '阶段回执收好咯，马上汇总成清晰回复呈给您~'
+    ],
+    success: [
+      '满满一碗香喷喷的代码端上来啦！大肥鱼今天超棒吧？',
+      '呼呼~ 捧着热腾腾的白米饭收工庆祝，主人快验收吧！',
+      '深海探索圆满浮水！这一轮又快又省心地跑完啦~',
+      '全部打捞验收完毕，记得夸夸努力干活的大肥鱼哦！',
+      '小饭碗装得满满当当，随时准备接下一顿大餐任务！',
+      '蓝鲸勋章闪亮亮~ 今天的代码也顺利端稳上桌啦！'
+    ],
+    error: [
+      '噗噜？！哪里冒出来的调皮 Bug 撞翻了小饭碗！',
+      '呆毛警报拉响——正在顺着堆栈潜下去捉那只漏洞！',
+      '抓到一处红字报错啦，主人别慌，我马上下海修补~',
+      '鲸尾一拍掀起水花，哪个边界条件敢在这里捣乱！',
+      '捕获到异常信号了，容我托腮理出它报错的原因…',
+      '小风浪而已，大肥鱼这就把它拍平再继续往前游！'
+    ]
+  },
+  zcode: {
+    thinking: [
+      '托腮眨眨蓝灰眼眸，头顶灵感小灯泡亮起来啦…',
+      '狐耳轻轻支起——正在细听代码上下文里的线索！',
+      '银色小铃铛晃了晃，正在推演最稳妥的重构路线…',
+      '额前的睡眠眼罩还没戴上呢，此刻思路可清醒着！',
+      '正在对照依赖关系反复思量，解法就快浮现了~',
+      '大尾巴在身后慢悠悠扫过，容我理顺这一段逻辑！'
+    ],
+    working: [
+      '爪印笔记本嗡嗡运转中，正在全息代码屏上飞快落笔！',
+      '叮铃~ 智谱娘认真进入编码节奏，终端和文件双线推进中！',
+      '指尖在代码浮窗上轻点，一行行规则逻辑稳稳落地~',
+      '黑色哥特裙摆微微扬起，正在把乱糟糟的结构理顺！',
+      '蓝光星芒闪过——构建与改动正有序执行呢！',
+      '双腕黑扣系紧，这一轮的编码重活交给我就好啦！'
+    ],
+    waiting: [
+      '狐耳垂下来一点点——主人，这里需要您点头才能继续哦。',
+      '悬停在分支节点上呢，等主人亲自拍板下发指令~',
+      '铃铛轻响提醒：有个权限确认正等着主人批复！',
+      '暂且合上爪印笔记本，请问主人接下来希望怎么走？',
+      '等待您的确认信号，批下来我立刻继续推进~',
+      '这步涉及重要改动，请主人先确认后再由我执行吧！'
+    ],
+    stalled: [
+      '对面好久没动静呀，狐耳一直竖着替您等回音呢…',
+      '这一步执行有点久，我先把铃铛按住安静守候日志~',
+      '远端响应慢半拍，不过大尾巴一直帮您暖着桌面等结果…'
+    ],
+    result: [
+      '全息屏返回数据已接住，正在整理清晰结论给您~',
+      '铃铛响了一记提示音，这一步的验证输出已收进笔记本！',
+      '工具执行回执妥当，容我核对细节后马上汇报~',
+      '线索拼图刚凑齐，蓝灰眼眸正在快速扫读关键片段…',
+      '阶段性结果已落袋，正在为您串联下一节推进~',
+      '命令回波收齐了，正在精简冗余后呈现最终结论~'
+    ],
+    success: [
+      '眼里闪出亮晶晶的蓝星★ 这一轮漂亮拿下啦，主人！',
+      '叮铃叮铃~ 所有检查与改动全数收官，是不是超可靠！',
+      '双拳一攥满心欢喜——今天的代码质量也让狐耳满意呢！',
+      '爪印笔记本合上啦，圆满交差，请主人检阅成果~',
+      '蓝紫挑染都跟着亮起来咯，随时准备好迎接下一题！',
+      '全部稳妥落地，大尾巴得意地晃了三圈呢~'
+    ],
+    error: [
+      '狐耳警觉地弹起来了！刚才捕获到一处异常报错！',
+      '咦，红字从哪儿冒出来的？容我托腮顺着调用栈查清！',
+      '叮铃警示响起——发现一处越界异常，我马上动手修复~',
+      '可别想藏过我的蓝灰眼眸，正在锁定引发报错的那一行！',
+      '遇到一点小故障，主人喝口水吧，我来把逻辑修顺畅~',
+      '异常堆栈已经记进爪印笔记本，这就逐条拆解摆平它！'
+    ]
   }
 };
 const WORK_STATUS_TEXTS = WORK_STATUS_TEXTS_BY_CHARACTER.claude;
@@ -424,6 +542,91 @@ function extractTranscriptToolDetail(tc) {
   return finalizeTaskDetail(parts.join('\n'));
 }
 
+function isCuaReplCall(payload) {
+  const ns = String(payload?.namespace || '');
+  const name = String(payload?.name || payload?.tool || '');
+  return ns.startsWith('mcp__cua_repl') && (name === 'js' || name === '');
+}
+
+function codexCuaCode(payload) {
+  const raw = payload?.arguments ?? payload?.input ?? payload?.args;
+  if (typeof raw === 'string') {
+    try {
+      const o = JSON.parse(raw);
+      if (typeof o?.code === 'string') return o.code;
+    } catch {}
+    return raw;
+  }
+  if (raw && typeof raw === 'object' && typeof raw.code === 'string') return raw.code;
+  return '';
+}
+
+function cuaDetailText(code, patterns = CUA_ELICIT_APIS) {
+  if (!code) return null;
+  const lines = String(code).split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const hit = lines.find(l => patterns.some(re => re.test(l)));
+  return finalizeTaskDetail(hit || lines[0] || null);
+}
+
+function isRealUserMessageText(rawText) {
+  const t = String(rawText || '').trim();
+  if (!t) return false;
+  if (/^<(?:environment_context|user_instructions|permissions instructions|collaboration_mode|app-context|instructions)\b/i.test(t)) {
+    return false;
+  }
+  return true;
+}
+
+function isCuaHandoffErrorOutput(payload) {
+  if (!payload || typeof payload !== 'object') return false;
+  if (payload.is_error === true || payload.isError === true) return true;
+  if (typeof payload.status === 'string' && /^(?:error|failed|rejected|cancelled|canceled)$/i.test(payload.status.trim())) {
+    return true;
+  }
+  const hasErrorText = (raw) => {
+    const t = String(raw || '').trim();
+    if (!t) return false;
+    return /^(?:error|failed|exception|typeerror|referenceerror|rangeerror|syntaxerror)\b\s*[:!]/i.test(t) ||
+      /^(?:tool\s+call\s+failed|failed\s+to)\b/i.test(t) ||
+      /\bmarkHandoff\s+failed\b/i.test(t);
+  };
+  const hasErrorObj = (obj) => {
+    if (!obj || typeof obj !== 'object') return false;
+    if (obj.ok === false || obj.success === false || obj.is_error === true || obj.isError === true) return true;
+    if (obj.error !== undefined && obj.error !== null && obj.error !== false && obj.error !== '') return true;
+    if (typeof obj.status === 'string' && /^(?:error|failed|rejected|cancelled|canceled)$/i.test(obj.status.trim())) return true;
+    if (Array.isArray(obj.content)) {
+      const joined = obj.content.map(c => (typeof c === 'string' ? c : (c && c.text) || '')).join('\n');
+      if (hasErrorText(joined)) return true;
+    }
+    return false;
+  };
+  const rawOut = payload.output ?? payload.result ?? payload.content;
+  if (typeof rawOut === 'string') {
+    const parsed = tryParseJsonObject(rawOut);
+    if (parsed) return hasErrorObj(parsed);
+    return hasErrorText(rawOut);
+  }
+  if (Array.isArray(rawOut)) {
+    const joined = rawOut.map(c => (typeof c === 'string' ? c : (c && c.text) || '')).join('\n');
+    return hasErrorText(joined);
+  }
+  if (rawOut && typeof rawOut === 'object') {
+    return hasErrorObj(rawOut);
+  }
+  return false;
+}
+
+function extractCodexMessageText(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  if (typeof payload.content === 'string') return payload.content;
+  if (Array.isArray(payload.content)) {
+    return payload.content.map(c => (typeof c === 'string' ? c : (c && c.text) || '')).join('');
+  }
+  if (typeof payload.text === 'string') return payload.text;
+  return '';
+}
+
 function extractCodexToolDetail(obj, fallbackToolName = '') {
   if (!obj || typeof obj !== 'object') return null;
   const toolName = String(obj.name || obj.tool || fallbackToolName || '').trim();
@@ -469,16 +672,26 @@ function extractCodexToolDetail(obj, fallbackToolName = '') {
     }
   }
 
+  if (!lines.length && isCuaReplCall(obj)) {
+    return cuaDetailText(codexCuaCode(obj));
+  }
+
   return finalizeTaskDetail(lines.join('\n'));
 }
 
 let _cachedStatusTier = null;
 let _cachedStatusText = '';
 
+const KNOWN_CHARACTERS = new Set(['claude', 'dragon', 'gemini', 'deepseek', 'zcode']);
+
+function normalizeCharacterKey(raw) {
+  const key = String(raw || 'claude').trim().toLowerCase();
+  return KNOWN_CHARACTERS.has(key) ? key : 'claude';
+}
+
 // WO-03 & Issue ①: Hold quote consistently throughout entire task, only re-pick when character or state/tier changes
 function pickStatusText(tier, character = 'claude') {
-  const charRaw = String(character || 'claude').toLowerCase();
-  const charKey = (charRaw === 'dragon' || charRaw === 'gemini') ? charRaw : 'claude';
+  const charKey = normalizeCharacterKey(character);
   const tierRaw = String(tier || 'working').toLowerCase();
   const normTier = (tierRaw === 'approval') ? 'waiting' : (tierRaw === 'calling' ? 'working' : (tierRaw === 'done' ? 'success' : tierRaw));
   const cacheKey = `${charKey}:${normTier}`;
@@ -813,6 +1026,7 @@ function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
 function isStateFresh(state, now) {
   if (!state || !state.state) return false;
   const age = now - (state.at || 0);
+  if (state.kind === 'handoff') return age < HANDOFF_MAX_AGE_MS;
   if (isHeldState(state)) return age < WAITING_MAX_AGE_MS;
   if (state.state === 'success' || state.state === 'result' || state.state === 'error') {
     return age < TERMINAL_HOLD_MS;
@@ -955,6 +1169,7 @@ class AgentMonitor {
     this.cachedCodex = { mtime: 0, size: 0, file: null, state: null };
     this.codexStateCache = new Map();
     this.codexAsyncCache = new Map();
+    this.codexSubagentCache = new Map();
     this.codexRolloutCandidates = [];
     this.lastCodexRolloutScan = 0;
 
@@ -1936,9 +2151,9 @@ class AgentMonitor {
       _cachedStatusText = '';
     }
     const cfgCharRaw = (best && typeof this.readPetConfig === 'function')
-      ? String(this.readPetConfig()?.Character || 'claude').toLowerCase()
+      ? this.readPetConfig()?.Character
       : 'claude';
-    const charKey = (cfgCharRaw === 'dragon' || cfgCharRaw === 'gemini') ? cfgCharRaw : 'claude';
+    const charKey = normalizeCharacterKey(cfgCharRaw);
     const charChanged = !!best && (this.lastCharKey !== undefined && this.lastCharKey !== charKey);
 
     // Heartbeat every 10s while active (safe with 35s watchdog, reduces disk writes by 60%)
@@ -2690,11 +2905,12 @@ class AgentMonitor {
     return 0;
   }
 
-  // AP02: 按原始提问时间实际删除已达 5 分钟上限的待答记录（边界：达到 300 秒即过期）
+  // AP02: 按原始提问时间实际删除已达上限的待答记录（普通提问/授权 5 分钟，handoff 15 分钟）
   pruneCodexPending(pending, now) {
     if (!pending || !Number.isFinite(now)) return;
     for (const [callId, p] of pending) {
-      if (now - p.at >= WAITING_MAX_AGE_MS) pending.delete(callId);
+      const maxAge = p?.kind === 'handoff' ? HANDOFF_MAX_AGE_MS : WAITING_MAX_AGE_MS;
+      if (now - p.at >= maxAge) pending.delete(callId);
     }
   }
 
@@ -2703,10 +2919,35 @@ class AgentMonitor {
     this.pruneCodexPending(pending, now);
     const latest = [...pending.values()].filter(p => p.accepted).sort((a, b) => b.at - a.at)[0];
     if (!latest) return null;
+    if (latest.kind === 'approval') {
+      let task = '等待主人确认权限';
+      if (latest.subKind === 'cua_elicit') {
+        task = '等待浏览器权限确认（推断）';
+      } else if (latest.guardianReview === true && now - latest.at < APPROVAL_INFER_DELAY_MS) {
+        task = '自动审查中（等待确认）';
+      }
+      return {
+        source: 'Codex', state: 'approval',
+        task,
+        taskDetail: latest.detail ?? null,
+        kind: 'approval',
+        at: latest.at, startedAt: latest.at, inFlight: true, fromPending: true
+      };
+    }
+    if (latest.kind === 'handoff') {
+      return {
+        source: 'Codex', state: 'waiting',
+        task: '等待主人接管浏览器验证',
+        taskDetail: latest.detail ?? null,
+        kind: 'handoff',
+        at: latest.at, startedAt: latest.at, inFlight: true, fromPending: true
+      };
+    }
     return {
-      source: 'Codex', state: latest.kind === 'approval' ? 'approval' : 'waiting',
-      task: latest.kind === 'approval' ? '等待主人确认权限' : '等待主人回答问题',
+      source: 'Codex', state: 'waiting',
+      task: '等待主人回答问题',
       taskDetail: latest.detail ?? null,
+      kind: 'question',
       at: latest.at, startedAt: latest.at, inFlight: true, fromPending: true
     };
   }
@@ -2714,13 +2955,14 @@ class AgentMonitor {
   scanCodexAsyncPrompts(file, size, mtime, now = Date.now()) {
     let item = this.codexAsyncCache.get(file);
     if (!item) {
-      item = { offset: 0, remainder: Buffer.alloc(0), pending: new Map() };
+      item = { offset: 0, remainder: Buffer.alloc(0), pending: new Map(), guardianReviewer: false };
       this.codexAsyncCache.set(file, item);
     }
     if (size < item.offset) {
       item.offset = 0;
       item.remainder = Buffer.alloc(0);
       item.pending.clear();
+      item.guardianReviewer = false;
     }
 
     let fd = null;
@@ -2736,18 +2978,59 @@ class AgentMonitor {
         for (let end = data.indexOf(10, lineStart); end >= 0; end = data.indexOf(10, lineStart)) {
           const lineBytes = data.subarray(lineStart, end);
           lineStart = end + 1;
+          const handoff = item.pending.get('handoff');
+          const hasHandoff = Boolean(handoff);
+          const handoffCallId = handoff?.callId;
           if (!lineBytes.includes('request_user_input_async') &&
               !lineBytes.includes('request_permissions') &&
               !lineBytes.includes('require_escalated') &&
               !lineBytes.includes('send_user_message_question_reply') &&
-              ![...item.pending.keys()].some(id => lineBytes.includes(id))) continue;
+              !lineBytes.includes('mcp__cua_repl') &&
+              !lineBytes.includes('approvals_reviewer') &&
+              !(handoffCallId && lineBytes.includes(handoffCallId)) &&
+              !(hasHandoff && (
+                lineBytes.includes('"role":"user"') ||
+                lineBytes.includes('"role": "user"') ||
+                lineBytes.includes('"role":"assistant"') ||
+                lineBytes.includes('"role": "assistant"') ||
+                lineBytes.includes('task_started') ||
+                lineBytes.includes('turn_started') ||
+                lineBytes.includes('turn_aborted') ||
+                lineBytes.includes('task_complete') ||
+                lineBytes.includes('turn_complete') ||
+                lineBytes.includes('function_call') ||
+                lineBytes.includes('custom_tool_call')
+              )) &&
+              ![...item.pending.keys()].some(id => id !== 'handoff' && lineBytes.includes(id))) continue;
           let entry;
           try { entry = JSON.parse(lineBytes.toString('utf8')); } catch { continue; }
+          if (entry.type === 'turn_context') {
+            if (entry.payload && typeof entry.payload.approvals_reviewer === 'string') {
+              item.guardianReviewer = entry.payload.approvals_reviewer === 'guardian_subagent';
+            }
+            continue;
+          }
+          if (entry.type === 'event_msg') {
+            const evKind = String(entry.payload?.type || '').toLowerCase();
+            const evTs = Date.parse(entry.timestamp) || mtime;
+            if (evKind === 'task_started' || evKind === 'turn_started' || evKind === 'turn_aborted') {
+              const h = item.pending.get('handoff');
+              if (h && evTs >= h.at) item.pending.delete('handoff');
+            } else if (evKind === 'task_complete' || evKind === 'turn_complete') {
+              const h = item.pending.get('handoff');
+              if (h) {
+                h.accepted = true;
+                h.at = evTs;
+              }
+            }
+            continue;
+          }
           if (entry.type !== 'response_item') continue;
           const payload = entry.payload || {};
           if (payload.type === 'function_call' || payload.type === 'custom_tool_call') {
             const name = String(payload.name || payload.tool || '').split('.').pop();
             if (name === 'request_user_input_async' && payload.call_id) {
+              if (item.pending.has('handoff')) item.pending.delete('handoff');
               let questionCount = 1;
               let detail = null;
               try {
@@ -2763,14 +3046,58 @@ class AgentMonitor {
             } else if (payload.call_id && (name === 'request_permissions' ||
                        (name === 'exec' && (/\btools\.request_permissions\s*\(/.test(String(payload.input || '')) ||
                         /\btools\.exec_command\s*\([\s\S]*?\bsandbox_permissions\s*:\s*["']require_escalated["']/.test(String(payload.input || '')))))) {
+              if (item.pending.has('handoff')) item.pending.delete('handoff');
+              const guardianReview = Boolean(
+                item.guardianReviewer &&
+                name === 'exec' &&
+                !/\btools\.request_permissions\s*\(/.test(String(payload.input || ''))
+              );
               item.pending.set(payload.call_id, {
                 at: Date.parse(entry.timestamp) || mtime, accepted: true,
-                kind: 'approval', questionCount: 1, answered: [],
+                kind: 'approval', guardianReview, questionCount: 1, answered: [],
                 detail: extractCodexToolDetail(payload)
               });
+            } else if (payload.call_id && isCuaReplCall(payload)) {
+              const code = codexCuaCode(payload);
+              if (CUA_HANDOFF_API.test(code)) {
+                item.pending.set('handoff', {
+                  at: Date.parse(entry.timestamp) || mtime,
+                  callId: payload.call_id,
+                  accepted: false,
+                  kind: 'handoff',
+                  questionCount: 1,
+                  answered: [],
+                  detail: cuaDetailText(code, [CUA_HANDOFF_API])
+                });
+              } else if (CUA_ELICIT_APIS.some(re => re.test(code))) {
+                if (item.pending.has('handoff')) item.pending.delete('handoff');
+                item.pending.set(payload.call_id, {
+                  at: Date.parse(entry.timestamp) || mtime,
+                  accepted: true,
+                  kind: 'approval',
+                  subKind: 'cua_elicit',
+                  questionCount: 1,
+                  answered: [],
+                  detail: cuaDetailText(code, CUA_ELICIT_APIS)
+                });
+              } else if (item.pending.has('handoff')) {
+                item.pending.delete('handoff');
+              }
+            } else if (item.pending.has('handoff')) {
+              item.pending.delete('handoff');
             }
-          } else if ((payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') &&
-                     item.pending.has(payload.call_id)) {
+          } else if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
+            const h = item.pending.get('handoff');
+            if (h && h.callId === payload.call_id) {
+              if (isCuaHandoffErrorOutput(payload)) {
+                item.pending.delete('handoff');
+              } else {
+                h.accepted = true;
+                h.at = Date.parse(entry.timestamp) || h.at || mtime;
+              }
+              continue;
+            }
+            if (!item.pending.has(payload.call_id)) continue;
             if (item.pending.get(payload.call_id).kind === 'approval') {
               item.pending.delete(payload.call_id);
               continue;
@@ -2779,9 +3106,28 @@ class AgentMonitor {
             try { output = typeof payload.output === 'string' ? JSON.parse(payload.output) : payload.output; } catch {}
             if (output?.accepted === true) item.pending.get(payload.call_id).accepted = true;
             else item.pending.delete(payload.call_id);
-          } else if (payload.type === 'message' && payload.role === 'user') {
-            const body = Array.isArray(payload.content)
-              ? payload.content.map(c => c?.text || '').join('') : String(payload.content || '');
+          } else if (payload.type === 'message') {
+            if (payload.role === 'assistant') {
+              const h = item.pending.get('handoff');
+              if (!h) continue;
+              const body = extractCodexMessageText(payload).trimStart();
+              if (body) {
+                const firstPara = body.split(/\r?\n[ \t]*\r?\n/)[0] || body;
+                h.detail = finalizeTaskDetail(firstPara) || h.detail;
+              }
+              h.at = Date.parse(entry.timestamp) || h.at || mtime;
+              if (String(payload.phase ?? '').trim().toLowerCase() === 'final_answer') {
+                h.accepted = true;
+              }
+              continue;
+            }
+            if (payload.role !== 'user') continue;
+            const body = extractCodexMessageText(payload);
+            const h = item.pending.get('handoff');
+            const msgTs = Date.parse(entry.timestamp) || mtime;
+            if (h && msgTs >= h.at && isRealUserMessageText(body)) {
+              item.pending.delete('handoff');
+            }
             const match = body.match(/<send_user_message_question_reply>\s*([\s\S]*?)\s*<\/send_user_message_question_reply>/);
             if (!match) continue;
             try {
@@ -2809,17 +3155,74 @@ class AgentMonitor {
     return this.codexPendingState(item.pending, now);
   }
 
+  isGuardianRollout(file, size, mtime) {
+    const cached = this.codexSubagentCache.get(file);
+    if (cached && cached.size === size && cached.mtime === mtime) return cached.guardian;
+
+    let guardian = false;
+    let fd = null;
+    try {
+      fd = fs.openSync(file, 'r');
+      const maxRead = Math.min(size, 512 * 1024);
+      const step = 64 * 1024;
+      const chunks = [];
+      let offset = 0;
+      let foundNl = false;
+      while (offset < maxRead && !foundNl) {
+        const want = Math.min(step, maxRead - offset);
+        const buf = Buffer.allocUnsafe(want);
+        const n = fs.readSync(fd, buf, 0, want, offset);
+        if (!n) break;
+        const nl = buf.indexOf(10);
+        if (nl >= 0) {
+          chunks.push(buf.subarray(0, nl));
+          foundNl = true;
+          break;
+        }
+        chunks.push(n < want ? buf.subarray(0, n) : buf);
+        offset += n;
+      }
+      if (chunks.length > 0) {
+        const firstLine = Buffer.concat(chunks).toString('utf8');
+        let parsed = null;
+        try { parsed = JSON.parse(firstLine); } catch {}
+        if (parsed && parsed.payload && typeof parsed.payload === 'object') {
+          const src = parsed.payload.source;
+          if (src && typeof src === 'object') {
+            const sub = src.subagent;
+            if (sub && typeof sub === 'object' && !sub.thread_spawn) {
+              guardian = sub.other === 'guardian' || sub.kind === 'guardian' || sub.type === 'guardian';
+            } else if (typeof sub === 'string') {
+              guardian = sub.trim().toLowerCase() === 'guardian';
+            }
+          } else if (typeof src === 'string') {
+            guardian = src.trim().toLowerCase() === 'guardian';
+          }
+        } else if (!/"thread_spawn"\s*:/.test(firstLine)) {
+          // 降级路径（如首行超限被截断或非合法 JSON）：仅匹配精确 source.subagent 元数据，避免误删普通会话
+          guardian = /"source"\s*:\s*\{\s*"subagent"\s*:\s*(?:\{\s*"other"\s*:\s*"guardian"\s*\}|"guardian")/.test(firstLine);
+        }
+      }
+    } catch {} finally {
+      if (fd !== null) try { fs.closeSync(fd); } catch {}
+    }
+    this.codexSubagentCache.set(file, { size, mtime, guardian });
+    return guardian;
+  }
+
   // AP06: 最终候选窗口保留显式传入的较大窗口（如离线额度回退的七天），
-  // 未知 / 等待 / 在飞候选仍至少保留现有 300 秒规则；普通工作扫描仍为 180 秒。
+  // 未知 / handoff 候选保留 15 分钟窗口，其余等待 / 在飞候选保留 300 秒规则；普通工作扫描仍为 180 秒。
   codexCandidateWindow(c, maxAgeMs) {
     const cachedState = this.codexStateCache.get(c.file)?.state;
-    const stateWindow = (cachedState === undefined || isHeldState(cachedState))
-      ? WAITING_MAX_AGE_MS
-      : 0;
+    const hasHandoff = cachedState?.kind === 'handoff' || this.codexAsyncCache.get(c.file)?.pending?.has('handoff');
+    const stateWindow = (cachedState === undefined || hasHandoff)
+      ? HANDOFF_MAX_AGE_MS
+      : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : 0);
     return Math.max(maxAgeMs, stateWindow);
   }
 
-  findCodexRollouts(now, maxAgeMs = ACTIVE_MAX_AGE_MS) {
+  findCodexRollouts(now, maxAgeMs = ACTIVE_MAX_AGE_MS, opts = {}) {
+    const excludeGuardian = opts.excludeGuardian === true;
     const sessionsDir = path.join(this.paths.codex, 'sessions');
     if (!fs.existsSync(sessionsDir)) return [];
 
@@ -2834,8 +3237,9 @@ class AgentMonitor {
         // session that becomes active again is rediscovered within the scan
         // interval without paying the idle cost on every candidate.
         const cachedState = this.codexStateCache.get(c.file)?.state;
-        const ageLimit = cachedState === undefined
-          ? WAITING_MAX_AGE_MS
+        const hasHandoff = cachedState?.kind === 'handoff' || this.codexAsyncCache.get(c.file)?.pending?.has('handoff');
+        const ageLimit = (cachedState === undefined || hasHandoff)
+          ? HANDOFF_MAX_AGE_MS
           : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
         if (now - c.mtime >= ageLimit) {
           refreshed.push(c);
@@ -2845,12 +3249,15 @@ class AgentMonitor {
           const st = fs.statSync(c.file);
           let eventTs = c.eventTs || 0;
           if (st.size !== c.size) eventTs = this.extractLastEventTimestamp(c.file, st.size) || eventTs;
-          refreshed.push({ ...c, size: st.size, mtime: Math.max(st.mtimeMs, eventTs), eventTs });
+          refreshed.push({ ...c, size: st.size, statMtime: st.mtimeMs, mtime: Math.max(st.mtimeMs, eventTs), eventTs });
         } catch {}
       }
       refreshed.sort((a, b) => b.mtime - a.mtime);
       this.codexRolloutCandidates = refreshed;
-      return refreshed.filter(c => now - c.mtime < this.codexCandidateWindow(c, maxAgeMs));
+      return refreshed.filter(c =>
+        (!excludeGuardian || !this.isGuardianRollout(c.file, c.size, c.statMtime ?? c.mtime)) &&
+        (now - c.mtime < this.codexCandidateWindow(c, maxAgeMs))
+      );
     }
     this.lastCodexRolloutScan = now;
 
@@ -2865,7 +3272,7 @@ class AgentMonitor {
           } else if (ent.isFile() && ent.name.endsWith('.jsonl')) {
             try {
               const st = fs.statSync(full);
-              files.push({ file: full, name: ent.name, mtime: st.mtimeMs, size: st.size });
+              files.push({ file: full, name: ent.name, statMtime: st.mtimeMs, mtime: st.mtimeMs, size: st.size });
             } catch {}
           }
         }
@@ -2882,12 +3289,15 @@ class AgentMonitor {
     for (const cand of files) {
       const eventTs = this.extractLastEventTimestamp(cand.file, cand.size);
       const effTime = Math.max(cand.mtime, eventTs || 0);
-      candidates.push({ file: cand.file, name: cand.name, mtime: effTime, size: cand.size, eventTs: eventTs || effTime });
+      candidates.push({ file: cand.file, name: cand.name, statMtime: cand.statMtime, mtime: effTime, size: cand.size, eventTs: eventTs || effTime });
     }
 
     candidates.sort((a, b) => b.mtime - a.mtime);
     this.codexRolloutCandidates = candidates;
-    const freshCandidates = candidates.filter(c => now - c.mtime < this.codexCandidateWindow(c, maxAgeMs));
+    const freshCandidates = candidates.filter(c =>
+      (!excludeGuardian || !this.isGuardianRollout(c.file, c.size, c.statMtime ?? c.mtime)) &&
+      (now - c.mtime < this.codexCandidateWindow(c, maxAgeMs))
+    );
     return freshCandidates;
   }
 
@@ -3142,7 +3552,7 @@ class AgentMonitor {
   checkCodex(now) {
     // AP02: 已不在候选窗口内的会话也按原始时间清理过期待答记录，避免旧记录滞留内存
     for (const item of this.codexAsyncCache.values()) this.pruneCodexPending(item.pending, now);
-    const candidates = this.findCodexRollouts(now, ACTIVE_MAX_AGE_MS);
+    const candidates = this.findCodexRollouts(now, ACTIVE_MAX_AGE_MS, { excludeGuardian: true });
     if (!candidates.length) return null;
 
     const sessions = [];

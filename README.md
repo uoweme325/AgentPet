@@ -1,6 +1,6 @@
 # 🐾 AgentPet — Windows Desktop Pet for Antigravity, Codex & DeepSeek Harness
 
-> **Windows 桌面联动桌宠**：实时显示 **Antigravity（反重力）、Codex、DeepSeek Harness（DSH）** 的思考 / 工作 / 等待确认状态，自带 **Codex 额度看板** 与 **DeepSeek 余额明细提醒**，包含 **小克（Claude娘）、白龙（GPT娘）、双子（Gemini娘）** 三位角色。
+> **Windows 桌面联动桌宠**：实时显示 **Antigravity（反重力）、Codex、DeepSeek Harness（DSH）** 的思考 / 工作 / 等待确认状态，自带 **Codex 额度看板** 与 **DeepSeek 余额明细提醒**，包含 **小克（Claude娘）、白龙（GPT娘）、双子（Gemini娘）、DeepSeek娘（大肥鱼）、智谱娘（ZCode）** 五位角色。
 >
 > **English Summary:** A lightweight portable **Windows (WPF + PowerShell)** desktop companion pet that monitors live coding states for **Antigravity, Codex, and DeepSeek Harness (DSH)**, displaying interactive bubble cards for Codex usage quotas, DeepSeek balance reminders, and character status animations.
 
@@ -16,6 +16,10 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 | :---: | :---: | :---: |
 | ![小克](preview/claude-happy-preview.png) | ![白龙](preview/dragon-happy-preview.png) | ![双子](preview/gemini-happy-preview.png) |
 
+| DeepSeek娘（大肥鱼） | 智谱娘（ZCode） |
+| :---: | :---: |
+| ![DeepSeek娘](preview/deepseek-happy-preview.png) | ![智谱娘](preview/zcode-happy-preview.png) |
+
 ## 🌟 功能介绍
 
 - **Agent 状态联动**：展示三个 Agent 的思考、工作和等待确认等状态。
@@ -28,10 +32,10 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 ## 🚀 下载与使用
 
-前往 [v1.6.0 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.0) 下载：
+前往 [v1.6.1 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.1) 下载：
 
-- **日常使用**：`AgentPet_v1.6.0.zip`
-- **源码与测试**：`AgentPet-v1.6.0-GitHub.zip`
+- **日常使用**：`AgentPet_v1.6.1.zip`
+- **源码与测试**：`AgentPet-v1.6.1-GitHub.zip`
 
 解压后双击 **`启动 AgentPet.bat`**。需要桌面快捷方式时，运行 **`创建桌面快捷方式.bat`**。
 
@@ -43,7 +47,27 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 - Agent 工作状态监控需要可用的 **Node.js** 运行时。
 - DeepSeek 余额功能需要本机运行 **DeepSeek Harness（DSH）**，并在 DSH 中完成账户或服务商配置。
 
-## 📝 v1.6.0 更新日志
+## 📝 v1.6.1 更新日志
+
+本次新增 DeepSeek娘（大肥鱼）和智谱娘，完善 Codex 权限与浏览器接管提醒，并增强窗口置顶恢复及菜单同步。
+
+- **新增两位角色**：加入 DeepSeek娘（大肥鱼）与智谱娘（ZCode）的立绘差分、专属主题、闲聊和唤醒台词，支持五角色切换。
+- **完善等待与接管提醒**：支持浏览器权限操作推断、接管等待保持，以及失败、中断和用户回复后的状态收口。
+- **修正子代理识别**：审批审查代理与普通工作子代理分别处理，避免路径或昵称包含 guardian 时漏掉待回答提醒；保留额度快照兜底。
+- **增强窗口恢复**：清理主窗与详情窗的异常 Owner 关系，增加置顶自检，并保留关闭置顶、隐藏桌宠和菜单展开时的行为约束。
+- **同步角色菜单**：托盘与右键菜单的角色勾选同步更新，修复切换后仍显示旧角色的问题。
+
+[查看完整 v1.6.1 发布说明与校验文件](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.1)
+
+## ⚠️ 使用说明
+
+- 余额看板目前仅支持人民币（CNY）。余额和额度数据仅供参考，请以官方页面为准。
+- 同一服务商下的账户切换识别受 DSH 宿主提供的上下文信息限制。
+- 多显示器物理热插拔与混合 DPI 场景尚需更多实机验证。若角色移出屏幕，可使用菜单中的位置复位功能。
+
+## 📚 历史版本
+
+### 📝 v1.6.0 更新日志
 
 本次更新重新整理工作气泡与悬停详情，并完善三位角色的显示与台词。
 
@@ -56,13 +80,6 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 [查看完整 v1.6.0 发布说明与校验文件](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.0)
 
-## ⚠️ 使用说明
-
-- 余额看板目前仅支持人民币（CNY）。余额和额度数据仅供参考，请以官方页面为准。
-- 同一服务商下的账户切换识别受 DSH 宿主提供的上下文信息限制。
-- 多显示器物理热插拔与混合 DPI 场景尚需更多实机验证。若角色移出屏幕，可使用菜单中的位置复位功能。
-
-## 📚 历史版本
 
 ### 📝 v1.5.3 更新日志
 

@@ -21,6 +21,11 @@
 5. **ZipZipPipe 等社区同人创作者**
    - 感谢社区同人画师与创作者关于 Claude娘（橘白礼服 ver.）、GPT娘（白龙娘）与 Gemini娘的原案形象与 AI 萌化人设灵感。
 
+## v1.6.1 新角色素材说明
+
+- DeepSeek娘（大肥鱼）的外观设计参考 [TreapGoGo/deepseek-whale-girl](https://github.com/TreapGoGo/deepseek-whale-girl) 等社区形象，项目立绘由 AI 辅助生成并经后处理。
+- 智谱娘（ZCode）采用维护者提供的 AI 辅助立绘差分。参考形象与生成素材的使用不代表相关品牌官方背书。
+
 ## AI 辅助创作与开发
 
 - 角色立绘、图标与部分视觉素材由 AI 辅助生成并经人工后处理与重构。

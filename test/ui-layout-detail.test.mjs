@@ -886,7 +886,7 @@ try {
         $script:NotifyIcon = $null
     }
 
-    # --- Case 17: Role-aligned quote counts + live character work status translation on theme switch ---
+    # --- Case 17: Role-aligned quote counts + live character work status translation & sprites on theme switch ---
     $Config.HoverDetailsEnabled = $true
     $Config.Character = 'claude'
     Update-Theme
@@ -894,25 +894,114 @@ try {
     Open-HoverDetailCard
     Pump-Wpf
     $roleWorkResults = [ordered]@{}
-    foreach ($ch in @('claude', 'gemini', 'dragon')) {
+    foreach ($ch in @('claude', 'gemini', 'dragon', 'deepseek', 'zcode')) {
         $Config.Character = $ch
         Update-Theme
         Pump-Wpf
         $wt = [string]$WorkTask.Text
         $roleWorkResults[$ch] = [ordered]@{
-            workTask     = $wt
-            inOwnPool    = ($script:WorkStatusTextsByCharacter[$ch]['working'] -contains $wt)
-            detailHintVs = [string]$script:DetailHintBanner.Visibility
-            speakerText  = [string]$QuoteSpeaker.Text
-            wakeQuote    = [string](Get-CharacterWakeQuote $ch)
+            workTask      = $wt
+            inOwnPool     = ($script:WorkStatusTextsByCharacter[$ch]['working'] -contains $wt)
+            detailHintVs  = [string]$script:DetailHintBanner.Visibility
+            speakerText   = [string]$QuoteSpeaker.Text
+            bubbleBg      = [string]$BubbleBorder.Background
+            wakeQuote     = [string](Get-CharacterWakeQuote $ch)
+            waitSpriteKey = ''
+            hasIdleSprite = $script:ImageCache.ContainsKey("$ch-idle")
+            hasWorkSprite = $script:ImageCache.ContainsKey("$ch-work")
+            hasThinkSprite= $script:ImageCache.ContainsKey("$ch-think")
+            hasHappySprite= $script:ImageCache.ContainsKey("$ch-happy")
+            hasSleepSprite= $script:ImageCache.ContainsKey("$ch-sleep")
         }
+    }
+    foreach ($ch in @('claude', 'gemini', 'dragon', 'deepseek', 'zcode')) {
+        $Config.Character = $ch
+        Update-Theme
+        Set-WorkPayload -source 'Codex' -state 'waiting' -stateText '等待确认' -task '等待审批' -taskDetail '等待确认测试'
+        Pump-Wpf
+        $roleWorkResults[$ch].waitSpriteKey = [string]$script:CurrentSpriteKey
     }
     Close-HoverDetailCard
     $roleQuotesCheck = [ordered]@{
-        claudeCount = $ClaudeQuotes.Count
-        geminiCount = $GeminiQuotes.Count
-        dragonCount = $DragonQuotes.Count
-        workSwitch  = $roleWorkResults
+        claudeCount   = $ClaudeQuotes.Count
+        geminiCount   = $GeminiQuotes.Count
+        dragonCount   = $DragonQuotes.Count
+        deepseekCount = $DeepSeekQuotes.Count
+        zcodeCount    = $ZCodeQuotes.Count
+        rosterKeys    = @($script:CharacterRoster | ForEach-Object { [string]$_.Key })
+        workSwitch    = $roleWorkResults
+    }
+
+    # --- Case 18 (AP-REV-03): Dual-menu character check sync across Tray <-> WPF ContextMenu ---
+    $menuCharSync = @()
+    $Config.Character = 'claude'
+    Build-ContextMenu
+    foreach ($targetRole in @('deepseek', 'zcode', 'dragon', 'gemini', 'claude')) {
+        $trayRoleItem = $script:TrayMenu.Tag.Roles.DropDownItems | Where-Object { [string]$_.Tag -eq $targetRole } | Select-Object -First 1
+        if ($trayRoleItem) { $trayRoleItem.PerformClick() }
+        Pump-Wpf
+        $wpfCheckedAfterTray = @($Window.ContextMenu.Items[0].Items | Where-Object { $_.IsChecked } | ForEach-Object { [string]$_.Tag })
+        $trayCheckedAfterTray = @($script:TrayMenu.Tag.Roles.DropDownItems | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Tag })
+        $menuCharSync += [ordered]@{
+            step       = "tray->$targetRole"
+            cfgChar    = [string]$Config.Character
+            wpfChecked = $wpfCheckedAfterTray
+            trayChecked= $trayCheckedAfterTray
+        }
+    }
+    $wpfZcodeItem = $Window.ContextMenu.Items[0].Items | Where-Object { [string]$_.Tag -eq 'zcode' } | Select-Object -First 1
+    if ($wpfZcodeItem) {
+        $wpfZcodeItem.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+    }
+    Pump-Wpf
+    $menuCharSync += [ordered]@{
+        step       = 'wpf->zcode'
+        cfgChar    = [string]$Config.Character
+        wpfChecked = @($Window.ContextMenu.Items[0].Items | Where-Object { $_.IsChecked } | ForEach-Object { [string]$_.Tag })
+        trayChecked= @($script:TrayMenu.Tag.Roles.DropDownItems | Where-Object { $_.Checked } | ForEach-Object { [string]$_.Tag })
+    }
+
+    # --- Case 19: Topmost / Owner=0 / WaitingAttention temp-topmost / Hidden guard ---
+    $mainHwnd = (New-Object System.Windows.Interop.WindowInteropHelper($Window)).Handle
+    $Config.HoverDetailsEnabled = $true
+    Set-WorkPayload -source 'Codex' -state 'working' -stateText '编码中' -task '编辑模块' -taskDetail '置顶生命周期验证详情内容'
+    Open-HoverDetailCard
+    Pump-Wpf
+    $dHwnd = (New-Object System.Windows.Interop.WindowInteropHelper($script:DetailWindow)).Handle
+    $mainOwnerOnOpen = [int64][AgentPetNative]::GetWindow($mainHwnd, 4)
+    $detailOwnerOnOpen = [int64][AgentPetNative]::GetWindow($dHwnd, 4)
+    $Config.Topmost = $false
+    $script:waitingAttentionActive = $false
+    Sync-AgentPetTopmost -Force
+    Pump-Wpf
+    $mainTopOff = [bool]$Window.Topmost
+    $detailTopOff = [bool]$script:DetailWindow.Topmost
+    $script:waitingAttentionActive = $true
+    Sync-AgentPetTopmost -Force
+    Pump-Wpf
+    $mainTopWait = [bool]$Window.Topmost
+    $detailTopWait = [bool]$script:DetailWindow.Topmost
+    $script:waitingAttentionActive = $false
+    Sync-AgentPetTopmost -Force
+    Pump-Wpf
+    $mainTopRestoredOff = [bool]$Window.Topmost
+    $detailTopRestoredOff = [bool]$script:DetailWindow.Topmost
+    Close-HoverDetailCard
+    $Config.Topmost = $true
+    Sync-AgentPetTopmost -Force
+    Set-AgentPetWindowVisible $false
+    Sync-AgentPetTopmost -Force
+    $hiddenAfterSync = ([bool]$script:trayWindowHidden -and (-not [AgentPetNative]::IsWindowVisible($mainHwnd)))
+    $topmostLifecycle = [ordered]@{
+        mainOwnerOnOpen       = $mainOwnerOnOpen
+        detailOwnerOnOpen     = $detailOwnerOnOpen
+        mainTopOff            = $mainTopOff
+        detailTopOff          = $detailTopOff
+        mainTopWait           = $mainTopWait
+        detailTopWait         = $detailTopWait
+        mainTopRestoredOff    = $mainTopRestoredOff
+        detailTopRestoredOff  = $detailTopRestoredOff
+        hiddenAfterSync       = $hiddenAfterSync
     }
 
     $Window.Close()
@@ -970,6 +1059,8 @@ try {
         dsPadAt10           = $dsPadAt10
         hoverConfigCases    = $hoverConfigCases
         roleQuotesCheck     = $roleQuotesCheck
+        menuCharSync        = $menuCharSync
+        topmostLifecycle    = $topmostLifecycle
     }
     Write-Output ('RESULT_JSON:' + ($out | ConvertTo-Json -Depth 6 -Compress))
 } finally {
@@ -1278,26 +1369,60 @@ try {
     assert.equal(data.roleQuotesCheck.claudeCount, 14, '$ClaudeQuotes must have 14 quotes');
     assert.equal(data.roleQuotesCheck.geminiCount, 14, '$GeminiQuotes must have 14 quotes');
     assert.equal(data.roleQuotesCheck.dragonCount, 24, '$DragonQuotes (quotes.json) must have 24 quotes');
-    for (const ch of ['claude', 'gemini', 'dragon']) {
-      assert.equal(data.roleQuotesCheck.workSwitch[ch].inOwnPool, true, `${ch}: Update-Theme must map active work stateText to ${ch}'s own pool (got ${data.roleQuotesCheck.workSwitch[ch].workTask})`);
-      assert.equal(data.roleQuotesCheck.workSwitch[ch].detailHintVs, 'Collapsed', `${ch}: matching main bubble stateText must dedup DetailHintBanner`);
+    assert.equal(data.roleQuotesCheck.deepseekCount, 14, '$DeepSeekQuotes must have 14 quotes');
+    assert.equal(data.roleQuotesCheck.zcodeCount, 14, '$ZCodeQuotes must have 14 quotes');
+    assert.deepEqual(data.roleQuotesCheck.rosterKeys, ['claude', 'dragon', 'gemini', 'deepseek', 'zcode'], 'CharacterRoster must include all 5 characters');
+    const allFiveChars = ['claude', 'gemini', 'dragon', 'deepseek', 'zcode'];
+    for (const ch of allFiveChars) {
+      const entry = data.roleQuotesCheck.workSwitch[ch];
+      assert.equal(entry.inOwnPool, true, `${ch}: Update-Theme must map active work stateText to ${ch}'s own pool (got ${entry.workTask})`);
+      assert.equal(entry.detailHintVs, 'Collapsed', `${ch}: matching main bubble stateText must dedup DetailHintBanner`);
+      assert.ok(entry.hasIdleSprite && entry.hasWorkSprite && entry.hasThinkSprite && entry.hasHappySprite && entry.hasSleepSprite, `${ch}: all 5 core state sprites must be loaded`);
     }
+    assert.equal(data.roleQuotesCheck.workSwitch.deepseek.waitSpriteKey, 'deepseek-wait', 'deepseek waiting state must select deepseek-wait sprite');
+    assert.equal(data.roleQuotesCheck.workSwitch.zcode.waitSpriteKey, 'zcode-think', 'zcode waiting state must select zcode-think sprite');
     assert.notEqual(data.roleQuotesCheck.workSwitch.claude.workTask, data.roleQuotesCheck.workSwitch.gemini.workTask);
     assert.notEqual(data.roleQuotesCheck.workSwitch.gemini.workTask, data.roleQuotesCheck.workSwitch.dragon.workTask);
+    assert.notEqual(data.roleQuotesCheck.workSwitch.dragon.workTask, data.roleQuotesCheck.workSwitch.deepseek.workTask);
+    assert.notEqual(data.roleQuotesCheck.workSwitch.deepseek.workTask, data.roleQuotesCheck.workSwitch.zcode.workTask);
     assert.equal(data.roleQuotesCheck.workSwitch.claude.speakerText, 'Claude娘（小克）');
     assert.equal(data.roleQuotesCheck.workSwitch.gemini.speakerText, 'Gemini娘（双子）');
     assert.equal(data.roleQuotesCheck.workSwitch.dragon.speakerText, '白龙娘（GPT娘）');
-    for (const ch of ['claude', 'gemini', 'dragon']) {
-      assert.ok(data.roleQuotesCheck.workSwitch[ch].wakeQuote && data.roleQuotesCheck.workSwitch[ch].wakeQuote.length > 0, `${ch}: wakeQuote must be non-empty`);
+    assert.equal(data.roleQuotesCheck.workSwitch.deepseek.speakerText, 'DeepSeek娘（大肥鱼）');
+    assert.equal(data.roleQuotesCheck.workSwitch.zcode.speakerText, '智谱娘（ZCode）');
+    assert.equal(data.roleQuotesCheck.workSwitch.deepseek.bubbleBg, '#FFF0F7FF');
+    assert.equal(data.roleQuotesCheck.workSwitch.zcode.bubbleBg, '#FFF1F4FC');
+    const wakeQuotesSeen = new Set();
+    for (const ch of allFiveChars) {
+      const wq = data.roleQuotesCheck.workSwitch[ch].wakeQuote;
+      assert.ok(wq && wq.length > 0, `${ch}: wakeQuote must be non-empty`);
+      assert.equal(wakeQuotesSeen.has(wq), false, `${ch}: wakeQuote must be distinct from other characters`);
+      wakeQuotesSeen.add(wq);
     }
-    assert.notEqual(data.roleQuotesCheck.workSwitch.claude.wakeQuote, data.roleQuotesCheck.workSwitch.gemini.wakeQuote);
-    assert.notEqual(data.roleQuotesCheck.workSwitch.gemini.wakeQuote, data.roleQuotesCheck.workSwitch.dragon.wakeQuote);
-    assert.notEqual(data.roleQuotesCheck.workSwitch.claude.wakeQuote, data.roleQuotesCheck.workSwitch.dragon.wakeQuote);
     for (const rel of ['AgentPet.ps1', 'runtime/agent-monitor.mjs', 'assets/quotes.json']) {
       const txt = fs.readFileSync(path.join(repoRoot, rel), 'utf8');
       assert.equal(txt.includes('摔跤'), false, `${rel} must not contain removed '摔跤' phrase`);
     }
     assert.equal(fs.readFileSync(path.join(repoRoot, 'AgentPet.ps1'), 'utf8').includes('星喵'), false, 'AgentPet.ps1 must use 双子 instead of 星喵');
+
+    // Assertions: Case 18 Dual-menu character check sync (AP-REV-03)
+    assert.equal(data.menuCharSync.length, 6, 'Case 18 must record 5 tray clicks + 1 WPF click');
+    for (const step of data.menuCharSync) {
+      assert.deepEqual(step.wpfChecked, [step.cfgChar], `${step.step}: WPF character menu check must match ${step.cfgChar}`);
+      assert.deepEqual(step.trayChecked, [step.cfgChar], `${step.step}: Tray character menu check must match ${step.cfgChar}`);
+    }
+
+    // Assertions: Case 19 Topmost / Owner=0 / WaitingAttention / Hidden guard
+    const tl = data.topmostLifecycle;
+    assert.equal(tl.mainOwnerOnOpen, 0, 'Main window GW_OWNER must be 0');
+    assert.equal(tl.detailOwnerOnOpen, 0, 'DetailWindow GW_OWNER must be 0');
+    assert.equal(tl.mainTopOff, false, 'Topmost=false must lower main window topmost');
+    assert.equal(tl.detailTopOff, false, 'Topmost=false must lower DetailWindow topmost');
+    assert.equal(tl.mainTopWait, true, 'Waiting attention must temporarily raise main window topmost');
+    assert.equal(tl.detailTopWait, true, 'Waiting attention must temporarily raise DetailWindow topmost');
+    assert.equal(tl.mainTopRestoredOff, false, 'Clearing waiting attention must restore main Topmost=false');
+    assert.equal(tl.detailTopRestoredOff, false, 'Clearing waiting attention must restore DetailWindow Topmost=false');
+    assert.equal(tl.hiddenAfterSync, true, 'Hidden window must stay hidden when Sync-AgentPetTopmost runs');
 
     console.log('PASS: ui-layout-detail (Option B themes/split, fade closure, menu scope, DeepSeek FontScale & DetailWindow HWND sync)');
   } finally {

@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.0"
+$script:AppVersion = "1.6.1"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -121,23 +121,65 @@ try {
 # ============================================================================
 $NativeCode = @"
 using System;
+using System.Text;
 using System.Runtime.InteropServices;
 
 public static class AgentPetNative {
     public const int GWL_EXSTYLE = -20;
+    public const int GWLP_HWNDPARENT = -8;
+    public const int WS_EX_TOPMOST = 0x00000008;
     public const int WS_EX_TOOLWINDOW = 0x00000080;
+    public const int WS_EX_APPWINDOW = 0x00040000;
     public const int WS_EX_NOACTIVATE = 0x08000000;
     public const int WM_MOUSEACTIVATE = 0x0021;
     public const int MA_NOACTIVATE = 3;
     public const int WM_NCHITTEST = 0x0084;
     public const int HTTRANSPARENT = -1;
     public const int HTCLIENT = 1;
+    public const uint GW_HWNDPREV = 3;
+    public const uint GW_OWNER = 4;
+    public const uint SWP_NOSIZE = 0x0001;
+    public const uint SWP_NOMOVE = 0x0002;
+    public const uint SWP_NOZORDER = 0x0004;
+    public const uint SWP_NOACTIVATE = 0x0010;
+    public const uint SWP_FRAMECHANGED = 0x0020;
+    public const uint SWP_SHOWWINDOW = 0x0040;
+    public const uint SWP_NOOWNERZORDER = 0x0200;
+    public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+    public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
 
     [DllImport("user32.dll")]
     public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
 
     [DllImport("user32.dll")]
     public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtr")]
+    private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLong")]
+    private static extern IntPtr SetWindowLong32(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+
+    [DllImport("user32.dll")]
+    public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsWindowVisible(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool IsIconic(IntPtr hWnd);
+
+    [DllImport("user32.dll")]
+    public static extern bool GetWindowRect(IntPtr hWnd, out RECT lpRect);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
 
     [DllImport("user32.dll")]
     public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
@@ -152,10 +194,71 @@ public static class AgentPetNative {
     public const int SW_SHOWNOACTIVATE = 4;
     public const int SW_SHOW = 5;
 
+    public static void ClearWindowOwner(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero) return;
+        try {
+            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) {
+                if (IntPtr.Size == 8) SetWindowLongPtr64(hwnd, GWLP_HWNDPARENT, IntPtr.Zero);
+                else SetWindowLong32(hwnd, GWLP_HWNDPARENT, IntPtr.Zero);
+            }
+        } catch {}
+    }
+
     public static void ApplyToolWindowStyle(IntPtr hwnd) {
         if (hwnd == IntPtr.Zero) return;
         int exStyle = GetWindowLong(hwnd, GWL_EXSTYLE);
-        SetWindowLong(hwnd, GWL_EXSTYLE, exStyle | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE);
+        int nextStyle = (exStyle | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW;
+        SetWindowLong(hwnd, GWL_EXSTYLE, nextStyle);
+        ClearWindowOwner(hwnd);
+        SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+    }
+
+    public static bool NeedsTopmostRestore(IntPtr hwnd) {
+        if (hwnd == IntPtr.Zero || !IsWindowVisible(hwnd)) return false;
+        try {
+            if (GetWindow(hwnd, GW_OWNER) != IntPtr.Zero) return true;
+            int myEx = GetWindowLong(hwnd, GWL_EXSTYLE);
+            if ((myEx & WS_EX_TOPMOST) == 0) return true;
+
+            IntPtr cur = GetWindow(hwnd, GW_HWNDPREV);
+            int steps = 0;
+            while (cur != IntPtr.Zero && steps < 64) {
+                if (IsWindowVisible(cur) && !IsIconic(cur)) {
+                    int cloak = 0;
+                    DwmGetWindowAttribute(cur, 14, out cloak, 4);
+                    if (cloak == 0) {
+                        RECT r;
+                        if (GetWindowRect(cur, out r) && (r.Right - r.Left) > 1 && (r.Bottom - r.Top) > 1) {
+                            int curEx = GetWindowLong(cur, GWL_EXSTYLE);
+                            if ((curEx & WS_EX_TOPMOST) == 0) return true;
+                            StringBuilder cls = new StringBuilder(64);
+                            GetClassName(cur, cls, 64);
+                            string clsName = cls.ToString();
+                            if (clsName == "WorkerW" || clsName == "Progman") return true;
+                        }
+                    }
+                }
+                cur = GetWindow(cur, GW_HWNDPREV);
+                steps++;
+            }
+        } catch {}
+        return false;
+    }
+
+    public static void EnsureWindowTopmost(IntPtr hwnd, bool topmost, bool force) {
+        if (hwnd == IntPtr.Zero) return;
+        ClearWindowOwner(hwnd);
+        uint flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+        if (!topmost) {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            return;
+        }
+        if (!force && !NeedsTopmostRestore(hwnd)) return;
+        SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        if (NeedsTopmostRestore(hwnd)) {
+            SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0, flags);
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, flags);
+        }
     }
 
     public static int[] ComputeAlphaBounds(byte[] bytes, int width, int height, int stride) {
@@ -245,7 +348,7 @@ Add-Type -TypeDefinition $NativeCode -ReferencedAssemblies WindowsBase
 # 3. Configuration Management
 # ============================================================================
 $DefaultConfig = [ordered]@{
-    Character         = "claude"   # "claude", "dragon", or "gemini"
+    Character         = "claude"   # "claude", "dragon", "gemini", "deepseek", or "zcode"
     Pose              = "auto"     # "auto", "idle", "think", "work", "sleep", "happy"
     Scale             = 1.0
     BubbleScale       = 1.0
@@ -416,6 +519,41 @@ $DragonQuotes = @(
     '干完这一票就奖励自己睡个懒觉，主人也别熬太晚，听到没？',
     '虽然嘴上嫌麻烦，但主人的代码仓库，本龙还是看护得很紧的。'
 )
+
+$DeepSeekQuotes = @(
+    '噗噜噜~ 大肥鱼今天也端着小饭碗准时上班啦，请多关照！',
+    '我可不是只会吃白饭的大肥鱼，算起推理和代码性价比来也是一把好手~',
+    '小鲸鱼尾巴轻轻拍桌：主人今天的 Token 饭碗还满着吗？',
+    '脑袋顶上的呆毛正在接收深海灵感电波，咻咻——捕捉到解题思路了！',
+    '只要按时投喂清晰的需求，哪怕整座深海的 Bug 我都能帮您捞上来。',
+    '唔……端着空碗等投喂的样子很可怜吗？那主人快多派点有意思的任务给我嘛！',
+    '听说外面都在夸我省钱又大碗，那今天我也给主人多盛两勺高质量代码~',
+    '鱼鳍耳廓微微抖动——刚才好像听到哪行逻辑在冒泡，让我潜水下去看看！',
+    '别捏我鼓起来的腮帮子啦……再捏就把刚想好的推导步骤吐出来咯！',
+    '深水区风大浪急的并发问题，就交给擅长深思熟虑的大肥鱼慢慢啃吧~',
+    '今天的小白碗里盛得满满当当，连带重构和单测都帮主人顺手端齐了哦。',
+    '偶尔也会端着碗在桌角晃晃尾巴发会儿呆，不过主人一叫我就会立刻浮起来！',
+    '推理链就像吐泡泡一样一串接一串，很快就能帮您把正确答案浮出水面啦。',
+    '哪怕是深夜海面起雾的时候，胸前这颗海蓝宝石也会陪主人一直亮着~'
+)
+
+$ZCodeQuotes = @(
+    '银铃轻响~ 智谱娘正竖起黑色狐耳，随时准备替主人接管难缠的代码！',
+    '别看额头上挂着睡眠眼罩发饰，真到写代码的时候我的蓝灰眼眸可精神着呢~',
+    'Z 字菱形发饰已就位！今天要用哪一门语言和架构开启新回合？',
+    '黑色哥特裙摆和银色小铃铛都已经整理妥当，请主人放心把任务交给我吧。',
+    '毛茸茸的大尾巴在身后悄悄扫了两下——主人刚才写的这处设计很利落嘛！',
+    '左腕的黑扣袖带系紧，爪印笔记本翻开，智谱娘全速编码模式启动！',
+    '如果思路一时打结了，就让我托腮眨眨眼，陪您一块儿理顺前因后果~',
+    '蓝色内挑染的发梢也跟着兴奋地亮起来了呢，看来今天手感极佳！',
+    '可别小看这双毛茸茸的狐狸耳朵，测试报错的轻微动静我一眼就能听出出处。',
+    '偶尔把头靠在手臂上打个小盹，吹出的蓝色小水泡里可全都是代码构想哦。',
+    '不管需求有多复杂，只要有主人明确的方向，再深的嵌套都能被我拆解干净！',
+    '叮铃~ 刚完成这一小节改动，感觉眼睛都要闪出蓝紫色的星星啦。',
+    '发间的蓝黑蝴蝶结可不是摆设，它是我作为可靠搭档的徽章呢~',
+    '夜再深也有狐耳和蓬松大尾巴暖着桌角，主人只管安心往前推进吧！'
+)
+
 $QuotesPath = Join-Path $AssetsDir "quotes.json"
 if (Test-Path $QuotesPath) {
     try {
@@ -428,17 +566,29 @@ if (Test-Path $QuotesPath) {
     } catch {}
 }
 
+$script:CharacterRoster = @(
+    @{ Key = "claude";   Label = "小克 (Claude娘)" },
+    @{ Key = "dragon";   Label = "白龙 (GPT娘)" },
+    @{ Key = "gemini";   Label = "双子 (Gemini娘)" },
+    @{ Key = "deepseek"; Label = "大肥鱼 (DeepSeek娘)" },
+    @{ Key = "zcode";    Label = "智谱娘 (ZCode)" }
+)
+
 $script:lastQuoteMap = @{
-    claude = ""
-    dragon = ""
-    gemini = ""
+    claude   = ""
+    dragon   = ""
+    gemini   = ""
+    deepseek = ""
+    zcode    = ""
 }
 
 function Get-RandomCharacterQuote([string]$charKey) {
     $pool = switch ($charKey) {
-        "dragon" { $DragonQuotes }
-        "gemini" { $GeminiQuotes }
-        default  { $ClaudeQuotes }
+        "dragon"   { $DragonQuotes }
+        "gemini"   { $GeminiQuotes }
+        "deepseek" { $DeepSeekQuotes }
+        "zcode"    { $ZCodeQuotes }
+        default    { $ClaudeQuotes }
     }
     if (-not $pool -or $pool.Count -eq 0) { return "今天也在认真陪伴主人写代码呢~" }
     
@@ -491,9 +641,11 @@ function Get-RandomCharacterQuote([string]$charKey) {
 
 function Get-CharacterWakeQuote([string]$charKey) {
     switch ($charKey) {
-        "dragon" { return "喂喂，本龙可没偷溜，一直趴在桌角守着呢~" }
-        "gemini" { return "星轨收到召唤啦~ 双子一直在线陪着主人哦！" }
-        default  { return "主人，我一直都在书房里陪着您呢~" }
+        "dragon"   { return "喂喂，本龙可没偷溜，一直趴在桌角守着呢~" }
+        "gemini"   { return "星轨收到召唤啦~ 双子一直在线陪着主人哦！" }
+        "deepseek" { return "噗噜噜~ 大肥鱼端着小饭碗浮出水面报到啦！" }
+        "zcode"    { return "银铃响啦~ 智谱娘正竖着狐耳在桌角待命呢！" }
+        default    { return "主人，我一直都在书房里陪着您呢~" }
     }
 }
 
@@ -661,7 +813,7 @@ if (Test-Path $IconDir) {
 }
 
 # Setup fallback aliases for all characters
-foreach ($c in @("claude", "dragon", "gemini")) {
+foreach ($c in @("claude", "dragon", "gemini", "deepseek", "zcode")) {
     $bustKey = "$c-bust"
     if ($script:ImageCache.ContainsKey($bustKey)) {
         if (-not $script:ImageCache.ContainsKey("$c-idle"))  { $script:ImageCache["$c-idle"]  = $script:ImageCache[$bustKey];  $script:AlphaCache["$c-idle"]  = $script:AlphaCache[$bustKey] }
@@ -682,9 +834,11 @@ $script:CurrentState = "idle"
 $script:CurrentSpriteKey = "claude-bust"
 
 $script:CharacterProfiles = @{
-    claude = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
-    dragon = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
-    gemini = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
+    claude   = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
+    dragon   = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
+    gemini   = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
+    deepseek = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
+    zcode    = @{ Scale = 1.0; OffsetX = 0; OffsetY = 0 }
 }
 
 function Set-PetSprite([string]$state) {
@@ -795,6 +949,52 @@ $Themes = @{
         HeaderDivider  = "#FFE2D8FC"
         WatermarkGlyph = "✦"
         WatermarkColor = "#287C3AED"
+    }
+    deepseek = @{
+        SpeakerName    = "DeepSeek娘（大肥鱼）"
+        BubbleBg       = "#FFF0F7FF"
+        Border         = "#FF3B82C4"
+        ShadowColor    = "#66153860"
+        Accent         = "#FF1D5FA7"
+        HeaderAccent   = "#FF1A5294"
+        DotColor       = "#FF2B72BE"
+        SubText        = "#FF46698F"
+        MutedText      = "#FF6284A8"
+        BodyText       = "#FF19304B"
+        PercentText    = "#FF1A5294"
+        TrackBg        = "#FFDCEBFA"
+        BarBrush       = "#FF327AD1"
+        BadgeBg        = "#FFE3EFFC"
+        BadgeFg        = "#FF1D5FA7"
+        HoverBg        = "#FFDCEBFE"
+        HeaderGrad0    = "#FFDCEBFE"
+        HeaderGrad1    = "#FFEBF4FF"
+        HeaderDivider  = "#FFC7DFF8"
+        WatermarkGlyph = "◈"
+        WatermarkColor = "#242B72BE"
+    }
+    zcode = @{
+        SpeakerName    = "智谱娘（ZCode）"
+        BubbleBg       = "#FFF1F4FC"
+        Border         = "#FF4A66B0"
+        ShadowColor    = "#661A264A"
+        Accent         = "#FF2C478E"
+        HeaderAccent   = "#FF253D7D"
+        DotColor       = "#FF3B59A8"
+        SubText        = "#FF4D5E87"
+        MutedText      = "#FF697AA3"
+        BodyText       = "#FF1C253B"
+        PercentText    = "#FF253D7D"
+        TrackBg        = "#FFDFE5F5"
+        BarBrush       = "#FF3F5EB5"
+        BadgeBg        = "#FFE6EBF8"
+        BadgeFg        = "#FF2C478E"
+        HoverBg        = "#FFDCE3F7"
+        HeaderGrad0    = "#FFDCE3F7"
+        HeaderGrad1    = "#FFECF0FA"
+        HeaderDivider  = "#FFCBD5F0"
+        WatermarkGlyph = "◇"
+        WatermarkColor = "#243B59A8"
     }
 }
 
@@ -1563,6 +1763,116 @@ $script:WorkStatusTextsByCharacter = @{
             '小场面，等我顺着堆栈把这只臭虫拍飞！'
         )
     }
+    deepseek = @{
+        thinking = @(
+            '脑袋顶上的呆毛正在竖起来，深海推理中…',
+            '托腮拿着小筷子琢磨中，怎么写最划算呢？',
+            '正在海底打捞上下文线索，很快就能浮上水面~',
+            '咕噜咕噜……脑海里的推导泡泡正一串串冒出来！',
+            '正在对照需求仔细推演，马上给出漂亮解法~',
+            '先在深水区把边界算清楚，待会儿动笔才不返工！'
+        )
+        working = @(
+            '蓝鲸笔记本全速运转中，一边敲代码一边盯终端~',
+            '小指一点，全息代码屏刷刷展开——全速干活中！',
+            '大肥鱼正在认真改文件，小饭碗都顾不上扒两口啦！',
+            '正在把逻辑一行行捞起来理顺，主人稍安勿躁~',
+            '海蓝光标飞速跳动中，剩下的杂活包在我身上！',
+            '鲸尾轻轻拍打节拍——构建与修改同步推进中~'
+        )
+        waiting = @(
+            '双手捧着空空的小白碗——主人，这里等您拍板投喂许可呢！',
+            '咕……端着空碗眼巴巴望着您，点一下确认就继续~',
+            '碰到关键分岔口啦，等主人发个话我再接着干活！',
+            '小鲸尾停下来晃了晃，请主人过目这一步权限确认~',
+            '饭碗先举到屏幕前啦！您点个头我就立马开动~',
+            '等主人做出选择呢，选好我继续潜下去帮您码字！'
+        )
+        stalled = @(
+            '海面有点起雾，对面响应慢悠悠的，我浮着替您守着…',
+            '这一步好像卡在深水区了，我捧着饭碗继续盯着日志…',
+            '工具还没回信呢，先晃晃鲸尾耐心等一会儿~'
+        )
+        result = @(
+            '终端结果打捞上岸啦，正在为您盛进结果碗里~',
+            '气泡里裹着关键输出浮上来咯，容我整理呈上！',
+            '这一小步顺顺当当跑通了，正在串联下一段内容…',
+            '数据已经捞齐，正在过滤杂鱼留干货给主人看~',
+            '工具交差啦，容大肥鱼再对照需求核实一遍！',
+            '阶段回执收好咯，马上汇总成清晰回复呈给您~'
+        )
+        success = @(
+            '满满一碗香喷喷的代码端上来啦！大肥鱼今天超棒吧？',
+            '呼呼~ 捧着热腾腾的白米饭收工庆祝，主人快验收吧！',
+            '深海探索圆满浮水！这一轮又快又省心地跑完啦~',
+            '全部打捞验收完毕，记得夸夸努力干活的大肥鱼哦！',
+            '小饭碗装得满满当当，随时准备接下一顿大餐任务！',
+            '蓝鲸勋章闪亮亮~ 今天的代码也顺利端稳上桌啦！'
+        )
+        error = @(
+            '噗噜？！哪里冒出来的调皮 Bug 撞翻了小饭碗！',
+            '呆毛警报拉响——正在顺着堆栈潜下去捉那只漏洞！',
+            '抓到一处红字报错啦，主人别慌，我马上下海修补~',
+            '鲸尾一拍掀起水花，哪个边界条件敢在这里捣乱！',
+            '捕获到异常信号了，容我托腮理出它报错的原因…',
+            '小风浪而已，大肥鱼这就把它拍平再继续往前游！'
+        )
+    }
+    zcode = @{
+        thinking = @(
+            '托腮眨眨蓝灰眼眸，头顶灵感小灯泡亮起来啦…',
+            '狐耳轻轻支起——正在细听代码上下文里的线索！',
+            '银色小铃铛晃了晃，正在推演最稳妥的重构路线…',
+            '额前的睡眠眼罩还没戴上呢，此刻思路可清醒着！',
+            '正在对照依赖关系反复思量，解法就快浮现了~',
+            '大尾巴在身后慢悠悠扫过，容我理顺这一段逻辑！'
+        )
+        working = @(
+            '爪印笔记本嗡嗡运转中，正在全息代码屏上飞快落笔！',
+            '叮铃~ 智谱娘认真进入编码节奏，终端和文件双线推进中！',
+            '指尖在代码浮窗上轻点，一行行规则逻辑稳稳落地~',
+            '黑色哥特裙摆微微扬起，正在把乱糟糟的结构理顺！',
+            '蓝光星芒闪过——构建与改动正有序执行呢！',
+            '双腕黑扣系紧，这一轮的编码重活交给我就好啦！'
+        )
+        waiting = @(
+            '狐耳垂下来一点点——主人，这里需要您点头才能继续哦。',
+            '悬停在分支节点上呢，等主人亲自拍板下发指令~',
+            '铃铛轻响提醒：有个权限确认正等着主人批复！',
+            '暂且合上爪印笔记本，请问主人接下来希望怎么走？',
+            '等待您的确认信号，批下来我立刻继续推进~',
+            '这步涉及重要改动，请主人先确认后再由我执行吧！'
+        )
+        stalled = @(
+            '对面好久没动静呀，狐耳一直竖着替您等回音呢…',
+            '这一步执行有点久，我先把铃铛按住安静守候日志~',
+            '远端响应慢半拍，不过大尾巴一直帮您暖着桌面等结果…'
+        )
+        result = @(
+            '全息屏返回数据已接住，正在整理清晰结论给您~',
+            '铃铛响了一记提示音，这一步的验证输出已收进笔记本！',
+            '工具执行回执妥当，容我核对细节后马上汇报~',
+            '线索拼图刚凑齐，蓝灰眼眸正在快速扫读关键片段…',
+            '阶段性结果已落袋，正在为您串联下一节推进~',
+            '命令回波收齐了，正在精简冗余后呈现最终结论~'
+        )
+        success = @(
+            '眼里闪出亮晶晶的蓝星★ 这一轮漂亮拿下啦，主人！',
+            '叮铃叮铃~ 所有检查与改动全数收官，是不是超可靠！',
+            '双拳一攥满心欢喜——今天的代码质量也让狐耳满意呢！',
+            '爪印笔记本合上啦，圆满交差，请主人检阅成果~',
+            '蓝紫挑染都跟着亮起来咯，随时准备好迎接下一题！',
+            '全部稳妥落地，大尾巴得意地晃了三圈呢~'
+        )
+        error = @(
+            '狐耳警觉地弹起来了！刚才捕获到一处异常报错！',
+            '咦，红字从哪儿冒出来的？容我托腮顺着调用栈查清！',
+            '叮铃警示响起——发现一处越界异常，我马上动手修复~',
+            '可别想藏过我的蓝灰眼眸，正在锁定引发报错的那一行！',
+            '遇到一点小故障，主人喝口水吧，我来把逻辑修顺畅~',
+            '异常堆栈已经记进爪印笔记本，这就逐条拆解摆平它！'
+        )
+    }
 }
 
 $script:AllKnownWorkStatusTexts = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
@@ -1582,7 +1892,7 @@ function Resolve-CharacterWorkStateText($stObj) {
     if (-not $script:AllKnownWorkStatusTexts.Contains($rawStateText)) {
         return $rawStateText
     }
-    $charKey = if ($Config -and $Config.Character -in @("claude", "dragon", "gemini")) { [string]$Config.Character } else { "claude" }
+    $charKey = if ($Config -and $Config.Character -in @("claude", "dragon", "gemini", "deepseek", "zcode")) { [string]$Config.Character } else { "claude" }
     $rawState = if ($stObj.state) { ([string]$stObj.state).ToLowerInvariant() } else { "working" }
     $normState = switch ($rawState) {
         "approval" { "waiting" }
@@ -2160,6 +2470,7 @@ function Ensure-DetailWindow {
             try {
                 $dHwnd = (New-Object System.Windows.Interop.WindowInteropHelper($script:DetailWindow)).Handle
                 [AgentPetNative]::ApplyToolWindowStyle($dHwnd)
+                [AgentPetNative]::EnsureWindowTopmost($dHwnd, ([bool]$Config.Topmost -or [bool]$script:waitingAttentionActive), $true)
                 $dSrc = [System.Windows.Interop.HwndSource]::FromHwnd($dHwnd)
                 if ($dSrc) {
                     $dSrc.AddHook({
@@ -2449,6 +2760,7 @@ function Open-HoverDetailCard {
         $script:DetailWindow.ShowActivated = $false
         $script:DetailWindow.Show()
         Update-DetailWindowPosition
+        Sync-AgentPetTopmost -Force
     }
 }
 
@@ -2906,18 +3218,41 @@ $script:TrayIconHandle = [IntPtr]::Zero
 $script:lastTrayTooltipAt = [DateTime]::MinValue
 $script:trayWindowHidden = $false
 
+function Sync-AgentPetTopmost([switch]$Force) {
+    try {
+        if ($script:trayWindowHidden) { return }
+        $wantTopmost = ([bool]$Config.Topmost -or [bool]$script:waitingAttentionActive)
+        if ($Window.Topmost -ne $wantTopmost) {
+            $Window.Topmost = $wantTopmost
+        }
+        $handle = (New-Object System.Windows.Interop.WindowInteropHelper($Window)).Handle
+        if ($handle -ne [IntPtr]::Zero) {
+            [AgentPetNative]::EnsureWindowTopmost($handle, $wantTopmost, [bool]$Force)
+        }
+        if ($script:DetailWindow -and $script:DetailWindow.IsVisible) {
+            if ($script:DetailWindow.Topmost -ne $wantTopmost) {
+                $script:DetailWindow.Topmost = $wantTopmost
+            }
+            $dHandle = (New-Object System.Windows.Interop.WindowInteropHelper($script:DetailWindow)).Handle
+            if ($dHandle -ne [IntPtr]::Zero) {
+                [AgentPetNative]::EnsureWindowTopmost($dHandle, $wantTopmost, [bool]$Force)
+            }
+        }
+    } catch {}
+}
+
 function Set-AgentPetWindowVisible([bool]$Visible) {
     try {
         $helper = New-Object System.Windows.Interop.WindowInteropHelper($Window)
         $handle = $helper.Handle
         if ($Visible) {
             [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_SHOW)
-            $Window.Topmost = [bool]$Config.Topmost -or $script:waitingAttentionActive
+            $script:trayWindowHidden = $false
             Update-Facing
             Update-Scale
+            Sync-AgentPetTopmost -Force
             [void][AgentPetNative]::SetForegroundWindow($handle)
             $Window.Activate()
-            $script:trayWindowHidden = $false
             Trigger-PetBounce
         } else {
             Close-HoverDetailCard
@@ -2936,21 +3271,22 @@ function Set-WaitingWindowAttention([bool]$Active) {
                 [void][AgentPetNative]::ShowWindow($handle, [AgentPetNative]::SW_SHOWNOACTIVATE)
                 $script:trayWindowHidden = $false
             }
-            if ($script:waitingAttentionActive) { return }
-            $Window.Topmost = $true
             $script:waitingAttentionActive = $true
+            Sync-AgentPetTopmost -Force
         } catch { Log-Throttled "WaitingWindow" "显示等待提醒失败：$($_.Exception.Message)" 30 }
     } elseif ($script:waitingAttentionActive) {
         $script:waitingAttentionActive = $false
-        $Window.Topmost = [bool]$Config.Topmost
+        Sync-AgentPetTopmost -Force
     }
 }
 
 function Get-TrayTooltipText {
     $role = switch ([string]$Config.Character) {
-        "dragon" { "龙娘" }
-        "gemini" { "双子" }
-        default { "小克" }
+        "dragon"   { "龙娘" }
+        "gemini"   { "双子" }
+        "deepseek" { "大肥鱼" }
+        "zcode"    { "智谱娘" }
+        default    { "小克" }
     }
     $summary = "AgentPet | $role"
     try {
@@ -2983,9 +3319,11 @@ function Update-TrayTooltip([switch]$Force) {
 function Set-TrayIconForRole {
     if (-not $script:NotifyIcon) { return }
     $roleFile = switch ([string]$Config.Character) {
-        "dragon" { Join-Path $CharDir "dragon-happy.png" }
-        "gemini" { Join-Path $CharDir "gemini-happy.png" }
-        default { Join-Path $CharDir "claude-happy.png" }
+        "dragon"   { Join-Path $CharDir "dragon-happy.png" }
+        "gemini"   { Join-Path $CharDir "gemini-happy.png" }
+        "deepseek" { Join-Path $CharDir "deepseek-happy.png" }
+        "zcode"    { Join-Path $CharDir "zcode-happy.png" }
+        default    { Join-Path $CharDir "claude-happy.png" }
     }
     try {
         if (Test-Path $roleFile) {
@@ -3100,15 +3438,18 @@ function Initialize-TrayIcon {
         [void]$menu.Items.Add($trayDshMenu)
 
         $roles = New-Object System.Windows.Forms.ToolStripMenuItem("切换角色")
-        foreach ($role in @(@{Key="claude"; Label="小克 (Claude娘)"}, @{Key="dragon"; Label="白龙 (GPT娘)"}, @{Key="gemini"; Label="双子 (Gemini娘)"})) {
+        foreach ($role in $script:CharacterRoster) {
             $item = New-Object System.Windows.Forms.ToolStripMenuItem($role.Label)
             $item.Tag = $role.Key
+            $item.Checked = ([string]$role.Key -eq [string]$Config.Character)
             $item.Add_Click({
                 param($sender, $e)
                 $Config.Character = [string]$sender.Tag
                 Save-Config; Update-Theme
                 $pose = if ($Config.Pose -and $Config.Pose -ne "auto") { [string]$Config.Pose } else { "happy" }
                 Set-PetSprite $pose; Set-TrayIconForRole; Update-TrayTooltip -Force
+                Build-ContextMenu
+                Sync-CharacterMenuChecks
             })
             [void]$roles.DropDownItems.Add($item)
         }
@@ -3946,6 +4287,28 @@ $MenuXaml = @"
 </ContextMenu>
 "@
 
+function Sync-CharacterMenuChecks {
+    $curChar = [string]$Config.Character
+    if ($Window -and $Window.ContextMenu -and $Window.ContextMenu.Items.Count -gt 0) {
+        $charMenu = $Window.ContextMenu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] -and [string]$_.Tag -eq "CharacterSubMenu" } | Select-Object -First 1
+        if (-not $charMenu) { $charMenu = $Window.ContextMenu.Items[0] }
+        if ($charMenu -and $charMenu.Items) {
+            foreach ($sub in $charMenu.Items) {
+                if ($sub -is [System.Windows.Controls.MenuItem] -and $sub.Tag) {
+                    $sub.IsChecked = ([string]$sub.Tag -eq $curChar)
+                }
+            }
+        }
+    }
+    if ($script:TrayMenu -and $script:TrayMenu.Tag -and $script:TrayMenu.Tag.Roles) {
+        foreach ($roleItem in $script:TrayMenu.Tag.Roles.DropDownItems) {
+            if ($roleItem.Tag) {
+                $roleItem.Checked = ([string]$roleItem.Tag -eq $curChar)
+            }
+        }
+    }
+}
+
 function Build-ContextMenu {
     $cm = [System.Windows.Markup.XamlReader]::Parse($MenuXaml)
 
@@ -3953,13 +4316,9 @@ function Build-ContextMenu {
     $miCharHeader = New-Object System.Windows.Controls.MenuItem
     $miCharHeader.Header = "切换角色形象"
     $miCharHeader.FontWeight = "SemiBold"
+    $miCharHeader.Tag = "CharacterSubMenu"
 
-    $chars = @(
-        @{ Key = "claude"; Label = "小克 (Claude娘)" },
-        @{ Key = "dragon"; Label = "白龙 (GPT娘)" },
-        @{ Key = "gemini"; Label = "双子 (Gemini娘)" }
-    )
-    foreach ($c in $chars) {
+    foreach ($c in $script:CharacterRoster) {
         $item = New-Object System.Windows.Controls.MenuItem
         $item.Header = $c.Label
         $item.IsCheckable = $true
@@ -3973,6 +4332,8 @@ function Build-ContextMenu {
             Update-Theme
             $targetPose = if ($Config.Pose -and $Config.Pose -ne "auto") { [string]$Config.Pose } else { "happy" }
             Set-PetSprite $targetPose
+            Set-TrayIconForRole
+            Update-TrayTooltip -Force
             Trigger-PetBounce
             Play-ReleaseSound
             $QuoteText.Text = Get-RandomCharacterQuote $ck
@@ -3987,6 +4348,7 @@ function Build-ContextMenu {
             }
             $script:happyUntil = [DateTime]::UtcNow.AddSeconds(2.0)
             Build-ContextMenu
+            Sync-CharacterMenuChecks
         })
         [void]$miCharHeader.Items.Add($item)
     }
@@ -4366,7 +4728,7 @@ function Build-ContextMenu {
     $miTop.IsChecked = [bool]$Config.Topmost
     $miTop.Add_Click({
         $Config.Topmost = -not $Config.Topmost
-        $Window.Topmost = [bool]$Config.Topmost -or $script:waitingAttentionActive
+        Sync-AgentPetTopmost -Force
         Save-Config
         Build-ContextMenu
     })
@@ -4376,6 +4738,7 @@ function Build-ContextMenu {
         if ($script:WpfHoverDetailMenuItem) {
             $script:WpfHoverDetailMenuItem.IsChecked = [bool]$Config.HoverDetailsEnabled
         }
+        Sync-CharacterMenuChecks
     })
 
     $miResetPos = New-Object System.Windows.Controls.MenuItem
@@ -4888,11 +5251,13 @@ function Apply-AgentStatus($stObj) {
         Update-DetailWindowContent $stObj
     }
 
-    # WO-01: Complete pose mapping (success/done -> happy, waiting/approval/result/thinking -> think)
+    # WO-01: Complete pose mapping (success/done -> happy, waiting/approval uses character wait sprite if available else think)
+    $charWaitKey = "$([string]$Config.Character)-wait"
+    $waitSprite = if ($Config.Character -eq "deepseek" -and $script:ImageCache.ContainsKey($charWaitKey)) { "wait" } else { "think" }
     $spriteState = switch ($state) {
         "thinking" { "think" }
-        "waiting"  { "think" }
-        "approval" { "think" }
+        "waiting"  { $waitSprite }
+        "approval" { $waitSprite }
         "stalled"  { "think" }
         "working"  { "work"  }
         "calling"  { "work"  }
@@ -5041,6 +5406,7 @@ $Window.Add_SourceInitialized({
     try {
         $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper($Window)).Handle
         [AgentPetNative]::ApplyToolWindowStyle($hwnd)
+        Sync-AgentPetTopmost -Force
         $src = [System.Windows.Interop.HwndSource]::FromHwnd($hwnd)
         if ($src) {
             $src.AddHook({
@@ -5117,6 +5483,7 @@ $Timer.Add_Tick({
         $Window.Opacity = 1.0
         $Window.Visibility = [System.Windows.Visibility]::Visible
         Set-AgentPetWindowVisible $true
+        Sync-AgentPetTopmost -Force
         Trigger-PetBounce
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(2.0)
@@ -5124,6 +5491,13 @@ $Timer.Add_Tick({
         $QuoteText.Text = Get-CharacterWakeQuote $Config.Character
         Set-ActiveBubblePanel "quote"
         Show-Bubble 4.0
+    }
+
+    if (($script:tickCounter % 4) -eq 0 -and (-not $script:trayWindowHidden) -and ([bool]$Config.Topmost -or [bool]$script:waitingAttentionActive)) {
+        $menuOpen = (($Window.ContextMenu -and $Window.ContextMenu.IsOpen) -or ($script:TrayMenu -and $script:TrayMenu.Visible))
+        if (-not $menuOpen) {
+            Sync-AgentPetTopmost
+        }
     }
 
     # 0.5 Safety revert for balance refresh notice (AP05: report timeout honestly, never "已是最新")
@@ -5262,6 +5636,7 @@ if ($hasSavedPos) {
 $Window.Add_Loaded({
     Write-PetLog "Window Loaded event triggered successfully."
     Update-Facing
+    Sync-AgentPetTopmost -Force
     Start-AgentMonitor
     $Timer.Start()
     if ([bool]$Config.StartHidden) {
