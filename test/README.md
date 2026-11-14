@@ -6,8 +6,10 @@
 - `run-all.mjs`：统一测试执行入口，依次拉起全部单元测试与退出码回归套件并汇总结算退出码。
 - `balance-stale.test.mjs`：WO-22 余额过期判定与自动刷新调度单测。
 - `port-cache.test.mjs`：WO-23 端口缓存合法性校验与全路径清理单测。
-- `state-machine.test.mjs`：WO-30 ~ WO-37 状态机、工具接续、提问识别、冷启动长窗口、跨会话仲裁、启动余额隔离、写入重试与退出脚本 13 项回归矩阵。
+- `state-machine.test.mjs`：WO-30 ~ WO-37 状态机、工具接续、提问识别、冷启动长窗口、跨会话仲裁、启动余额隔离、写入重试与退出脚本回归矩阵。
 - `async-question.test.mjs`：Codex `request_user_input_async` 异步提问跟踪、多问题回答匹配、跨重启恢复、权限确认请求（`approval`）与 5 分钟超时回归测试。
+- `hover-detail.test.mjs`：工作摘要与任务详情字段、长内容及多来源详情回归。
+- `ui-layout-detail.test.mjs`：Windows WPF 布局、悬停详情、字号、配置回落与三角色切换回归。
 - `exit-code.test.mjs`：CLOSE-03 故障注入与退出码/清理回归套件（使用 `os.tmpdir()` 隔离注入，覆盖全部测试文件的正常与断言失败非零退出场景）。
 
 ## 运行准则

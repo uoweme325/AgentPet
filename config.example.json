@@ -18,5 +18,6 @@
     "LowBalanceAlertEnabled": true,
     "LowBalanceCnyThreshold": 5,
     "DshPort": 0,
-    "DshBaseUrl": ""
+    "DshBaseUrl": "",
+    "HoverDetailsEnabled": false
 }

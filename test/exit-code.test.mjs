@@ -180,6 +180,27 @@ try {
     forbidStdout: 'PASS: question and permission prompts'
   });
 
+  {
+    console.log('--- Scenario 8a: ui-layout-detail.test.mjs 正常通过零退出 ---');
+    const cleanRes = spawnSync(process.execPath, [path.join(testDir, 'ui-layout-detail.test.mjs')], {
+      encoding: 'utf8',
+      timeout: 30000
+    });
+    assert.equal(cleanRes.status, 0, `expected status 0, got ${cleanRes.status}: ${cleanRes.stderr}`);
+    assert.ok((cleanRes.stdout || '').includes('PASS: ui-layout-detail'), 'missing PASS line in 8a stdout');
+    console.log('   [PASS] 8a. ui-layout-detail.test.mjs 原样运行');
+  }
+
+  runInjectedScenario({
+    label: '8b. ui-layout-detail.test.mjs 断言失败非零退出',
+    baseFile: 'ui-layout-detail.test.mjs',
+    targetPattern: "assert.equal(data.detailOnBadgeHover.visible, false, 'hovering inline WorkSourceBadge must NOT open DetailWindow');",
+    replacePattern: "assert.equal(data.detailOnBadgeHover.visible, true, 'hovering inline WorkSourceBadge must NOT open DetailWindow');",
+    expectedStatus: 1,
+    expectStderr: '[ui-layout-detail.test.mjs FAILURE]',
+    forbidStdout: 'PASS: ui-layout-detail'
+  });
+
   console.log('=== ALL EXIT-CODE REGRESSION SCENARIOS VERIFIED SUCCESSFULLY ===');
 } catch (e) {
   console.error('[exit-code.test.mjs FAILURE]', (e && e.stack) || e);

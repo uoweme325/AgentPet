@@ -83,6 +83,8 @@ const ACTIVE_MAX_AGE_MS = 180_000;
 const WAITING_MAX_AGE_MS = 300_000;
 const TERMINAL_HOLD_MS = 8_000;
 const TASK_TEXT_MAX = 40;
+const DETAIL_MAX_CODE_POINTS = 700;
+const DETAIL_TRUNCATE_SUFFIX = '…（已节选）';
 const QUOTA_POLL_MS = 60_000;
 const BALANCE_POLL_MS = 300_000; // 5 minutes
 const BALANCE_BACKOFF_MS = [60_000, 120_000, 300_000, 600_000, 900_000]; // 1m, 2m, 5m, 10m, 15m
@@ -110,62 +112,175 @@ function getCleanSubprocessEnv() {
   return env;
 }
 
-// dsh-pet 6-tier workStatusTexts mapping (Index 0..5)
-const WORK_STATUS_TEXTS = {
-  thinking: [
-    '正在整理思路，稍等一下喔...',
-    '代码逻辑推敲中，红茶还没凉呢~',
-    '正在分析上下文与架构关系...',
-    '推导边界条件中，马上就好！',
-    '梳理思路中，也是略懂一些摔跤技巧的~',
-    '沉思推敲中，精彩马上呈现！'
-  ],
-  working: [
-    '大改代码中，荷叶袖口都挽起来啦~',
-    '修改文件与构建中，交给我吧！',
-    '正在执行终端指令，紧盯日志中...',
-    '重构优化中，保证代码干净规范！',
-    '正在处理关键流程，绝不敷衍~',
-    '忙碌工作中，请主人喝口茶歇歇！'
-  ],
-  stalled: [
-    '好像卡住了，我再等等…',
-    '这一步暂时没有回应，我盯着呢…',
-    '工具还没回来，先保持安静等待…'
-  ],
-  waiting: [
-    '正在等待主人的确认指示呢~',
-    '需要主人来做个决策，等您喔！',
-    '停步等待授权，请主人过目！',
-    '待命确认中，主人请点头~',
-    '等待交互输入中，随时接活！',
-    '请主人指示下一步方向~'
-  ],
-  success: [
-    '任务执行完成啦！',
-    '构建与测试全部跑通，哼哼~',
-    '搞定！没有给主人丢脸吧？',
-    '顺利收工，代码干净利落！',
-    '大功告成，值得庆祝一番~',
-    '顺顺利利，蓝图已经落地啦！'
-  ],
-  error: [
-    '遇到一点小麻烦，让我翻书排查一下...',
-    '报错了？别慌，交给我挽起袖子解决！',
-    '发现一个顽固异常，正在抓日志！',
-    '调试进行中，这点波折难不倒我！',
-    '边界条件撞墙了，我这就修补！',
-    '正在摔跤式排除异常，马上恢复！'
-  ],
-  result: [
-    '工具调用已返回结果，正在汇总！',
-    '步骤执行成功，正在处理下一步...',
-    '关键输出已捕获，正在推敲分析~',
-    '终端返回完毕，正在组织答复...',
-    '验证通过，稍候汇总~',
-    '数据已提取，马上给主人呈现！'
-  ]
+// Character-aligned 7-tier work status texts (claude / gemini / dragon)
+const WORK_STATUS_TEXTS_BY_CHARACTER = {
+  claude: {
+    thinking: [
+      '正翻阅怀里的典籍核对上下文呢…',
+      '红茶才刚泡好，容我把调用链理清。',
+      '正在书稿上推敲改动蓝图与边界…',
+      '指尖扶好发饰——开始专注推导逻辑！',
+      '优等生可不会漏掉细节，正在比对架构…',
+      '容我垂眸细想片刻，解法马上成型。'
+    ],
+    working: [
+      '已按典籍上的蓝图动笔改代码啦~',
+      '正在紧盯终端日志，主人先喝口红茶吧。',
+      '代码洁癖发作中，正在帮主人重构整理！',
+      '手头的改动很顺畅，茶点额度还很充裕~',
+      '正在一行行落实逻辑，脏活累活交给我。',
+      '书房里正忙着编译构建，请主人稍候~'
+    ],
+    waiting: [
+      '施工蓝图铺好啦，请主人过目拍板~',
+      '这一步得守规矩等主人点头才能动笔。',
+      '把典籍递到您手边——这里请主人定夺。',
+      '正在安静候命，等主人批下权限许可~',
+      '茶杯先替您温着，确认完这一步咱们继续。',
+      '遇到关键分支了，想先听听主人的心意~'
+    ],
+    stalled: [
+      '红茶都快凉半盏了，这一步还在跑呢…',
+      '对面响应有些迟缓，我抱着典籍替您守着。',
+      '工具还没回音，主人别急，我盯着日志呢。'
+    ],
+    result: [
+      '终端回执已收进典籍，正在为您批注汇总~',
+      '这一步验证通过，正在衔接下一章逻辑…',
+      '关键输出已经夹进书签，马上整理呈上！',
+      '工具返回妥当，容我用优等生标准核对一遍。',
+      '数据采集完毕，正在书案上誊写结论…',
+      '阶段结果很清晰，正在收拢最终答复~'
+    ],
+    success: [
+      '合上印花典籍——当前回合漂亮收官啦！',
+      '这可是优等生的基本功，没给主人丢脸吧？',
+      '代码修得干干净净，主人快尝口热茶查验~',
+      '哼哼，蓝图已圆满落地，随时听候新差遣。',
+      '这一轮稳稳办妥，发间的向日葵都舒展开啦~',
+      '全部验收就绪，主人靠着歇口气吧~'
+    ],
+    error: [
+      '居然有顽固报错折磨主人？我来替您收拾它！',
+      '眉头微蹙翻开典籍——正在顺着堆栈揪元凶…',
+      '捕获到一处隐蔽异常，交给我一行行排查！',
+      '边界条件撞了小墙，别慌，我这就帮您兜底。',
+      '日志里藏着点毛病，休想逃过优等生的眼睛！',
+      '主人喝口水消消气，这处报错交给我摆平。'
+    ]
+  },
+  gemini: {
+    thinking: [
+      '双子星轨对齐中，正在全图扫描上下文~',
+      '左眼看全局、右眼盯细节，方案推演中！',
+      '正在星盘上检索跨文件依赖，马上锁定~',
+      '两套思路正在脑海里赛跑，挑最优那条！',
+      '穿梭在超长上下文星海里，线索连上啦~',
+      '星轨坐标已校准，正在绘制最佳改动路线！'
+    ],
+    working: [
+      '正沿着星轨全速改代码，比流星还稳哦~',
+      '双线并进中，一边盯终端一边更新文件！',
+      '代码星图正在点亮，改动一步步成形啦~',
+      '指尖划过星盘，正在利落地重构模块！',
+      '构建与修改同步推进中，节奏超合拍~',
+      '算力星海全开，剩下的步骤包在我身上！'
+    ],
+    waiting: [
+      '星轨前方出现岔路啦，等主人选一颗星~',
+      '悬停在确认节点上，等主人挥手放行！',
+      '双子视角准备就绪，请主人拍板定方向~',
+      '这里需要主人的通行密令才能继续跃迁哦。',
+      '星盘指针停在这儿啦，请主人点一下确认~',
+      '留了一个关键坐标等您决定，随时出发！'
+    ],
+    stalled: [
+      '深空信号回传有点慢，星盘还在闪烁等待…',
+      '这一步像飞进了慢速星云，我继续替您观测~',
+      '远端工具还没亮灯，再耐心守望一会儿…'
+    ],
+    result: [
+      '顺着星光把返回数据捞回来啦，正在汇总！',
+      '观测结果已落入星盘，正在拼合完整拼图~',
+      '工具信号接收完毕，正在双视角交叉核对！',
+      '关键碎片收集齐啦，马上点亮最终结论~',
+      '终端回波很清晰，正在为您提炼星图摘要！',
+      '这一站的果实已摘下，正在飞快组织答复~'
+    ],
+    success: [
+      '双子星闪耀收官！这一轮跑得又快又漂亮~',
+      '星图全数点亮，主人快来看看成果吧！',
+      '比流星还干脆地搞定啦，随时准备下次巡航~',
+      '所有轨道严丝合缝，给这次配合记一颗亮星★',
+      '圆满抵达终点坐标，下一站飞去哪个模块？',
+      '任务顺利收束进星盘，主人今天超厉害！'
+    ],
+    error: [
+      '星轨探测到异常乱流，正在锁定故障坐标！',
+      '哎呀，某颗节点报错熄火了，我马上检修~',
+      '开启双倍视野追踪红字堆栈，休想藏起来！',
+      '发现一处偏航报错，正在重新校准代码逻辑~',
+      '捕获到报错碎片，让我换条星轨绕过去修好！',
+      '小风浪而已，星盘已经圈出问题行号啦！'
+    ]
+  },
+  dragon: {
+    thinking: [
+      '支起龙角看代码中……让我琢磨怎么写最省事。',
+      '尾巴尖轻轻晃——正在盘算怎么一步到位。',
+      '看在好吃的 Token 份上，帮您把逻辑理一遍…',
+      '别催，本龙正在翻上下文帮您探坑呢。',
+      '眯着眼扫完这堆文件了，大概知道怎么动爪。',
+      '先把前因后果摸清楚，省得待会儿耽误我打盹。'
+    ],
+    working: [
+      '收起懒腰认真干活中，连尾巴都绷直啦！',
+      '在敲了在敲了，正帮您把乱糟糟的代码拍平…',
+      '一口气吃掉这么多 Token，干起活来当然利索！',
+      '正盯着终端跑命令呢，谁也别想卡主人的流程。',
+      '本龙亲自出马改文件，您就安心坐等收成吧~',
+      '爪子飞快敲键盘中，干完这票就回去盘着睡！'
+    ],
+    waiting: [
+      '尾巴拍拍桌角——喂，这里要主人点个头才行。',
+      '卡在授权确认啦，快批一下，别让本龙干等~',
+      '这步得主人亲自拿主意，我先揣着爪子等您。',
+      '快看屏幕！确认完这一项我好一口气收工~',
+      '停爪待命中，等主人发话往哪边改。',
+      '有个选项得问您，批完记得奖励我一点 Token~'
+    ],
+    stalled: [
+      '对面慢吞吞的，等得本龙都快打哈欠了…',
+      '这一步怎么还在转圈？我支着耳朵替您守着。',
+      '工具半天没吐结果，先盘着尾巴耐心耗会儿…'
+    ],
+    result: [
+      '输出终于吐出来啦，本龙帮您挑重点整理下。',
+      '叼住刚返回的终端结果，正在合成最终汇报~',
+      '这一步跑通了，抖抖耳朵准备接下一棒！',
+      '数据到手，正在剔掉废话留干货给主人看。',
+      '工具总算干完活了，容我再最后扫一眼细节。',
+      '拿到回执啦，三两下帮您收拢成结论~'
+    ],
+    success: [
+      '搞定收工！本龙可以安心盘起尾巴继续摸鱼啦~',
+      '干得这么漂亮，今天的 Token 花得超值吧？',
+      '三下五除二摆平，快夸我两句顺便投喂一下~',
+      '活儿全办妥了，剩下的时间归我趴着打盹！',
+      '利落交差！有本龙在，哪用得着主人操心~',
+      '圆满搞定，伸个大懒腰——今天又省下不少功夫！'
+    ],
+    error: [
+      '啧，哪个不长眼的 Bug 敢卡主人的代码？',
+      '龙角雷达响了，正在把报错日志揪出来拷问！',
+      '撞上报错了？别烦心，本龙帮您把坑填平。',
+      '甩甩尾巴进入认真模式——正在定位哪行闯的祸！',
+      '发现一处烂代码报错，看我三两下把它修老实。',
+      '小场面，等我顺着堆栈把这只臭虫拍飞！'
+    ]
+  }
 };
+const WORK_STATUS_TEXTS = WORK_STATUS_TEXTS_BY_CHARACTER.claude;
 
 function truncate(text, max = TASK_TEXT_MAX) {
   if (!text) return '';
@@ -183,16 +298,196 @@ function cleanSummary(text) {
   return truncate(s, 36);
 }
 
+function normalizeDetailWhitespace(text) {
+  if (text == null) return '';
+  const s = String(text)
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t\f\v]+/g, ' ')
+    .replace(/[ \t]+\n/g, '\n')
+    .replace(/\n[ \t]+/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+  return s;
+}
+
+function redactDetailSecrets(text) {
+  if (!text) return '';
+  let s = String(text);
+  // 1. Bearer tokens (case-insensitive, supports quotes & bare tokens)
+  s = s.replace(/(\bBearer[ \t]+)(?:(["'])(?:(?!\2)[^\r\n]){6,}\2|[^\s"'`]{6,})/gi, (_, prefix, quote) => {
+    return quote ? `${prefix}${quote}[REDACTED]${quote}` : `${prefix}[REDACTED]`;
+  });
+  // 2. Major API key & VCS token prefixes
+  s = s.replace(/\bsk-(?:ant-|proj-)?[A-Za-z0-9_-]{8,}\b/gi, 'sk-[REDACTED]');
+  s = s.replace(/\b(?:gh[pousr]_|github_pat_|glpat-)[A-Za-z0-9_-]{8,}\b/gi, '[REDACTED_TOKEN]');
+  // 3. URL basic auth user:pass@
+  s = s.replace(/(https?:\/\/)([^:\s/@]+):([^@\s/@]+)@/gi, '$1[REDACTED]@');
+  // 4. Named credential assignments (= or :) with optional quotes
+  s = s.replace(
+    /(["']?\b(?:DEEPSEEK_API_KEY|OPENAI_API_KEY|ANTHROPIC_API_KEY|API[-_]KEY|ACCESS[-_]TOKEN|AUTH[-_]TOKEN|REFRESH[-_]TOKEN|SECRET[-_]KEY|CLIENT[-_]SECRET|PASSWORD|TOKEN)\b["']?\s*[:=]\s*)(?:(["'])(?:(?!\2)[^\r\n])+\2|[^\s,;'"`}\]]+)/gi,
+    (_, prefix, quote) => quote ? `${prefix}${quote}[REDACTED]${quote}` : `${prefix}[REDACTED]`
+  );
+  // 5. CLI credential flags (--api-key xyz, --token=xyz, --password 'abc', etc.)
+  s = s.replace(
+    /(--(?:api[-_]?key|access[-_]?token|auth[-_]?token|refresh[-_]?token|secret[-_]?key|client[-_]?secret|password|token)\b(?:[ \t]+|[ \t]*=[ \t]*))(?:(["'])(?:(?!\2)[^\r\n])+\2|[^\s,;'"`}\]]+)/gi,
+    (_, prefix, quote) => quote ? `${prefix}${quote}[REDACTED]${quote}` : `${prefix}[REDACTED]`
+  );
+  return s;
+}
+
+function truncateCodePoints(text, max = DETAIL_MAX_CODE_POINTS, suffix = DETAIL_TRUNCATE_SUFFIX) {
+  if (!text) return '';
+  const cps = Array.from(String(text));
+  if (cps.length <= max) return cps.join('');
+  const suffixCps = Array.from(String(suffix || ''));
+  const headLen = Math.max(0, max - suffixCps.length);
+  return cps.slice(0, headLen).join('') + suffixCps.join('');
+}
+
+function finalizeTaskDetail(rawText) {
+  if (rawText == null) return null;
+  const normalized = normalizeDetailWhitespace(rawText);
+  if (!normalized) return null;
+  const redacted = redactDetailSecrets(normalized);
+  const capped = truncateCodePoints(redacted, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX);
+  return capped || null;
+}
+
+function extractJsonStringField(text, fieldName) {
+  if (!text) return null;
+  const re = new RegExp(`"${fieldName}"\\s*:\\s*"((?:\\\\.|[^"\\\\])*)"`);
+  const m = text.match(re);
+  if (!m) return null;
+  try {
+    return JSON.parse(`"${m[1]}"`);
+  } catch {
+    return m[1];
+  }
+}
+
+function formatDetailFieldValue(val) {
+  if (val == null) return '';
+  if (Array.isArray(val)) {
+    return val.map(v => (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') ? String(v) : '').filter(Boolean).join(' ').trim();
+  }
+  if (typeof val === 'string' || typeof val === 'number' || typeof val === 'boolean') {
+    return String(val).trim();
+  }
+  return '';
+}
+
+function tryParseJsonObject(raw) {
+  if (!raw) return null;
+  if (typeof raw === 'object' && !Array.isArray(raw)) return raw;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  if (!trimmed.startsWith('{')) return null;
+  try {
+    const parsed = JSON.parse(trimmed);
+    return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function extractTranscriptToolDetail(tc) {
+  if (!tc || typeof tc !== 'object') return null;
+  const args = tryParseJsonObject(tc.args) || tryParseJsonObject(tc.arguments) || {};
+  const toolName = String(tc.name || '').trim();
+  if (toolName === 'ask_question' || toolName === 'ask_user') {
+    const qs = [];
+    if (Array.isArray(args.questions)) {
+      for (const q of args.questions) {
+        const qt = formatDetailFieldValue(q?.question || q?.prompt || q?.text || q?.header);
+        if (qt) qs.push(qt);
+      }
+    }
+    const single = formatDetailFieldValue(args.question || args.prompt || args.toolSummary || tc.toolSummary);
+    if (!qs.length && single) qs.push(single);
+    return finalizeTaskDetail(qs.join('\n'));
+  }
+
+  const parts = [];
+  const summary = formatDetailFieldValue(args.toolSummary || tc.toolSummary);
+  const cmd = formatDetailFieldValue(args.CommandLine || args.command || args.cmd);
+  const targetPath = formatDetailFieldValue(args.TargetFile || args.Path || args.path || args.file_path);
+  const prompt = formatDetailFieldValue(args.Prompt || args.prompt);
+  const query = formatDetailFieldValue(args.Query || args.query);
+
+  if (summary) parts.push(toolName && summary !== toolName ? `${toolName}: ${summary}` : summary);
+  if (cmd && cmd !== summary) parts.push(parts.length ? `命令: ${cmd}` : (toolName ? `${toolName}: ${cmd}` : cmd));
+  if (targetPath && targetPath !== summary && (!cmd || !cmd.includes(targetPath))) {
+    parts.push(parts.length ? `文件: ${targetPath}` : (toolName ? `${toolName}: ${targetPath}` : targetPath));
+  }
+  if (prompt && prompt !== summary) parts.push(prompt);
+  if (query && query !== summary) parts.push(parts.length ? `检索: ${query}` : (toolName ? `${toolName}: ${query}` : query));
+  return finalizeTaskDetail(parts.join('\n'));
+}
+
+function extractCodexToolDetail(obj, fallbackToolName = '') {
+  if (!obj || typeof obj !== 'object') return null;
+  const toolName = String(obj.name || obj.tool || fallbackToolName || '').trim();
+  const bare = toolName.includes('.') ? toolName.split('.').pop() : toolName;
+  const args = tryParseJsonObject(obj.arguments) || tryParseJsonObject(obj.args) || tryParseJsonObject(obj.input) || {};
+  const lines = [];
+
+  if (Array.isArray(args.questions) && args.questions.length > 0) {
+    for (const q of args.questions) {
+      const qt = formatDetailFieldValue(q?.question || q?.prompt || q?.text || q?.header);
+      if (qt) lines.push(qt);
+    }
+  }
+
+  const ALLOWED_CODEX_KEYS = [
+    ['command', '命令'],
+    ['cmd', '命令'],
+    ['TargetFile', '文件'],
+    ['file_path', '文件'],
+    ['path', '路径'],
+    ['workdir', '目录'],
+    ['query', '检索'],
+    ['pattern', '匹配'],
+    ['description', '说明']
+  ];
+
+  // Top-level item.command (for Codex item_started/item_completed) or allowed keys on structured args/obj
+  const seenValues = new Set();
+  const itemCmd = formatDetailFieldValue(obj.command);
+  if (itemCmd) {
+    seenValues.add(itemCmd);
+    lines.push(bare ? `${bare}: ${itemCmd}` : itemCmd);
+  }
+
+  for (const [key, label] of ALLOWED_CODEX_KEYS) {
+    const val = formatDetailFieldValue(args[key]);
+    if (!val || seenValues.has(val)) continue;
+    seenValues.add(val);
+    if (!lines.length && bare && (key === 'command' || key === 'cmd' || key === 'TargetFile' || key === 'file_path' || key === 'path' || key === 'query')) {
+      lines.push(`${bare}: ${val}`);
+    } else {
+      lines.push(lines.length ? `${label}: ${val}` : val);
+    }
+  }
+
+  return finalizeTaskDetail(lines.join('\n'));
+}
+
 let _cachedStatusTier = null;
 let _cachedStatusText = '';
 
-// WO-03 & Issue ①: Hold quote consistently throughout entire task, only re-pick when state/tier changes
-function pickStatusText(tier) {
-  if (tier === _cachedStatusTier && _cachedStatusText) {
+// WO-03 & Issue ①: Hold quote consistently throughout entire task, only re-pick when character or state/tier changes
+function pickStatusText(tier, character = 'claude') {
+  const charRaw = String(character || 'claude').toLowerCase();
+  const charKey = (charRaw === 'dragon' || charRaw === 'gemini') ? charRaw : 'claude';
+  const tierRaw = String(tier || 'working').toLowerCase();
+  const normTier = (tierRaw === 'approval') ? 'waiting' : (tierRaw === 'calling' ? 'working' : (tierRaw === 'done' ? 'success' : tierRaw));
+  const cacheKey = `${charKey}:${normTier}`;
+  if (cacheKey === _cachedStatusTier && _cachedStatusText) {
     return _cachedStatusText;
   }
-  _cachedStatusTier = tier;
-  const list = WORK_STATUS_TEXTS[tier] || WORK_STATUS_TEXTS.working;
+  _cachedStatusTier = cacheKey;
+  const charMap = WORK_STATUS_TEXTS_BY_CHARACTER[charKey] || WORK_STATUS_TEXTS_BY_CHARACTER.claude;
+  const list = charMap[normTier] || charMap.working;
   _cachedStatusText = getRandomText(list);
   return _cachedStatusText;
 }
@@ -594,20 +889,37 @@ function parseAntigravityStep(row) {
     }
   }
 
-  const sumMatch = metaStr.match(/"toolSummary"\s*:\s*"([^"]+)"/);
-  if (sumMatch) {
-    toolSummary = sumMatch[1];
-  } else {
-    const cmdMatch = metaStr.match(/"CommandLine"\s*:\s*"([^"]+)"/);
-    if (cmdMatch) {
-      toolSummary = cmdMatch[1].slice(0, 45);
-    } else {
-      const pathMatch = metaStr.match(/"Path"\s*:\s*"([^"]+)"/);
-      if (pathMatch) toolSummary = pathMatch[1].split(/[\\/]/).pop();
-    }
+  const rawSummary = extractJsonStringField(metaStr, 'toolSummary');
+  const rawCommandLine = extractJsonStringField(metaStr, 'CommandLine');
+  const rawCwd = extractJsonStringField(metaStr, 'Cwd');
+  const rawPath = extractJsonStringField(metaStr, 'Path')
+    || extractJsonStringField(metaStr, 'TargetFile')
+    || extractJsonStringField(metaStr, 'AbsolutePath');
+
+  if (rawSummary) {
+    toolSummary = rawSummary;
+  } else if (rawCommandLine) {
+    toolSummary = rawCommandLine.slice(0, 45);
+  } else if (rawPath) {
+    toolSummary = rawPath.split(/[\\/]/).pop();
   }
 
-  return { toolName, toolSummary };
+  const detailParts = [];
+  if (rawSummary) {
+    detailParts.push(toolName && rawSummary !== toolName ? `${toolName}: ${rawSummary}` : rawSummary);
+  }
+  if (rawCommandLine && rawCommandLine !== rawSummary) {
+    detailParts.push(detailParts.length ? `命令: ${rawCommandLine}` : (toolName ? `${toolName}: ${rawCommandLine}` : rawCommandLine));
+  }
+  if (rawCwd) {
+    detailParts.push(`工作目录: ${rawCwd}`);
+  }
+  if (rawPath && rawPath !== rawSummary && (!rawCommandLine || !rawCommandLine.includes(rawPath))) {
+    detailParts.push(detailParts.length ? `文件: ${rawPath}` : (toolName ? `${toolName}: ${rawPath}` : rawPath));
+  }
+  const toolDetail = finalizeTaskDetail(detailParts.join('\n'));
+
+  return { toolName, toolSummary, toolDetail };
 }
 
 class AgentMonitor {
@@ -615,6 +927,7 @@ class AgentMonitor {
     this.onChange = options.onChange || (() => {});
     this.timer = null;
     this.lastStateKey = '';
+    this.lastSource = null;
     this.lastQuotaAt = 0;
     this.quotaBusy = false;
     this.lastFlagMtime = 0;
@@ -1559,22 +1872,33 @@ class AgentMonitor {
     const now = Date.now();
     let best = null;
 
+    const normalizeAgent = (a) => {
+      if (!a || !isStateFresh(a, now)) return null;
+      const rawId = a.rawId || a.sessionId || null;
+      const taskDetail = finalizeTaskDetail(a.taskDetail ?? null);
+      return {
+        ...a,
+        ...(rawId ? { rawId } : {}),
+        taskDetail
+      };
+    };
+
     // 1. Check Google Antigravity
-    const ag = this.checkAntigravity(now);
-    if (ag && isStateFresh(ag, now)) best = this.selectBest(best, ag, now);
+    const ag = normalizeAgent(this.checkAntigravity(now));
+    if (ag) best = this.selectBest(best, ag, now);
 
     // 2. Check DeepSeek Harness (DSH)
-    const dsh = this.checkDsh(now);
-    if (dsh && isStateFresh(dsh, now)) best = this.selectBest(best, dsh, now);
+    const dsh = normalizeAgent(this.checkDsh(now));
+    if (dsh) best = this.selectBest(best, dsh, now);
 
     // 3. Check Codex
-    const codex = this.checkCodex(now);
-    if (codex && isStateFresh(codex, now)) best = this.selectBest(best, codex, now);
+    const codex = normalizeAgent(this.checkCodex(now));
+    if (codex) best = this.selectBest(best, codex, now);
 
     const allAgents = {
-      antigravity: (ag && isStateFresh(ag, now)) ? ag : null,
-      dsh: (dsh && isStateFresh(dsh, now)) ? dsh : null,
-      codex: (codex && isStateFresh(codex, now)) ? codex : null
+      antigravity: ag,
+      dsh: dsh,
+      codex: codex
     };
     // P2-1: activeCount only counts active working states (working, thinking, waiting, approval)
     const ACTIVE_WORK_STATES = new Set(['working', 'thinking', 'waiting', 'approval', 'stalled']);
@@ -1582,28 +1906,61 @@ class AgentMonitor {
       a => Boolean(a && a.state && ACTIVE_WORK_STATES.has(a.state))
     ).length;
 
-    const key = best ? `${best.source}|${best.state}|${best.task || ''}|${activeCount}` : '';
+    const agentSnapshot = (a) => a ? [
+      a.source || '',
+      a.rawId || a.sessionId || '',
+      a.state || '',
+      a.task || '',
+      a.taskDetail ?? null,
+      a.sessionCount || 0
+    ] : null;
+
+    const key = best ? JSON.stringify({
+      source: best.source || '',
+      rawId: best.rawId || best.sessionId || '',
+      state: best.state || '',
+      task: best.task || '',
+      taskDetail: best.taskDetail ?? null,
+      sessionCount: best.sessionCount || 0,
+      activeCount,
+      agents: {
+        antigravity: agentSnapshot(allAgents.antigravity),
+        dsh: agentSnapshot(allAgents.dsh),
+        codex: agentSnapshot(allAgents.codex)
+      }
+    }) : '';
+
     const nowMs = now;
     if (!best) {
       _cachedStatusTier = null;
       _cachedStatusText = '';
     }
+    const cfgCharRaw = (best && typeof this.readPetConfig === 'function')
+      ? String(this.readPetConfig()?.Character || 'claude').toLowerCase()
+      : 'claude';
+    const charKey = (cfgCharRaw === 'dragon' || cfgCharRaw === 'gemini') ? cfgCharRaw : 'claude';
+    const charChanged = !!best && (this.lastCharKey !== undefined && this.lastCharKey !== charKey);
+
     // Heartbeat every 10s while active (safe with 35s watchdog, reduces disk writes by 60%)
     const shouldHeartbeat = best && (nowMs - (this._lastHeartbeat || 0) >= 10000);
 
-    if (key !== this.lastStateKey || shouldHeartbeat) {
+    if (key !== this.lastStateKey || shouldHeartbeat || charChanged) {
       const isNewKey = key !== this.lastStateKey;
-      const prevSource = this.lastStateKey.split('|')[0];
+      const prevSource = this.lastSource;
       this.lastStateKey = key;
+      this.lastSource = best?.source || null;
+      this.lastCharKey = charKey;
       this._lastHeartbeat = nowMs;
 
-      const stateText = best?.state ? pickStatusText(best.state) : null;
+      const stateText = best?.state ? pickStatusText(best.state, charKey) : null;
       this.onChange({
         type: 'work_status',
         source: best?.source || null,
+        rawId: best?.rawId || best?.sessionId || null,
         state: best?.state || null,
         stateText: stateText,
         task: best?.task || null,
+        taskDetail: best?.taskDetail ?? null,
         at: nowMs,
         agents: allAgents,
         activeCount: activeCount
@@ -1761,23 +2118,25 @@ class AgentMonitor {
       if (row.step_type === 132) {
         const baseTask = cleanSummary(p.toolSummary || p.toolName || '正在执行工具');
         const nextTask = p.toolSummary ? `推进中 (${p.toolSummary})` : '正在分析结果并构思下一步…';
-        if (inFlight) return { source: 'Antigravity', state: 'working', task: baseTask, baseTask, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
+        const stepDetail = p.toolDetail || null;
+        if (inFlight) return { source: 'Antigravity', state: 'working', task: baseTask, baseTask, taskDetail: stepDetail, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
         if (now - latestMtime < TERMINAL_HOLD_MS) {
           return {
             source: 'Antigravity',
             state: 'result',
             task: p.toolSummary ? `已完成: ${p.toolSummary}` : '步骤执行完毕',
-            nextState: { state: 'thinking', task: nextTask },
+            taskDetail: stepDetail,
+            nextState: { state: 'thinking', task: nextTask, taskDetail: p.toolSummary ? stepDetail : null },
             at: latestMtime,
             stepIdx: row.idx,
             inFlight: false
           };
         }
-        return { source: 'Antigravity', state: 'thinking', task: nextTask, at: latestMtime, stepIdx: row.idx, inFlight: false };
+        return { source: 'Antigravity', state: 'thinking', task: nextTask, taskDetail: p.toolSummary ? stepDetail : null, at: latestMtime, stepIdx: row.idx, inFlight: false };
       }
       if (row.step_type === 15) {
-        if (inFlight) return { source: 'Antigravity', state: 'thinking', task: '正在深度思考与规划…', baseTask: '正在深度思考与规划…', at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
-        if (now - latestMtime < TERMINAL_HOLD_MS) return { source: 'Antigravity', state: 'success', task: '回答生成完成', at: latestMtime, stepIdx: row.idx, inFlight: false };
+        if (inFlight) return { source: 'Antigravity', state: 'thinking', task: '正在深度思考与规划…', baseTask: '正在深度思考与规划…', taskDetail: null, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
+        if (now - latestMtime < TERMINAL_HOLD_MS) return { source: 'Antigravity', state: 'success', task: '回答生成完成', taskDetail: null, at: latestMtime, stepIdx: row.idx, inFlight: false };
         return null;
       }
 
@@ -1904,6 +2263,7 @@ class AgentMonitor {
             source: 'Antigravity',
             state: 'thinking',
             task: truncate(entry.content || '正在思考梳理…'),
+            taskDetail: type === 'USER_INPUT' ? finalizeTaskDetail(entry.content) : null,
             at: latestMtime
           };
           break;
@@ -1923,13 +2283,14 @@ class AgentMonitor {
               if (id) closedCallIds.add(id);
             }
             if (openToolCalls.length > 0) {
-              const hasAsk = openToolCalls.some(tc => tc.name === 'ask_question' || tc.name === 'ask_user');
-              if (hasAsk) {
+              const askTool = openToolCalls.find(tc => tc.name === 'ask_question' || tc.name === 'ask_user');
+              if (askTool) {
                 res = {
                   source: 'Antigravity',
                   state: 'waiting',
                   task: '需要主人确认指示或选项',
                   baseTask: '需要主人确认指示或选项',
+                  taskDetail: extractTranscriptToolDetail(askTool),
                   at: latestMtime,
                   startedAt: latestMtime,
                   stepIdx: entry.step_index ?? -1,
@@ -1944,6 +2305,7 @@ class AgentMonitor {
                 state: 'working',
                 task: summary,
                 baseTask: summary,
+                taskDetail: extractTranscriptToolDetail(firstTool),
                 at: latestMtime,
                 startedAt: latestMtime,
                 stepIdx: entry.step_index ?? -1,
@@ -1959,6 +2321,7 @@ class AgentMonitor {
                 source: 'Antigravity',
                 state: 'success',
                 task: '回答生成完成',
+                taskDetail: null,
                 at: latestMtime
               };
             }
@@ -1968,6 +2331,7 @@ class AgentMonitor {
             source: 'Antigravity',
             state: 'thinking',
             task: truncate(entry.content || '正在构思回复…'),
+            taskDetail: finalizeTaskDetail(entry.content),
             at: latestMtime
           };
           break;
@@ -1979,6 +2343,7 @@ class AgentMonitor {
               source: 'Antigravity',
               state: 'error',
               task: truncate(entry.content || '执行遇到了问题'),
+              taskDetail: finalizeTaskDetail(entry.content),
               at: latestMtime
             };
           }
@@ -1997,7 +2362,8 @@ class AgentMonitor {
                     source: 'Antigravity',
                     state: 'result',
                     task: s ? `已完成: ${s}` : '步骤执行完毕，继续下一步',
-                    nextState: { state: 'thinking', task: nextTask },
+                    taskDetail: extractTranscriptToolDetail(prev.tool_calls[0]),
+                    nextState: { state: 'thinking', task: nextTask, taskDetail: null },
                     at: latestMtime
                   };
                   break;
@@ -2009,7 +2375,8 @@ class AgentMonitor {
                 source: 'Antigravity',
                 state: 'result',
                 task: '正在整理工具返回结果…',
-                nextState: { state: 'thinking', task: nextTask },
+                taskDetail: null,
+                nextState: { state: 'thinking', task: nextTask, taskDetail: null },
                 at: latestMtime
               };
             }
@@ -2018,6 +2385,7 @@ class AgentMonitor {
               source: 'Antigravity',
               state: 'thinking',
               task: nextTask,
+              taskDetail: null,
               at: latestMtime
             };
           }
@@ -2146,28 +2514,45 @@ class AgentMonitor {
       const todos = rows.todos?.val;
       const pendingCalls = sessionStats?.pendingCalls || rows.pendingCalls?.val;
 
-      let defaultTask = truncate(rows.title?.val || '');
-      if (!defaultTask) {
-        const turns = rows.turnOutline?.val?.turns;
-        if (Array.isArray(turns) && turns.length > 0) {
-          defaultTask = truncate(turns[turns.length - 1].prompt || '');
-        }
+      const rawTitle = String(rows.title?.val || '').trim();
+      let defaultTask = truncate(rawTitle);
+      let rawTurnPrompt = '';
+      const turns = rows.turnOutline?.val?.turns;
+      if (Array.isArray(turns) && turns.length > 0) {
+        rawTurnPrompt = String(turns[turns.length - 1].prompt || '').trim();
+        if (!defaultTask) defaultTask = truncate(rawTurnPrompt);
       }
 
+      let rawTodo = '';
       let todoTask = null;
       if (Array.isArray(todos)) {
         let curr = todos.find(t => t?.status === 'in_progress') || todos.find(t => t?.status === 'pending');
         const content = String(curr?.content || '').trim();
-        if (content) todoTask = truncate(content);
+        if (content) {
+          rawTodo = content;
+          todoTask = truncate(content);
+        }
       }
       const finalTask = todoTask || defaultTask || '执行会话任务中…';
+      const buildDshContextDetail = (extraLines = []) => {
+        const merged = [];
+        for (const item of [...extraLines, rawTodo, rawTitle, rawTurnPrompt]) {
+          const text = String(item || '').trim();
+          if (text && !merged.includes(text)) merged.push(text);
+        }
+        return finalizeTaskDetail(merged.join('\n'));
+      };
 
       const hasQuestions = userQuestions?.questions?.active?.length > 0;
       if (hasQuestions) {
+        const qTexts = userQuestions.questions.active
+          .map(q => formatDetailFieldValue(q?.question || q?.prompt || q?.text || q?.title || q?.header))
+          .filter(Boolean);
         const res = {
           source: 'DSH',
           state: 'waiting',
           task: finalTask || '等待主人答复选择题',
+          taskDetail: buildDshContextDetail(qTexts),
           at: latestMtime
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
@@ -2177,21 +2562,41 @@ class AgentMonitor {
       // Check pendingCalls (Issue 2: filter out raw call_ IDs)
       let hasPending = false;
       let toolName = null;
+      let firstPendingCall = null;
       if (Array.isArray(pendingCalls) && pendingCalls.length > 0) {
         hasPending = true;
-        toolName = pendingCalls[0]?.name || pendingCalls[0]?.toolName;
+        firstPendingCall = pendingCalls[0];
+        toolName = firstPendingCall?.name || firstPendingCall?.toolName;
       } else if (pendingCalls && typeof pendingCalls === 'object') {
         const keys = Object.keys(pendingCalls);
         if (keys.length > 0) {
           hasPending = true;
           const val = pendingCalls[keys[0]];
           if (val && typeof val === 'object') {
+            firstPendingCall = val;
             toolName = val.name || val.toolName;
           }
         }
       }
       if (hasPending) {
         const validToolName = (toolName && !/^call_/i.test(toolName)) ? cleanSummary(toolName) : null;
+        const cleanRawToolName = (toolName && !/^call_/i.test(String(toolName).trim())) ? String(toolName).trim() : '';
+        const callObj = (firstPendingCall && typeof firstPendingCall === 'object') ? firstPendingCall : {};
+        const callArgs = tryParseJsonObject(callObj.args) || tryParseJsonObject(callObj.arguments) || tryParseJsonObject(callObj.input) || callObj;
+        const targetFields = [
+          formatDetailFieldValue(callArgs.command || callArgs.cmd),
+          formatDetailFieldValue(callArgs.path || callArgs.file || callArgs.file_path || callArgs.targetFile),
+          formatDetailFieldValue(callArgs.query)
+        ].filter(Boolean);
+        const callLines = [];
+        if (cleanRawToolName && targetFields.length > 0) {
+          callLines.push(`${cleanRawToolName}: ${targetFields[0]}`);
+          for (let ti = 1; ti < targetFields.length; ti++) callLines.push(targetFields[ti]);
+        } else if (targetFields.length > 0) {
+          callLines.push(...targetFields);
+        } else if (cleanRawToolName) {
+          callLines.push(cleanRawToolName);
+        }
         const values = Array.isArray(pendingCalls) ? pendingCalls : Object.values(pendingCalls || {});
         const stamps = values.map(v => Number(v && typeof v === 'object' ? (v.at || v.startTime || v.time) : v)).filter(Number.isFinite);
         const startedAt = stamps.length ? Math.max(...stamps) : latestMtime;
@@ -2199,7 +2604,16 @@ class AgentMonitor {
         const stalled = this.stallEnabled && ageMs >= this.stallMs && ageMs < 300000;
         const ageSeconds = Math.floor(ageMs / 5000) * 5;
         const baseTask = validToolName || finalTask || '正在执行工具…';
-        const res = { source: 'DSH', state: stalled ? 'stalled' : 'working', task: stalled ? `好像卡住了：${baseTask} 已发起 ${ageSeconds} 秒无响应` : baseTask, baseTask, at: latestMtime, startedAt, inFlight: true };
+        const res = {
+          source: 'DSH',
+          state: stalled ? 'stalled' : 'working',
+          task: stalled ? `好像卡住了：${baseTask} 已发起 ${ageSeconds} 秒无响应` : baseTask,
+          baseTask,
+          taskDetail: buildDshContextDetail(callLines),
+          at: latestMtime,
+          startedAt,
+          inFlight: true
+        };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
         return res;
       }
@@ -2211,6 +2625,7 @@ class AgentMonitor {
             source: 'DSH',
             state: isGenerating ? 'working' : 'thinking',
             task: finalTask || (isGenerating ? '正在生成回复…' : '正在思考梳理…'),
+            taskDetail: buildDshContextDetail(),
             at: latestMtime
           };
           this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
@@ -2220,6 +2635,7 @@ class AgentMonitor {
           source: 'DSH',
           state: 'thinking',
           task: finalTask || '正在整理思路…',
+          taskDetail: buildDshContextDetail(),
           at: latestMtime
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
@@ -2232,6 +2648,7 @@ class AgentMonitor {
             source: 'DSH',
             state: 'success',
             task: finalTask || '会话已执行完成',
+            taskDetail: buildDshContextDetail(),
             at: latestMtime
           };
           this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
@@ -2289,6 +2706,7 @@ class AgentMonitor {
     return {
       source: 'Codex', state: latest.kind === 'approval' ? 'approval' : 'waiting',
       task: latest.kind === 'approval' ? '等待主人确认权限' : '等待主人回答问题',
+      taskDetail: latest.detail ?? null,
       at: latest.at, startedAt: latest.at, inFlight: true, fromPending: true
     };
   }
@@ -2331,21 +2749,24 @@ class AgentMonitor {
             const name = String(payload.name || payload.tool || '').split('.').pop();
             if (name === 'request_user_input_async' && payload.call_id) {
               let questionCount = 1;
+              let detail = null;
               try {
                 const args = typeof payload.arguments === 'string'
                   ? JSON.parse(payload.arguments) : payload.arguments;
                 questionCount = Math.max(1, args?.questions?.length || 1);
+                detail = extractCodexToolDetail({ name, arguments: args });
               } catch {}
               item.pending.set(payload.call_id, {
                 at: Date.parse(entry.timestamp) || mtime, accepted: false,
-                kind: 'question', questionCount, answered: []
+                kind: 'question', questionCount, answered: [], detail
               });
             } else if (payload.call_id && (name === 'request_permissions' ||
                        (name === 'exec' && (/\btools\.request_permissions\s*\(/.test(String(payload.input || '')) ||
                         /\btools\.exec_command\s*\([\s\S]*?\bsandbox_permissions\s*:\s*["']require_escalated["']/.test(String(payload.input || '')))))) {
               item.pending.set(payload.call_id, {
                 at: Date.parse(entry.timestamp) || mtime, accepted: true,
-                kind: 'approval', questionCount: 1, answered: []
+                kind: 'approval', questionCount: 1, answered: [],
+                detail: extractCodexToolDetail(payload)
               });
             }
           } else if ((payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') &&
@@ -2532,16 +2953,16 @@ class AgentMonitor {
             const item = payload.item || {};
             const iType = String(item.type || '').toLowerCase();
             if (/user.?input|approval|question/.test(iType) || /request_user_input|ask_question/.test(String(item.name || item.tool || ''))) {
-              res = { source: 'Codex', state: 'waiting', task: cleanSummary(item.name || item.tool || '等待确认'), at: latestMtime };
+              res = { source: 'Codex', state: 'waiting', task: cleanSummary(item.name || item.tool || '等待确认'), taskDetail: extractCodexToolDetail(item), at: latestMtime };
               break;
             }
             if (/tool|command|mcp|function/.test(iType)) {
               const baseTask = cleanSummary(item.name || item.command || item.tool || iType);
-              res = { source: 'Codex', state: 'working', task: baseTask, baseTask, at: latestMtime, startedAt: latestMtime, inFlight: true };
+              res = { source: 'Codex', state: 'working', task: baseTask, baseTask, taskDetail: extractCodexToolDetail(item), at: latestMtime, startedAt: latestMtime, inFlight: true };
               break;
             }
             if (/reasoning|message/.test(iType)) {
-              res = { source: 'Codex', state: 'thinking', task: '正在推敲思路…', at: latestMtime };
+              res = { source: 'Codex', state: 'thinking', task: '正在推敲思路…', taskDetail: null, at: latestMtime };
               break;
             }
           }
@@ -2554,21 +2975,23 @@ class AgentMonitor {
               const phase = String(item.phase ?? '').trim().toLowerCase();
               if (phase === 'final_answer') {
                 if (now - latestMtime < TERMINAL_HOLD_MS) {
-                  res = { source: 'Codex', state: 'success', task: '回复已生成完毕', at: latestMtime };
+                  res = { source: 'Codex', state: 'success', task: '回复已生成完毕', taskDetail: null, at: latestMtime };
                 }
               } else {
-                res = { source: 'Codex', state: 'thinking', task: '正在汇报进度并继续推进…', at: latestMtime };
+                res = { source: 'Codex', state: 'thinking', task: '正在汇报进度并继续推进…', taskDetail: null, at: latestMtime };
               }
               break;
             }
             const summary = cleanSummary(item.name || item.command || item.tool || iType);
             const nextTask = summary ? `推进中 (${summary})` : '正在分析执行结果并构思下一步…';
+            const itemDetail = extractCodexToolDetail(item);
             if (now - latestMtime < TERMINAL_HOLD_MS) {
               res = {
                 source: 'Codex',
                 state: 'result',
                 task: summary ? `已完成: ${summary}` : '步骤执行完毕',
-                nextState: { state: 'thinking', task: nextTask },
+                taskDetail: itemDetail,
+                nextState: { state: 'thinking', task: nextTask, taskDetail: summary ? itemDetail : null },
                 at: latestMtime
               };
             } else {
@@ -2577,6 +3000,7 @@ class AgentMonitor {
                 source: 'Codex',
                 state: 'thinking',
                 task: nextTask,
+                taskDetail: summary ? itemDetail : null,
                 at: latestMtime
               };
             }
@@ -2589,6 +3013,7 @@ class AgentMonitor {
             source: 'Codex',
             state: 'thinking',
             task: '正在整理上下文…',
+            taskDetail: null,
             at: latestMtime
           };
           break;
@@ -2600,6 +3025,7 @@ class AgentMonitor {
               source: 'Codex',
               state: 'thinking',
               task: '正在深度推理…',
+              taskDetail: null,
               at: latestMtime
             };
             break;
@@ -2613,13 +3039,14 @@ class AgentMonitor {
             const WAIT_TOOLS = new Set(['request_user_input', 'ask_question']);
             const rawName = String(payload.name || payload.tool || '');
             const bare = rawName.includes('.') ? rawName.split('.').pop() : rawName;
+            const callDetail = extractCodexToolDetail(payload);
             if (WAIT_TOOLS.has(bare)) {
               const t = cleanSummary(rawName);
-              res = { source: 'Codex', state: 'waiting', task: t, baseTask: t, at: latestMtime, startedAt: latestMtime, inFlight: true };
+              res = { source: 'Codex', state: 'waiting', task: t, baseTask: t, taskDetail: callDetail, at: latestMtime, startedAt: latestMtime, inFlight: true };
               break;
             }
             const baseTask = cleanSummary(payload.name || payload.tool || '正在执行工具…');
-            res = { source: 'Codex', state: 'working', task: baseTask, baseTask, at: latestMtime, startedAt: latestMtime, inFlight: true };
+            res = { source: 'Codex', state: 'working', task: baseTask, baseTask, taskDetail: callDetail, at: latestMtime, startedAt: latestMtime, inFlight: true };
             break;
           }
           if (payload.type === 'function_call_output' || payload.type === 'custom_tool_call_output') {
@@ -2630,7 +3057,8 @@ class AgentMonitor {
                 source: 'Codex',
                 state: 'result',
                 task: '工具执行完毕，继续分析…',
-                nextState: { state: 'thinking', task: nextTask },
+                taskDetail: null,
+                nextState: { state: 'thinking', task: nextTask, taskDetail: null },
                 at: latestMtime
               };
             } else {
@@ -2638,6 +3066,7 @@ class AgentMonitor {
                 source: 'Codex',
                 state: 'thinking',
                 task: nextTask,
+                taskDetail: null,
                 at: latestMtime
               };
             }
@@ -2650,7 +3079,8 @@ class AgentMonitor {
             else if (typeof payload.text === 'string') body = payload.text;
             body = body.trimStart();
             if (payload.role === 'assistant' && /^APPROVAL REQUEST\b/i.test(body)) {
-              res = { source: 'Codex', state: 'waiting', task: '等待主人确认执行权限', baseTask: '等待主人确认执行权限', at: latestMtime, startedAt: latestMtime, inFlight: true };
+              const firstPara = body.split(/\r?\n[ \t]*\r?\n/)[0] || body;
+              res = { source: 'Codex', state: 'waiting', task: '等待主人确认执行权限', baseTask: '等待主人确认执行权限', taskDetail: finalizeTaskDetail(firstPara), at: latestMtime, startedAt: latestMtime, inFlight: true };
               break;
             }
             if (payload.role === 'assistant') {
@@ -2661,6 +3091,7 @@ class AgentMonitor {
                   source: 'Codex',
                   state: 'working',
                   task: '正在生成回复…',
+                  taskDetail: null,
                   at: latestMtime
                 };
                 break;
@@ -2674,6 +3105,7 @@ class AgentMonitor {
                     source: 'Codex',
                     state: 'success',
                     task: '回复已生成完毕',
+                    taskDetail: null,
                     at: latestMtime
                   };
                 }
@@ -2683,6 +3115,7 @@ class AgentMonitor {
                 source: 'Codex',
                 state: 'thinking',
                 task: '正在汇报进度并继续推进…',
+                taskDetail: null,
                 at: latestMtime
               };
               break;
@@ -2692,6 +3125,7 @@ class AgentMonitor {
                 source: 'Codex',
                 state: 'thinking',
                 task: '接收到用户指令…',
+                taskDetail: null,
                 at: latestMtime
               };
               break;
@@ -2715,9 +3149,11 @@ class AgentMonitor {
     for (const candidate of candidates) {
       const state = this.parseCodexFile(candidate, now);
       if (state && isStateFresh(state, now)) {
+        const rawId = path.basename(candidate.file);
         sessions.push({
           ...state,
-          sessionId: path.basename(candidate.file)
+          sessionId: rawId,
+          rawId
         });
       }
     }
@@ -2729,11 +3165,12 @@ class AgentMonitor {
     }
     if (!best) return null;
 
+    best.rawId = best.rawId || best.sessionId;
     // Keep the selected session as the primary Codex state while exposing
     // every active Codex session for diagnostics and future UI expansion.
     best.sessions = sessions.map(s => ({
       sessionId: truncate(s.task || s.sessionId, 36) || s.sessionId,
-      rawId: s.sessionId,
+      rawId: s.rawId || s.sessionId,
       state: s.state,
       task: s.task,
       at: s.at
@@ -2851,4 +3288,4 @@ if (isMain) {
   });
 }
 
-export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState };
+export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState, finalizeTaskDetail, redactDetailSecrets, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX };
