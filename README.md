@@ -14,11 +14,11 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 | 小克（Claude娘） | 白龙（GPT娘） | 双子（Gemini娘） |
 | :---: | :---: | :---: |
-| ![小克](preview/claude-happy-preview.png) | ![白龙](preview/dragon-happy-preview.png) | ![双子](preview/gemini-happy-preview.png) |
+| ![小克](assets/characters/claude-idle.png) | ![白龙](assets/characters/dragon-idle.png) | ![双子](assets/characters/gemini-idle.png) |
 
 | DeepSeek娘（大肥鱼） | 智谱娘（ZCode） |
 | :---: | :---: |
-| ![DeepSeek娘](preview/deepseek-happy-preview.png) | ![智谱娘](preview/zcode-happy-preview.png) |
+| ![DeepSeek娘](assets/characters/deepseek-idle.png) | ![智谱娘](assets/characters/zcode-idle.png) |
 
 ## 🌟 功能介绍
 
