@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.1"
+$script:AppVersion = "1.6.2"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -391,6 +391,7 @@ function Save-Config {
 
         # Atomic move / replace
         Move-Item -Path $tmpPath -Destination $ConfigPath -Force
+        $script:sliderConfigDirty = $false
     } catch {
         Write-PetLog "Error saving configuration: $($_.Exception.Message)"
         if (Test-Path $tmpPath) {
@@ -1165,6 +1166,7 @@ function Apply-WorkVisualStyle([string]$state, $theme) {
 
 function Update-Theme {
     $t = Get-CurrentTheme
+    if ($script:TrayMenu) { Update-TrayMenuTheme }
     $bgBrush     = $BrushConv.ConvertFromString($t.BubbleBg)
     $borderBrush = $BrushConv.ConvertFromString($t.Border)
     $accentBrush = $BrushConv.ConvertFromString($t.Accent)
@@ -3062,10 +3064,73 @@ function Update-Facing {
 # ============================================================================
 $script:isBubbleOpen = $false
 $script:manualBubbleHidden = $false
+$script:userInspectPanel = $null
+$script:userInspectHovering = $false
 $script:waitingLastAlert = $null
 $script:waitingAttentionActive = $false
 $script:bubbleAnimVersion = 0
 $script:bubbleCloseTime = [DateTime]::MaxValue
+
+function Stop-UserBubbleInspection {
+    $script:userInspectPanel = $null
+    $script:userInspectHovering = $false
+    $script:userInspectUntil = [DateTime]::MinValue
+}
+
+function Start-UserBubbleInspection([ValidateSet('quota', 'deepseek')][string]$mode) {
+    $script:userInspectPanel = $mode
+    $script:userInspectHovering = $false
+    $script:userInspectUntil = [DateTime]::MaxValue
+    $script:manualBubbleHidden = $false
+    $script:lastInteractTime = [DateTime]::UtcNow
+    Set-ActiveBubblePanel $mode
+    Show-Bubble 0 -Force
+    if ($mode -eq 'quota') {
+        Request-QuotaRefresh
+    } else {
+        Request-BalanceRefresh
+    }
+    Update-UserBubbleInspection ([DateTime]::UtcNow) ([bool]$Bubble.IsMouseOver)
+}
+
+function Update-UserBubbleInspection([DateTime]$now, [bool]$hovered) {
+    if (-not $script:userInspectPanel) { return }
+    if ($script:agentBusy -and $script:lastAgentState -in @("waiting", "approval")) {
+        Stop-UserBubbleInspection
+        Set-ActiveBubblePanel "work"
+        Show-Bubble 0
+        return
+    }
+
+    # Existing request deadlines cover success, failure, cooldown and timeout.
+    $pending = if ($script:userInspectPanel -eq 'quota') {
+        $script:refreshingUntil -gt $now
+    } else {
+        $script:balanceRequestTimeout -and $script:balanceRequestTimeout -gt $now
+    }
+    if ($pending) {
+        $script:userInspectUntil = [DateTime]::MaxValue
+        $script:userInspectHovering = $hovered
+        return
+    }
+    if ($script:userInspectUntil -eq [DateTime]::MaxValue) {
+        $script:userInspectUntil = $now.AddSeconds(5.0)
+        $script:userInspectHovering = $hovered
+    }
+    if ($hovered -or $script:userInspectHovering) {
+        $script:userInspectUntil = $now.AddSeconds(2.0)
+    }
+    $script:userInspectHovering = $hovered
+    if ($now -lt $script:userInspectUntil) { return }
+
+    Stop-UserBubbleInspection
+    if ($script:agentBusy) {
+        Set-ActiveBubblePanel 'work'
+        Show-Bubble 0
+    } else {
+        Hide-Bubble
+    }
+}
 
 function Show-Bubble([double]$holdSeconds = 5.2, [switch]$Force) {
     if ($holdSeconds -gt 0) {
@@ -3105,6 +3170,7 @@ function Show-Bubble([double]$holdSeconds = 5.2, [switch]$Force) {
 }
 
 function Hide-Bubble {
+    Stop-UserBubbleInspection
     Close-HoverDetailCard
     if (-not $script:isBubbleOpen) { return }
     $script:isBubbleOpen = $false
@@ -3144,6 +3210,9 @@ function Hide-Bubble {
 }
 
 function Set-ActiveBubblePanel([string]$mode) {
+    if ($script:userInspectPanel -and $script:userInspectPanel -ne $mode) {
+        Stop-UserBubbleInspection
+    }
     $script:currentBubblePanel = $mode
     if ($mode -ne "work") {
         Close-HoverDetailCard
@@ -3372,6 +3441,143 @@ function Set-TrayIconForRole {
     } catch {}
 }
 
+# Theme-aware rounded tray menus share their renderer and regular font across all submenus.
+if (-not ('AgentPetTrayMenuRenderer' -as [type])) {
+    Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing, System.Core -TypeDefinition @'
+using System;
+using System.Collections.Generic;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+
+public sealed class AgentPetTrayMenuRenderer : ToolStripProfessionalRenderer {
+    public Color Surface { get; private set; }
+    public Color TextColor { get; private set; }
+    public Color Accent { get; private set; }
+    public Color CheckedFill { get; private set; }
+    public Color HoverFill { get; private set; }
+    public Color BorderColor { get; private set; }
+    public Color DisabledColor { get; private set; }
+    private readonly Font menuFont = new Font("Microsoft YaHei UI", 10.0f, FontStyle.Regular, GraphicsUnit.Point);
+    private readonly HashSet<ToolStrip> attached = new HashSet<ToolStrip>();
+    private bool fontDisposed;
+    private ToolStrip rootMenu;
+
+    public AgentPetTrayMenuRenderer() { RoundedEdges = false; }
+    public void SetPalette(Color surface, Color text, Color accent, Color check, Color hover, Color border, Color disabled) {
+        Surface=surface; TextColor=text; Accent=accent; CheckedFill=check; HoverFill=hover; BorderColor=border; DisabledColor=disabled;
+    }
+    private static GraphicsPath Rounded(RectangleF r, float radius) {
+        GraphicsPath p=new GraphicsPath(); float d=Math.Min(radius*2,Math.Min(r.Width,r.Height));
+        if(d<=1) { p.AddRectangle(r); return p; }
+        p.AddArc(r.Left,r.Top,d,d,180,90);p.AddArc(r.Right-d,r.Top,d,d,270,90);
+        p.AddArc(r.Right-d,r.Bottom-d,d,d,0,90);p.AddArc(r.Left,r.Bottom-d,d,d,90,90);p.CloseFigure();return p;
+    }
+    private static void UpdateRegion(ToolStrip strip) {
+        if(!(strip is ToolStripDropDown) || strip.Width<10 || strip.Height<10) return;
+        using(GraphicsPath path=Rounded(new RectangleF(0,0,strip.Width,strip.Height),10)) {
+            Region old=strip.Region; strip.Region=new Region(path); if(old!=null) old.Dispose();
+        }
+    }
+    public void Apply(ToolStrip strip) {
+        if(rootMenu==null) rootMenu=strip;
+        strip.Renderer=this;strip.BackColor=Surface;strip.ForeColor=TextColor;strip.Font=menuFont;
+        strip.Padding=new Padding(5,5,5,5);
+        ToolStripDropDownMenu dropdown=strip as ToolStripDropDownMenu;
+        if(dropdown!=null) { dropdown.ShowImageMargin=false;dropdown.ShowCheckMargin=false; }
+        if(attached.Add(strip)) {
+            strip.SizeChanged+=delegate(object sender,EventArgs e){ UpdateRegion((ToolStrip)sender); };
+            strip.Disposed+=delegate(object sender,EventArgs e){
+                attached.Remove((ToolStrip)sender);
+                if(Object.ReferenceEquals(sender,rootMenu) && !fontDisposed) { menuFont.Dispose();fontDisposed=true; }
+            };
+        }
+        foreach(ToolStripItem item in strip.Items) {
+            item.Font=menuFont;item.ForeColor=item.Enabled?TextColor:DisabledColor;
+            if(!(item is ToolStripSeparator)) {
+                // DropDownMenu sizes its viewport without horizontal item padding. Its native arrow lane also fits our check.
+                item.Padding=new Padding(0,6,0,6);
+                item.Margin=new Padding(0,1,0,1);
+            }
+            ToolStripMenuItem menu=item as ToolStripMenuItem;
+            if(menu!=null && menu.HasDropDownItems) Apply(menu.DropDown);
+        }
+        UpdateRegion(strip);strip.Invalidate();
+    }
+    protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e) {
+        using(SolidBrush brush=new SolidBrush(Surface)) e.Graphics.FillRectangle(brush,e.AffectedBounds);
+    }
+    protected override void OnRenderImageMargin(ToolStripRenderEventArgs e) { }
+    protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e) {
+        GraphicsState state=e.Graphics.Save();
+        try { e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;
+            using(GraphicsPath path=Rounded(new RectangleF(.5f,.5f,e.ToolStrip.Width-1,e.ToolStrip.Height-1),10))
+            using(Pen pen=new Pen(BorderColor,1)) e.Graphics.DrawPath(pen,path);
+        } finally { e.Graphics.Restore(state); }
+    }
+    protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e) {
+        ToolStripMenuItem menu=e.Item as ToolStripMenuItem;
+        bool isChecked=menu!=null && menu.Checked;
+        bool active=e.Item.Enabled && e.Item.Selected;
+        GraphicsState state=e.Graphics.Save();
+        try { e.Graphics.SmoothingMode=SmoothingMode.AntiAlias;
+            RectangleF bounds=new RectangleF(1,0,e.Item.Width-2,e.Item.Height-1);
+            if(active || isChecked) {
+                using(GraphicsPath path=Rounded(bounds,6))
+                using(SolidBrush brush=new SolidBrush(isChecked?CheckedFill:HoverFill)) e.Graphics.FillPath(brush,path);
+            }
+            if(isChecked && (menu==null || !menu.HasDropDownItems)) {
+                float x=e.Item.Width-20, y=e.Item.Height/2f;
+                using(Pen pen=new Pen(e.Item.Enabled?Accent:DisabledColor,1.8f)) {
+                    pen.StartCap=LineCap.Round;pen.EndCap=LineCap.Round;pen.LineJoin=LineJoin.Round;
+                    e.Graphics.DrawLines(pen,new PointF[]{new PointF(x,y),new PointF(x+3,y+3),new PointF(x+9,y-4)});
+                }
+            }
+        } finally { e.Graphics.Restore(state); }
+    }
+    protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e) { }
+    protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e) {
+        ToolStripMenuItem item=e.Item as ToolStripMenuItem;
+        e.TextColor=!e.Item.Enabled?DisabledColor:((e.Item.Selected || (item!=null && item.Checked))?Accent:TextColor);
+        Rectangle r=e.TextRectangle;r.Width=Math.Min(r.Width,Math.Max(1,e.Item.Width-r.X-26));e.TextRectangle=r;
+        base.OnRenderItemText(e);
+    }
+    protected override void OnRenderArrow(ToolStripArrowRenderEventArgs e) {
+        e.ArrowColor=!e.Item.Enabled?DisabledColor:(e.Item.Selected?Accent:TextColor);base.OnRenderArrow(e);
+    }
+    protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e) {
+        int y=e.Item.Height/2;
+        using(Pen pen=new Pen(BorderColor,1)) e.Graphics.DrawLine(pen,8,y,e.Item.Width-8,y);
+    }
+}
+'@
+}
+
+function ConvertTo-AgentPetTrayColor([string]$Value) {
+    $c = [System.Windows.Media.ColorConverter]::ConvertFromString($Value)
+    return [System.Drawing.Color]::FromArgb(255, [int]$c.R, [int]$c.G, [int]$c.B)
+}
+
+function Update-TrayMenuTheme {
+    if (-not $script:TrayMenu) { return }
+    try {
+        $t = Get-CurrentTheme
+        $renderer = $script:TrayMenu.Renderer
+        if (-not ($renderer -is [AgentPetTrayMenuRenderer])) { $renderer = New-Object AgentPetTrayMenuRenderer }
+        $renderer.SetPalette(
+            (ConvertTo-AgentPetTrayColor $t.BubbleBg),
+            (ConvertTo-AgentPetTrayColor $t.BodyText),
+            (ConvertTo-AgentPetTrayColor $t.Accent),
+            (ConvertTo-AgentPetTrayColor $t.HoverBg),
+            (ConvertTo-AgentPetTrayColor $t.BadgeBg),
+            (ConvertTo-AgentPetTrayColor $t.HeaderDivider),
+            (ConvertTo-AgentPetTrayColor $t.MutedText)
+        )
+        $renderer.Apply($script:TrayMenu)
+    } catch { Log-Throttled 'TrayMenuTheme' "Tray menu styling failed: $($_.Exception.Message)" 30 }
+}
+
+
 function Initialize-TrayIcon {
     Write-PetLog "Tray initialization requested (enabled=$([bool]$Config.TrayEnabled))."
     if ($null -ne $script:NotifyIcon -or -not [bool]$Config.TrayEnabled) { return }
@@ -3473,8 +3679,8 @@ function Initialize-TrayIcon {
         $show.Add_Click({ Set-AgentPetWindowVisible $true })
         $hide.Add_Click({ Set-AgentPetWindowVisible $false })
         $work.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "work"; Show-Bubble 0 -Force })
-        $quota.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "quota"; Request-QuotaRefresh; Show-Bubble 0 -Force })
-        $deepseek.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh; Show-Bubble 0 -Force })
+        $quota.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "quota" })
+        $deepseek.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "deepseek" })
         $quote.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; $QuoteText.Text = Get-RandomCharacterQuote $Config.Character; Set-ActiveBubblePanel "quote"; Show-Bubble 5.5 })
         $defQuota.Add_Click({ $Config.BubbleMode = "quota"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quota" } }; Build-ContextMenu })
         $defDeepseek.Add_Click({ $Config.BubbleMode = "deepseek"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh } }; Build-ContextMenu })
@@ -3516,11 +3722,8 @@ function Initialize-TrayIcon {
             Build-ContextMenu
         })
         $trayDshRefreshItem.Add_Click({
-            $script:manualBubbleHidden = $false
             Set-AgentPetWindowVisible $true
-            Set-ActiveBubblePanel "deepseek"
-            Request-BalanceRefresh
-            Show-Bubble 0 -Force
+            Start-UserBubbleInspection "deepseek"
         })
         $trayEnabledItem.Add_Click({
             param($sender, $e)
@@ -3557,6 +3760,7 @@ function Initialize-TrayIcon {
         $menu.Add_Opening({
             param($sender, $e)
             $m = $sender.Tag
+            Update-TrayMenuTheme
             Update-TrayTooltip -Force
             $m.DefQuota.Checked    = ($Config.BubbleMode -eq "quota")
             $m.DefDeepseek.Checked = ($Config.BubbleMode -eq "deepseek")
@@ -3575,6 +3779,7 @@ function Initialize-TrayIcon {
             foreach ($roleItem in $m.Roles.DropDownItems) { if ($roleItem.Tag) { $roleItem.Checked = ([string]$roleItem.Tag -eq [string]$Config.Character) } }
         })
         $script:TrayMenu = $menu
+        Update-TrayMenuTheme
         $script:NotifyIcon.ContextMenuStrip = $menu
         Write-PetLog "Tray icon initialized successfully."
     } catch {
@@ -3758,6 +3963,7 @@ function Request-QuotaRefresh {
         [System.IO.File]::WriteAllText($RefreshFlagPath, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString(), [System.Text.Encoding]::UTF8)
     } catch {
         Log-Throttled "QuotaRefresh" "写入 Codex 额度刷新标记失败：$($_.Exception.Message)" 30
+        $script:refreshingUntil = [DateTime]::MinValue
         if ($ShortReset) {
             $ShortReset.Text = "请求失败"
         }
@@ -4257,30 +4463,156 @@ function Play-ApproveSound {
 # ============================================================================
 # 12. Custom Rounded WPF ContextMenu (Modeled after T7moris/GPT-Niang)
 # ============================================================================
+$script:sliderConfigDirty = $false
+
+function Save-PendingSliderConfig {
+    if (-not $script:sliderConfigDirty) { return }
+    Save-Config
+}
+
 $MenuXaml = @"
 <ContextMenu xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
              xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-             HasDropShadow="True" Background="Transparent" BorderThickness="0" Padding="6">
+             HasDropShadow="True" Background="Transparent" BorderThickness="0" Padding="0">
   <ContextMenu.Resources>
+    <SolidColorBrush x:Key="MenuSurfaceBrush" Color="#FFF5F1FF"/>
+    <SolidColorBrush x:Key="MenuTextBrush" Color="#FF2F2859"/>
+    <SolidColorBrush x:Key="MenuMutedBrush" Color="#FF8A84B0"/>
+    <SolidColorBrush x:Key="MenuAccentBrush" Color="#FF5340C9"/>
+    <SolidColorBrush x:Key="MenuBorderBrush" Color="#FFE2D8FC"/>
+    <SolidColorBrush x:Key="MenuHoverBrush" Color="#FFEDE9FE"/>
+    <SolidColorBrush x:Key="MenuQuickBrush" Color="#0F5340C9"/>
+    <SolidColorBrush x:Key="MenuSelectedBrush" Color="#FFEAE2FF"/>
+    <Color x:Key="MenuShadowColor">#FF37297A</Color>
     <Style TargetType="MenuItem">
       <Setter Property="FontFamily" Value="Microsoft YaHei UI, Segoe UI"/>
-      <Setter Property="FontSize" Value="12.5"/>
-      <Setter Property="Foreground" Value="#FF2E241D"/>
-      <Setter Property="Padding" Value="10,6"/>
+      <Setter Property="FontSize" Value="13"/>
+      <Setter Property="FontWeight" Value="Normal"/>
+      <Setter Property="Foreground" Value="{DynamicResource MenuTextBrush}"/>
+      <Setter Property="Background" Value="Transparent"/>
+      <Setter Property="Padding" Value="11,6"/>
+      <Setter Property="MinHeight" Value="34"/>
+      <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
       <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Grid SnapsToDevicePixels="True">
+              <Border x:Name="ItemChrome" Background="{TemplateBinding Background}"
+                      CornerRadius="7" Padding="{TemplateBinding Padding}" MinHeight="{TemplateBinding MinHeight}">
+                <Grid>
+                  <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="Auto"/>
+                    <ColumnDefinition Width="*"/>
+                    <ColumnDefinition Width="18"/>
+                  </Grid.ColumnDefinitions>
+                  <ContentPresenter x:Name="RowIcon" ContentSource="Icon" Margin="0,0,9,0"
+                                    VerticalAlignment="Center" IsHitTestVisible="False"/>
+                  <ContentPresenter x:Name="HeaderPresenter" Grid.Column="1" ContentSource="Header" RecognizesAccessKey="True"
+                                    VerticalAlignment="Center" HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                                    Margin="0,0,10,0"/>
+                  <Path x:Name="SelectionCheck" Grid.Column="2" Data="M 1,5 L 4,8 L 10,1"
+                        Stroke="{DynamicResource MenuAccentBrush}" StrokeThickness="1.8" StrokeStartLineCap="Round"
+                        StrokeEndLineCap="Round" StrokeLineJoin="Round" Width="12" Height="10"
+                        VerticalAlignment="Center" HorizontalAlignment="Center" Visibility="Collapsed"/>
+                  <Path x:Name="SubmenuChevron" Grid.Column="2" Data="M 1,1 L 5,5 L 1,9"
+                        Stroke="{TemplateBinding Foreground}" StrokeThickness="1.5" StrokeStartLineCap="Round"
+                        StrokeEndLineCap="Round" StrokeLineJoin="Round" Width="7" Height="10"
+                        VerticalAlignment="Center" HorizontalAlignment="Center" Visibility="Collapsed"/>
+                </Grid>
+              </Border>
+              <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="-2" VerticalOffset="-8"
+                     PlacementTarget="{Binding RelativeSource={RelativeSource TemplatedParent}}"
+                     IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}"
+                     AllowsTransparency="True" Focusable="False" PopupAnimation="None">
+                <Border x:Name="SubmenuChrome" Background="{DynamicResource MenuSurfaceBrush}"
+                        BorderBrush="{DynamicResource MenuBorderBrush}" BorderThickness="1" CornerRadius="12"
+                        Padding="6" Margin="6,5,10,10" MinWidth="176" SnapsToDevicePixels="True">
+                  <Border.Effect>
+                    <DropShadowEffect BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.15"
+                                      Color="{DynamicResource MenuShadowColor}"/>
+                  </Border.Effect>
+                  <ScrollViewer CanContentScroll="True" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+                    <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle" KeyboardNavigation.TabNavigation="Cycle"/>
+                  </ScrollViewer>
+                </Border>
+              </Popup>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="Icon" Value="{x:Null}">
+                <Setter TargetName="RowIcon" Property="Visibility" Value="Collapsed"/>
+              </Trigger>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="ItemChrome" Property="Background" Value="{DynamicResource MenuHoverBrush}"/>
+              </Trigger>
+              <Trigger Property="IsSubmenuOpen" Value="True">
+                <Setter TargetName="ItemChrome" Property="Background" Value="{DynamicResource MenuHoverBrush}"/>
+              </Trigger>
+              <Trigger Property="IsChecked" Value="True">
+                <Setter TargetName="ItemChrome" Property="Background" Value="{DynamicResource MenuSelectedBrush}"/>
+                <Setter Property="Foreground" Value="{DynamicResource MenuAccentBrush}"/>
+                <Setter TargetName="SelectionCheck" Property="Visibility" Value="Visible"/>
+              </Trigger>
+              <Trigger Property="HasItems" Value="True">
+                <Setter TargetName="SubmenuChevron" Property="Visibility" Value="Visible"/>
+                <Setter TargetName="SelectionCheck" Property="Visibility" Value="Collapsed"/>
+              </Trigger>
+              <Trigger Property="IsEnabled" Value="False">
+                <Setter TargetName="ItemChrome" Property="Opacity" Value="0.45"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
+    </Style>
+    <Style x:Key="ExitMenuItemStyle" TargetType="MenuItem" BasedOn="{StaticResource {x:Type MenuItem}}">
+      <Setter Property="MinHeight" Value="32"/>
+      <Setter Property="Cursor" Value="Hand"/>
+      <Setter Property="Foreground" Value="#FFD9383A"/>
+      <Setter Property="Template">
+        <Setter.Value>
+          <ControlTemplate TargetType="MenuItem">
+            <Grid SnapsToDevicePixels="True" MinHeight="{TemplateBinding MinHeight}">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto"/>
+                <ColumnDefinition Width="*"/>
+              </Grid.ColumnDefinitions>
+              <Border x:Name="ExitRowChrome" Grid.ColumnSpan="2"
+                      Background="{TemplateBinding Background}" CornerRadius="7"/>
+              <Border x:Name="ExitHitArea" Background="Transparent" Cursor="Hand"
+                      Padding="{TemplateBinding Padding}" CornerRadius="7">
+                <ContentPresenter ContentSource="Header" RecognizesAccessKey="True" VerticalAlignment="Center"/>
+              </Border>
+              <TextBlock x:Name="VersionLabel" Grid.Column="1" Text="{TemplateBinding Tag}"
+                         Foreground="{DynamicResource MenuMutedBrush}" FontSize="12" Margin="14,0,11,0"
+                         HorizontalAlignment="Right" VerticalAlignment="Center" IsHitTestVisible="False"/>
+            </Grid>
+            <ControlTemplate.Triggers>
+              <Trigger Property="IsHighlighted" Value="True">
+                <Setter TargetName="ExitRowChrome" Property="Background" Value="{DynamicResource MenuHoverBrush}"/>
+              </Trigger>
+            </ControlTemplate.Triggers>
+          </ControlTemplate>
+        </Setter.Value>
+      </Setter>
     </Style>
     <Style TargetType="Separator">
-      <Setter Property="Margin" Value="6,4"/>
-      <Setter Property="Background" Value="#268F5B36"/>
+      <Setter Property="Margin" Value="8,4"/>
+      <Setter Property="Template">
+        <Setter.Value><ControlTemplate TargetType="Separator"><Border Height="1" Background="{DynamicResource MenuBorderBrush}"/></ControlTemplate></Setter.Value>
+      </Setter>
     </Style>
   </ContextMenu.Resources>
   <ContextMenu.Template>
     <ControlTemplate TargetType="ContextMenu">
-      <Border Background="#FCFFFDFB" BorderBrush="#44CE6018" BorderThickness="1.4" CornerRadius="14" Padding="5,6" Margin="6">
-        <Border.Effect>
-          <DropShadowEffect BlurRadius="16" ShadowDepth="4" Direction="270" Opacity="0.18" Color="#FF3D220A"/>
-        </Border.Effect>
-        <StackPanel IsItemsHost="True" KeyboardNavigation.DirectionalNavigation="Cycle"/>
+      <Border x:Name="RootMenuChrome" Background="{DynamicResource MenuSurfaceBrush}"
+              BorderBrush="{DynamicResource MenuBorderBrush}" BorderThickness="1" CornerRadius="12"
+              Padding="6" Margin="6" MinWidth="266" SnapsToDevicePixels="True">
+        <Border.Effect><DropShadowEffect BlurRadius="16" ShadowDepth="3" Direction="270" Opacity="0.15" Color="{DynamicResource MenuShadowColor}"/></Border.Effect>
+        <ScrollViewer CanContentScroll="True" HorizontalScrollBarVisibility="Disabled" VerticalScrollBarVisibility="Auto">
+          <ItemsPresenter KeyboardNavigation.DirectionalNavigation="Cycle" KeyboardNavigation.TabNavigation="Cycle"/>
+        </ScrollViewer>
       </Border>
     </ControlTemplate>
   </ContextMenu.Template>
@@ -4309,13 +4641,39 @@ function Sync-CharacterMenuChecks {
     }
 }
 
+function Set-AgentPetContextMenuTheme($contextMenu) {
+    if (-not $contextMenu) { return }
+    $theme = Get-CurrentTheme
+    $colors = @{
+        MenuSurfaceBrush  = $theme.BubbleBg
+        MenuTextBrush     = $theme.BodyText
+        MenuMutedBrush    = $theme.MutedText
+        MenuAccentBrush   = $theme.Accent
+        MenuBorderBrush   = $theme.HeaderDivider
+        MenuHoverBrush    = $theme.BadgeBg
+        MenuSelectedBrush = $theme.HoverBg
+    }
+    foreach ($entry in $colors.GetEnumerator()) {
+        if ($entry.Value) { $contextMenu.Resources[$entry.Key] = $BrushConv.ConvertFromString([string]$entry.Value) }
+    }
+    $quickColor = $ColorConv.ConvertFromString([string]$theme.Accent)
+    $quickColor.A = 15
+    $contextMenu.Resources['MenuQuickBrush'] = [System.Windows.Media.SolidColorBrush]::new($quickColor)
+    if ($theme.ShadowColor) {
+        $shadowColor = $ColorConv.ConvertFromString([string]$theme.ShadowColor)
+        $shadowColor.A = 255
+        $contextMenu.Resources['MenuShadowColor'] = $shadowColor
+    }
+}
+
 function Build-ContextMenu {
     $cm = [System.Windows.Markup.XamlReader]::Parse($MenuXaml)
+    Set-AgentPetContextMenuTheme $cm
 
     # 1. Character Switcher
     $miCharHeader = New-Object System.Windows.Controls.MenuItem
-    $miCharHeader.Header = "切换角色形象"
-    $miCharHeader.FontWeight = "SemiBold"
+    $miCharHeader.Header = "切换角色"
+    $miCharHeader.FontWeight = "Normal"
     $miCharHeader.Tag = "CharacterSubMenu"
 
     foreach ($c in $script:CharacterRoster) {
@@ -4356,16 +4714,16 @@ function Build-ContextMenu {
 
     # 2. Set Character Pose Sub-Menu (设置角色形态)
     $miPoseHeader = New-Object System.Windows.Controls.MenuItem
-    $miPoseHeader.Header = "设置角色动作形态"
-    $miPoseHeader.FontWeight = "SemiBold"
+    $miPoseHeader.Header = "动作形态"
+    $miPoseHeader.FontWeight = "Normal"
 
     $poses = @(
-        @{ Key = "auto";  Label = "✦ 自动跟随 (根据状态自动切换)" },
-        @{ Key = "idle";  Label = "待机形态 (标准立绘)" },
-        @{ Key = "think"; Label = "思考形态 (托腮沉思)" },
-        @{ Key = "work";  Label = "工作形态 (认真干活)" },
-        @{ Key = "sleep"; Label = "打盹形态 (呼呼大睡)" },
-        @{ Key = "happy"; Label = "欢喜形态 (开怀笑颜)" }
+        @{ Key = "auto";  Label = "自动跟随" },
+        @{ Key = "idle";  Label = "待机" },
+        @{ Key = "think"; Label = "思考" },
+        @{ Key = "work";  Label = "工作" },
+        @{ Key = "sleep"; Label = "瞌睡" },
+        @{ Key = "happy"; Label = "开心" }
     )
 
     $currentPose = if ($Config.Pose) { [string]$Config.Pose } else { "auto" }
@@ -4398,25 +4756,23 @@ function Build-ContextMenu {
             Build-ContextMenu
         })
         [void]$miPoseHeader.Items.Add($pItem)
+        if ($p.Key -eq "auto") { [void]$miPoseHeader.Items.Add((New-Object System.Windows.Controls.Separator)) }
     }
     [void]$cm.Items.Add($miPoseHeader)
+    [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
     # 2. Quick Actions
     $miShowQuota = New-Object System.Windows.Controls.MenuItem
     $miShowQuota.Header = "查看并刷新 Codex 额度"
     $miShowQuota.Add_Click({
-        Set-ActiveBubblePanel "quota"
-        Request-QuotaRefresh
-        Show-Bubble 14.0
+        Start-UserBubbleInspection "quota"
     })
     [void]$cm.Items.Add($miShowQuota)
 
     $miShowDeepSeek = New-Object System.Windows.Controls.MenuItem
     $miShowDeepSeek.Header = "查看并刷新 DeepSeek 余额"
     $miShowDeepSeek.Add_Click({
-        Set-ActiveBubblePanel "deepseek"
-        Request-BalanceRefresh
-        Show-Bubble 14.0
+        Start-UserBubbleInspection "deepseek"
     })
     [void]$cm.Items.Add($miShowDeepSeek)
 
@@ -4434,6 +4790,8 @@ function Build-ContextMenu {
     # 2.5 Bubble Default Mode Submenu
     $miBubbleDefault = New-Object System.Windows.Controls.MenuItem
     $miBubbleDefault.Header = "气泡默认偏好"
+    $miBubbleDefault.Tag = "BubbleDefaultMenu"
+    $miBubbleDefault.Visibility = if ($script:NotifyIcon) { 'Collapsed' } else { 'Visible' }
     foreach ($mOpt in @(
         @{ Key="quota"; Label="Codex 剩余额度" },
         @{ Key="deepseek"; Label="DeepSeek 官方余额" },
@@ -4467,6 +4825,10 @@ function Build-ContextMenu {
 
     [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
+    $miAppearance = New-Object System.Windows.Controls.MenuItem
+    $miAppearance.Header = "外观"
+    [void]$cm.Items.Add($miAppearance)
+
     # 3. Interactive Scale Slider Row + Presets
     $miScale = New-Object System.Windows.Controls.MenuItem
     $miScale.Header = "立绘缩放比例 ($([int][Math]::Round($Config.Scale * 100))%)"
@@ -4493,16 +4855,23 @@ function Build-ContextMenu {
         param($sender, $e)
         $v = [Math]::Round($sender.Value, 2)
         $Config.Scale = $v
+        $script:sliderConfigDirty = $true
         if ($sender.Tag) {
             $sender.Tag.ValTxt.Text = "$([int][Math]::Round($v * 100))%"
             $sender.Tag.MenuItem.Header = "立绘缩放比例 ($([int][Math]::Round($v * 100))%)"
+            foreach ($preset in $sender.Tag.MenuItem.Items) {
+                if ($preset -is [System.Windows.Controls.MenuItem] -and $preset.IsCheckable) {
+                    $preset.IsChecked = ([Math]::Abs($v - [double]$preset.Tag) -lt 0.03)
+                }
+            }
         }
         Update-Scale
         Update-BubbleScale
         Update-Facing
     })
-    $scaleSlider.Add_PreviewMouseLeftButtonUp({ Save-Config })
-    $scaleSlider.Add_LostMouseCapture({ Save-Config })
+    $scaleSlider.Add_PreviewMouseLeftButtonUp({ Save-PendingSliderConfig })
+    $scaleSlider.Add_LostMouseCapture({ Save-PendingSliderConfig })
+    $scaleSlider.Add_LostKeyboardFocus({ Save-PendingSliderConfig })
 
     [void]$scalePanel.Children.Add($scaleSlider)
     [void]$scalePanel.Children.Add($scaleValTxt)
@@ -4528,7 +4897,7 @@ function Build-ContextMenu {
         })
         [void]$miScale.Items.Add($spItem)
     }
-    [void]$cm.Items.Add($miScale)
+    [void]$miAppearance.Items.Add($miScale)
 
     # 4b. Bubble Scale Sub-Menu (气泡缩放 [0.8, 1.3])
     $currBS = if ($Config.BubbleScale) { [double]$Config.BubbleScale } else { 1.0 }
@@ -4557,7 +4926,7 @@ function Build-ContextMenu {
         })
         [void]$miBubbleScale.Items.Add($bItem)
     }
-    [void]$cm.Items.Add($miBubbleScale)
+    [void]$miAppearance.Items.Add($miBubbleScale)
 
 
     # 5. Bubble Font Size Sub-Menu (气泡字体大小适配)
@@ -4586,11 +4955,11 @@ function Build-ContextMenu {
         })
         [void]$miFont.Items.Add($fItem)
     }
-    [void]$cm.Items.Add($miFont)
+    [void]$miAppearance.Items.Add($miFont)
 
     # 5. Sound & Volume Slider
     $miSound = New-Object System.Windows.Controls.MenuItem
-    $miSound.Header = "Q 弹音效与音量"
+    $miSound.Header = "音效与音量"
 
     $miSoundToggle = New-Object System.Windows.Controls.MenuItem
     $miSoundToggle.Header = "启用点击语音音效"
@@ -4626,10 +4995,12 @@ function Build-ContextMenu {
         param($sender, $e)
         $v = [int][Math]::Round($sender.Value)
         $Config.SoundVolume = $v
+        $script:sliderConfigDirty = $true
         if ($sender.Tag) { $sender.Tag.Text = "$([int][Math]::Round($v / 10))%" }
     })
-    $volSlider.Add_PreviewMouseLeftButtonUp({ Save-Config })
-    $volSlider.Add_LostMouseCapture({ Save-Config })
+    $volSlider.Add_PreviewMouseLeftButtonUp({ Save-PendingSliderConfig })
+    $volSlider.Add_LostMouseCapture({ Save-PendingSliderConfig })
+    $volSlider.Add_LostKeyboardFocus({ Save-PendingSliderConfig })
 
     [void]$volPanel.Children.Add($volSlider)
     [void]$volPanel.Children.Add($volTxt)
@@ -4637,11 +5008,10 @@ function Build-ContextMenu {
     $miVolSliderItem.Header = $volPanel
     $miVolSliderItem.StaysOpenOnClick = $true
     [void]$miSound.Items.Add($miVolSliderItem)
-    [void]$cm.Items.Add($miSound)
 
     # 6. Auto-Quotes (定时碎碎念)
     $miAutoQuote = New-Object System.Windows.Controls.MenuItem
-    $miAutoQuote.Header = "定时碎碎念 (自动冒泡)"
+    $miAutoQuote.Header = "定时碎碎念"
     $aqPresets = @(
         @{ Label = "关闭";      Val = 0 },
         @{ Label = "每 1 分钟"; Val = 1 },
@@ -4664,11 +5034,10 @@ function Build-ContextMenu {
         })
         [void]$miAutoQuote.Items.Add($aqItem)
     }
-    [void]$cm.Items.Add($miAutoQuote)
 
     # 7. Sleep Timeout
     $miSleep = New-Object System.Windows.Controls.MenuItem
-    $miSleep.Header = "空闲打盹时间"
+    $miSleep.Header = "打盹时间"
     $sleepPresets = @(
         @{ Label = "30 秒";    Val = 30 },
         @{ Label = "1 分钟";   Val = 60 },
@@ -4692,6 +5061,8 @@ function Build-ContextMenu {
         [void]$miSleep.Items.Add($sItem)
     }
     [void]$cm.Items.Add($miSleep)
+    [void]$cm.Items.Add($miAutoQuote)
+    [void]$cm.Items.Add($miSound)
 
     [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
@@ -4723,7 +5094,7 @@ function Build-ContextMenu {
     [void]$cm.Items.Add($miHoverDetail)
 
     $miTop = New-Object System.Windows.Controls.MenuItem
-    $miTop.Header = "窗口始终置顶"
+    $miTop.Header = "窗口置顶"
     $miTop.IsCheckable = $true
     $miTop.IsChecked = [bool]$Config.Topmost
     $miTop.Add_Click({
@@ -4735,14 +5106,25 @@ function Build-ContextMenu {
     [void]$cm.Items.Add($miTop)
 
     $cm.Add_Opened({
+        param($sender, $e)
+        Set-AgentPetContextMenuTheme $sender
+        foreach ($item in $sender.Items) {
+            if ($item.Tag -eq "BubbleDefaultMenu") {
+                $item.Visibility = if ($script:NotifyIcon) { 'Collapsed' } else { 'Visible' }
+                break
+            }
+        }
         if ($script:WpfHoverDetailMenuItem) {
             $script:WpfHoverDetailMenuItem.IsChecked = [bool]$Config.HoverDetailsEnabled
         }
         Sync-CharacterMenuChecks
     })
+    $cm.Add_Closed({ Save-PendingSliderConfig })
+
+    [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
     $miResetPos = New-Object System.Windows.Controls.MenuItem
-    $miResetPos.Header = "重置位置到屏幕右下角"
+    $miResetPos.Header = "重置位置到右下角"
     $miResetPos.Add_Click({
         $wa = [System.Windows.SystemParameters]::WorkArea
         $Window.Left = $wa.Right - $Window.Width - 28
@@ -4757,19 +5139,49 @@ function Build-ContextMenu {
     [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
     # 9. Version Info & Exit
-    $miAbout = New-Object System.Windows.Controls.MenuItem
-    $miAbout.Header = "AgentPet v$script:AppVersion"
-    $miAbout.IsEnabled = $false
-    [void]$cm.Items.Add($miAbout)
-
     $miExit = New-Object System.Windows.Controls.MenuItem
     $miExit.Header = "退出 AgentPet"
-    $miExit.Foreground = $BrushConv.ConvertFromString("#FFD9383A")
-    $miExit.FontWeight = "SemiBold"
+    $miExit.Tag = "AgentPet v$script:AppVersion"
+    $miExit.Style = $cm.Resources['ExitMenuItemStyle']
     $miExit.Add_Click({
         $Window.Close()
     })
     [void]$cm.Items.Add($miExit)
+
+    # Root icons use the same 20-unit coordinate space and stay aligned with the row text.
+    $rowIcons = @(
+        @{ Item = $miCharHeader; Data = 'M 10,2 A 3.2,3.2 0 1 1 9.99,2 M 3,17 C 3,10 17,10 17,17' }
+        @{ Item = $miPoseHeader; Data = 'M 8,2 Q 9,7 14,8 Q 9,9 8,14 Q 7,9 2,8 Q 7,7 8,2 M 15,11 V 17 M 12,14 H 18' }
+        @{ Item = $miShowQuota; Data = 'M 3,15 A 8,8 0 1 1 17,15 H 3 M 9,12 L 13,8' }
+        @{ Item = $miShowDeepSeek; Data = 'M 16,6 H 4 Q 2,6 2,8 V 15 Q 2,17 4,17 H 16 Q 18,17 18,15 V 8 Q 18,6 16,6 M 3,6 L 14,3 Q 16,3 16,6 M 18,10 H 13 A 1.5,1.5 0 0 0 13,13 H 18' }
+        @{ Item = $miSayQuote; Data = 'M 5,14 L 3,17 V 12 A 7,7 0 1 1 9,16 Q 7,16 5,14 Z M 6,9 H 14 M 6,12 H 11' }
+        @{ Item = $miBubbleDefault; Data = 'M 5,15 L 3,17 V 12 A 7,7 0 1 1 9,16 Q 7,16 5,15 Z M 6,9 H 13 M 8,7 V 11' }
+        @{ Item = $miAppearance; Data = 'M 11,2 A 8,8 0 1 0 10,18 H 11 Q 13,18 12,16 Q 10,13 14,13 H 16 Q 18,13 18,10 A 8,8 0 0 0 11,2 Z M 6,9 H 6.2 M 8,6 H 8.2 M 12,6 H 12.2 M 15,8 H 15.2' }
+        @{ Item = $miSleep; Data = 'M 10,2 A 8,8 0 1 0 18,12 A 7,7 0 0 1 10,2 Z' }
+        @{ Item = $miAutoQuote; Data = 'M 4,3 H 16 Q 18,3 18,5 V 12 Q 18,14 16,14 H 8 L 3,18 V 5 Q 3,3 4,3 Z M 6,7 H 14 M 6,10 H 12' }
+        @{ Item = $miSound; Data = 'M 3,7 H 6 L 10,4 V 16 L 6,13 H 3 Z M 13,7 Q 16,10 13,13 M 15,4 Q 20,10 15,16' }
+        @{ Item = $miBroadcast; Data = 'M 4,14 H 16 Q 14,12 14,8 A 4,4 0 0 0 6,8 Q 6,12 4,14 Z M 8,17 Q 10,19 12,17' }
+        @{ Item = $miHoverDetail; Data = 'M 3,4 H 17 V 16 H 3 Z M 3,8 H 17 M 6,6 H 6.2' }
+        @{ Item = $miTop; Data = 'M 8,3 H 14 L 13,9 L 16,12 H 5 L 8,9 Z M 10,12 V 18' }
+        @{ Item = $miResetPos; Data = 'M 4,4 L 15,15 M 8,15 H 15 V 8' }
+    )
+    foreach ($row in $rowIcons) {
+        $icon = New-Object System.Windows.Shapes.Path
+        $icon.Data = [System.Windows.Media.Geometry]::Parse($row.Data)
+        $icon.Width = 15
+        $icon.Height = 15
+        $icon.Stretch = 'Uniform'
+        $icon.StrokeThickness = 1.25
+        $icon.StrokeStartLineCap = 'Round'
+        $icon.StrokeEndLineCap = 'Round'
+        $icon.StrokeLineJoin = 'Round'
+        $icon.SetResourceReference([System.Windows.Shapes.Shape]::StrokeProperty, 'MenuMutedBrush')
+        $row.Item.Icon = $icon
+        $row.Item.MinHeight = 32
+    }
+    foreach ($item in @($miShowQuota, $miShowDeepSeek, $miSayQuote)) {
+        $item.SetResourceReference([System.Windows.Controls.Control]::BackgroundProperty, 'MenuQuickBrush')
+    }
 
     $Window.ContextMenu = $cm
 }
@@ -4847,6 +5259,7 @@ $PetImage.Add_MouseLeftButtonUp({
         Save-Config
         Update-Facing
     } else {
+        Stop-UserBubbleInspection
         Trigger-PetBounce
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(1.8)
@@ -4904,6 +5317,11 @@ $Bubble.Add_MouseLeftButtonUp({
         "quota"
     }
 
+    if ($script:userInspectPanel -and $nextMode -in @("quota", "deepseek")) {
+        Start-UserBubbleInspection $nextMode
+        $e.Handled = $true
+        return
+    }
     if ($nextMode -eq "quote") {
         $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
     } elseif ($nextMode -eq "deepseek") {
@@ -4921,7 +5339,7 @@ if ($RefreshDeepSeekBtn) {
     $RefreshDeepSeekBtn.Add_Click({
         param($s, $e)
         $e.Handled = $true
-        Request-BalanceRefresh
+        Start-UserBubbleInspection "deepseek"
     })
 }
 if ($DeepSeekPricingLink) {
@@ -4935,7 +5353,7 @@ if ($RefreshQuotaBtn) {
     $RefreshQuotaBtn.Add_Click({
         param($s, $e)
         $e.Handled = $true
-        Request-QuotaRefresh
+        Start-UserBubbleInspection "quota"
     })
 }
 
@@ -5069,7 +5487,16 @@ function Apply-AgentStatus($stObj) {
         $script:LastDetailContentKey = $null
         $script:LastDetailMetaKey = $null
         Close-HoverDetailCard
-        if ($script:agentBusy) { $script:agentBusy = $false; $script:lastAgentState = $null; $script:waitingLastAlert = $null; Set-PetSprite "idle"; Set-ActiveBubblePanel $Config.BubbleMode; Hide-Bubble }
+        if ($script:agentBusy) {
+            $script:agentBusy = $false
+            $script:lastAgentState = $null
+            $script:waitingLastAlert = $null
+            Set-PetSprite "idle"
+            if (-not $script:userInspectPanel) {
+                Set-ActiveBubblePanel $Config.BubbleMode
+                Hide-Bubble
+            }
+        }
         return
     }
     $state = [string]$stObj.state
@@ -5085,8 +5512,10 @@ function Apply-AgentStatus($stObj) {
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
-            Set-ActiveBubblePanel $Config.BubbleMode
-            Hide-Bubble
+            if (-not $script:userInspectPanel) {
+                Set-ActiveBubblePanel $Config.BubbleMode
+                Hide-Bubble
+            }
         }
         return
     }
@@ -5109,8 +5538,10 @@ function Apply-AgentStatus($stObj) {
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
-            Set-ActiveBubblePanel $Config.BubbleMode
-            Hide-Bubble
+            if (-not $script:userInspectPanel) {
+                Set-ActiveBubblePanel $Config.BubbleMode
+                Hide-Bubble
+            }
         }
         return
     }
@@ -5217,7 +5648,7 @@ function Apply-AgentStatus($stObj) {
     $isUserInspecting = ($script:userInspectUntil -and $now -lt $script:userInspectUntil)
     $isWaiting = ($state -eq "waiting" -or $state -eq "approval")
     Set-WaitingWindowAttention $isWaiting
-    if ($isWaiting) { $script:userInspectUntil = [DateTime]::MinValue; $isUserInspecting = $false }
+    if ($isWaiting) { Stop-UserBubbleInspection; $isUserInspecting = $false }
 
     if ((-not $script:manualBubbleHidden -and (-not $isUserInspecting)) -or $isWaiting) {
         Set-ActiveBubblePanel "work"
@@ -5500,6 +5931,9 @@ $Timer.Add_Tick({
         }
     }
 
+    # Renew inspection before status updates can choose the work panel.
+    Update-UserBubbleInspection $now ([bool]$Bubble.IsMouseOver)
+
     # 0.5 Safety revert for balance refresh notice (AP05: report timeout honestly, never "已是最新")
     if (Get-Command Update-BalanceRefreshTimeout -ErrorAction SilentlyContinue) {
         Update-BalanceRefreshTimeout $now
@@ -5536,14 +5970,16 @@ $Timer.Add_Tick({
                 $script:waitingLastAlert = $null
                 $script:lastInteractTime = [DateTime]::UtcNow
                 Set-PetSprite "idle"
-                Set-ActiveBubblePanel $Config.BubbleMode
-                Hide-Bubble
+                if (-not $script:userInspectPanel) {
+                    Set-ActiveBubblePanel $Config.BubbleMode
+                    Hide-Bubble
+                }
             }
         }
     }
 
     # 2. Keep bubble open while user is hovering over it
-    if ($script:isBubbleOpen -and (-not $script:agentBusy)) {
+    if ($script:isBubbleOpen -and (-not $script:agentBusy) -and (-not $script:userInspectPanel)) {
         if ($Bubble.IsMouseOver) {
             $script:bubbleCloseTime = $now.AddSeconds(2.8)
         } elseif ($now -ge $script:bubbleCloseTime) {
@@ -5658,6 +6094,7 @@ $Window.Add_ContentRendered({
 })
 
 $Window.Add_Closed({
+    Save-PendingSliderConfig
     try { $Timer.Stop() } catch {}
     try { Close-HoverDetailCard -Dispose } catch {}
     try {

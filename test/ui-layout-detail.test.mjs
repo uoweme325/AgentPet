@@ -1004,7 +1004,430 @@ try {
         hiddenAfterSync       = $hiddenAfterSync
     }
 
+    # Case 20: open the real rounded templates, including a submenu with a live slider.
+    [void][AgentPetNative]::ShowWindow($mainHwnd, [AgentPetNative]::SW_SHOWNOACTIVATE)
+    $script:trayWindowHidden = $false
+    $Config.Pose = 'happy'
+    Initialize-TrayIcon
+    if (-not $script:NotifyIcon) { throw 'Case 20 requires the real tray icon to be initialized' }
+    $menuThemes = @()
+    foreach ($ch in @('claude','dragon','gemini','deepseek','zcode')) {
+        $Config.Character = $ch
+        Update-Theme
+        Build-ContextMenu
+        $theme = Get-CurrentTheme
+        $trayRenderer = $script:TrayMenu.Renderer
+        $menuThemes += [ordered]@{
+            character = $ch
+            expected = [string]$theme.BubbleBg
+            wpf = [string]$Window.ContextMenu.Resources['MenuSurfaceBrush']
+            tray = ('#{0:X8}' -f $trayRenderer.Surface.ToArgb())
+            expectedHover = [string]$theme.BadgeBg
+            expectedChecked = [string]$theme.HoverBg
+            wpfHover = [string]$Window.ContextMenu.Resources['MenuHoverBrush']
+            wpfChecked = [string]$Window.ContextMenu.Resources['MenuSelectedBrush']
+            trayHover = ('#{0:X8}' -f $trayRenderer.HoverFill.ToArgb())
+            trayChecked = ('#{0:X8}' -f $trayRenderer.CheckedFill.ToArgb())
+        }
+    }
+
+    # Sample the real tray renderer away from the text and checkmark without opening a popup.
+    $sampleMenu = [System.Windows.Forms.ContextMenuStrip]::new()
+    try {
+        $sampleItem = [System.Windows.Forms.ToolStripMenuItem]::new('sample')
+        [void]$sampleMenu.Items.Add($sampleItem)
+        $sampleMenu.Size = $sampleMenu.GetPreferredSize([System.Drawing.Size]::Empty)
+        $sampleMenu.PerformLayout()
+        $sampleItem.Select()
+        if (-not $sampleItem.Selected) { throw 'The tray rendering sample must be selected to test hover fill' }
+        $bitmap = [System.Drawing.Bitmap]::new($sampleItem.Width, $sampleItem.Height)
+        $graphics = [System.Drawing.Graphics]::FromImage($bitmap)
+        try {
+            $renderArgs = [System.Windows.Forms.ToolStripItemRenderEventArgs]::new($graphics, $sampleItem)
+            $trayHoverPixels = @(foreach ($checked in @($false, $true)) {
+                $sampleItem.Checked = $checked
+                $graphics.Clear([System.Drawing.Color]::Transparent)
+                $trayRenderer.DrawMenuItemBackground($renderArgs)
+                '#{0:X8}' -f $bitmap.GetPixel(10, [int]($sampleItem.Height / 2)).ToArgb()
+            })
+        } finally {
+            $graphics.Dispose()
+            $bitmap.Dispose()
+        }
+    } finally {
+        $sampleMenu.Dispose()
+    }
+    $menu = $Window.ContextMenu
+    $menu.PlacementTarget = $Window
+    $menu.IsOpen = $true
+    Pump-Wpf
+    $menu.ApplyTemplate() | Out-Null
+    $menuChrome = $menu.Template.FindName('RootMenuChrome', $menu)
+    $visibleMenuRows = @($menu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] -and $_.Visibility -eq 'Visible' })
+    $exitRow = $visibleMenuRows[-1]
+    $exitRow.ApplyTemplate() | Out-Null
+    $exitHitArea = $exitRow.Template.FindName('ExitHitArea', $exitRow)
+    $versionLabel = $exitRow.Template.FindName('VersionLabel', $exitRow)
+    $exitStart = $exitHitArea.TranslatePoint([System.Windows.Point]::new(0, $exitHitArea.ActualHeight / 2), $menuChrome)
+    $exitEnd = $exitHitArea.TranslatePoint([System.Windows.Point]::new($exitHitArea.ActualWidth, $exitHitArea.ActualHeight / 2), $menuChrome)
+    $versionStart = $versionLabel.TranslatePoint([System.Windows.Point]::new(0, $versionLabel.ActualHeight / 2), $menuChrome)
+    $versionEnd = $versionLabel.TranslatePoint([System.Windows.Point]::new($versionLabel.ActualWidth, $versionLabel.ActualHeight / 2), $menuChrome)
+    $exitPoint = $exitHitArea.TranslatePoint([System.Windows.Point]::new(4, $exitHitArea.ActualHeight / 2), $menu)
+    $versionPoint = $versionLabel.TranslatePoint([System.Windows.Point]::new($versionLabel.ActualWidth / 2, $versionLabel.ActualHeight / 2), $menu)
+    $gapPoint = $menuChrome.TranslatePoint([System.Windows.Point]::new(($exitEnd.X + $versionStart.X) / 2, $exitStart.Y), $menu)
+    $rightPaddingPoint = $exitRow.TranslatePoint([System.Windows.Point]::new($exitRow.ActualWidth - 3, $exitRow.ActualHeight / 2), $menu)
+    $footerHits = @(
+        foreach ($point in @($exitPoint, $versionPoint, $gapPoint, $rightPaddingPoint)) {
+            $hit = $menu.InputHitTest($point)
+            while ($hit -is [System.Windows.Media.Visual] -and $hit -ne $exitRow) {
+                $hit = [System.Windows.Media.VisualTreeHelper]::GetParent($hit)
+            }
+            $hit -eq $exitRow
+        }
+    )
+    $footer = [ordered]@{
+        exitLabel = [string]$exitRow.Header
+        versionText = [string]$versionLabel.Text
+        expectedVersion = "AgentPet v$script:AppVersion"
+        aligned = ($exitStart.X -ge 0 -and $exitStart.X -le 16 -and $exitEnd.X -le $versionStart.X -and
+            [Math]::Abs($exitStart.Y - $versionStart.Y) -le 1 -and
+            ($menuChrome.ActualWidth - $versionEnd.X) -ge 0 -and ($menuChrome.ActualWidth - $versionEnd.X) -le 24)
+        hits = $footerHits
+    }
+    $poseMenu = $menu.Items[1]
+    $poseMenu.ApplyTemplate() | Out-Null
+    $poseMenu.IsSubmenuOpen = $true
+    Pump-Wpf
+    $poseRows = @($poseMenu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] })
+    foreach ($row in $poseRows) { $row.ApplyTemplate() | Out-Null }
+    $popup = $poseMenu.Template.FindName('PART_Popup', $poseMenu)
+    $submenuChrome = $poseMenu.Template.FindName('SubmenuChrome', $poseMenu)
+    $checkedRows = @($poseRows | Where-Object {$_.Template.FindName('SelectionCheck', $_).Visibility -eq 'Visible'} | ForEach-Object {[string]$_.Tag})
+    $selectedChrome = $poseRows[-1].Template.FindName('ItemChrome', $poseRows[-1])
+    $roundedMenu = [ordered]@{
+        themes = $menuThemes
+        trayHoverPixels = $trayHoverPixels
+        rootRadius = $menuChrome.CornerRadius.TopLeft
+        subRadius = $submenuChrome.CornerRadius.TopLeft
+        submenuVisible = ($popup.IsOpen -and $submenuChrome.IsVisible)
+        subSurface = [string]$submenuChrome.Background
+        labels = @($poseRows | ForEach-Object {[string]$_.Header})
+        checks = $checkedRows
+        separatorAfterAuto = ($poseMenu.Items[1] -is [System.Windows.Controls.Separator])
+        selectedFill = [string]$selectedChrome.Background
+        expectedSelectedFill = [string]$menu.Resources['MenuSelectedBrush']
+        defaultRowHeight = $poseRows[1].MinHeight
+        rowFont = [string]$poseRows[1].FontWeight
+        arrow = [string]$poseMenu.Template.FindName('SubmenuChevron', $poseMenu).Visibility
+        traySubmenuThemed = [object]::ReferenceEquals($script:TrayMenu.Renderer, $script:TrayMenu.Tag.Roles.DropDown.Renderer)
+        trayHasNativeGutter = ($script:TrayMenu.ShowCheckMargin -or $script:TrayMenu.ShowImageMargin)
+        rootLabels = @($visibleMenuRows | Select-Object -SkipLast 1 | ForEach-Object { [string]$_.Header })
+        rootRowHeight = $visibleMenuRows[0].MinHeight
+        footer = $footer
+    }
+    $poseMenu.IsSubmenuOpen = $false
+    $appearanceMenu = $visibleMenuRows | Where-Object { $_.Header -eq '外观' }
+    $roundedMenu.appearanceLabels = @($appearanceMenu.Items | ForEach-Object { [string]$_.Header })
+    $appearanceMenu.IsSubmenuOpen = $true
+    Pump-Wpf
+    $scaleMenu = $appearanceMenu.Items | Where-Object { $_.Header -like '立绘缩放比例*' } | Select-Object -First 1
+    $scaleMenu.IsSubmenuOpen = $true
+    Pump-Wpf
+    $sliderRow = $scaleMenu.Items[0]
+    $sliderRow.ApplyTemplate() | Out-Null
+    $slider = $sliderRow.Header.Children[0]
+    $roundedMenu.sliderVisible = [bool]$slider.IsVisible
+    $roundedMenu.sliderStaysOpen = [bool]$sliderRow.StaysOpenOnClick
+    $slider.Value = 1.15
+    $roundedMenu.sliderChanged = ([Math]::Abs([double]$Config.Scale - 1.15) -lt 0.001)
+    $scaleMenu.IsSubmenuOpen = $false
+    $appearanceMenu.IsSubmenuOpen = $false
+    $menu.IsOpen = $false
+
+    # WinForms preferred popup width must contain item rows and the custom right-side check.
+    $trayMenus = @($script:TrayMenu)
+    for ($index = 0; $index -lt $trayMenus.Count; $index++) {
+        $strip = $trayMenus[$index]
+        $size = $strip.GetPreferredSize([System.Drawing.Size]::Empty)
+        $strip.Size = $size
+        $strip.PerformLayout()
+        foreach ($item in $strip.Items) {
+            if ($item -isnot [System.Windows.Forms.ToolStripMenuItem]) { continue }
+            if ($item.Bounds.Right -gt $strip.ClientSize.Width) {
+                throw "Tray menu item outside viewport: $($item.Text)"
+            }
+            if ($item.HasDropDownItems) { $trayMenus += $item.DropDown }
+        }
+    }
+    $roundedMenu.trayMenuCount = $trayMenus.Count
+
+    $trayToggle = $script:TrayMenu.Tag.TrayEnabled
+    $trayToggle.Checked = $true
+    $trayToggle.PerformClick()
+    $Window.ContextMenu.PlacementTarget = $Window
+    $Window.ContextMenu.IsOpen = $true
+    Pump-Wpf
+    $fallback = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '气泡默认偏好' }
+    $roundedMenu.bubbleDefaultWithoutTray = [string]$fallback.Visibility
+    $Window.ContextMenu.IsOpen = $false
+
+    # Case 21: manual quota requests keep their panel through updates and expire after reading.
+    Set-HoverDetailsEnabled $false
+    $Config.TrayEnabled = $true
+    Initialize-TrayIcon
+    Build-ContextMenu
+    function global:Request-QuotaRefresh {
+        $script:refreshingUntil = [DateTime]::UtcNow.AddSeconds(14)
+    }
+    function global:Request-BalanceRefresh([switch]$Silent) {
+        $script:balanceRequestTimeout = [DateTime]::UtcNow.AddSeconds(15)
+        $script:balanceRequestStartedMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    }
+    $manualInspection = [ordered]@{ entries = @(); lifecycle = @(); transitions = @() }
+    $defaultModeBeforeInspection = [string]$Config.BubbleMode
+    $trayBubble = $script:TrayMenu.Items | Where-Object { $_.Text -eq '气泡看板' }
+    $trayCredentials = $script:TrayMenu.Items | Where-Object { $_.Text -eq 'DeepSeek 凭据管理' }
+    $entryCases = @(
+        @{ Name = 'wpf-quota'; Mode = 'quota'; Item = ($Window.ContextMenu.Items | Where-Object { $_.Header -eq '查看并刷新 Codex 额度' }) },
+        @{ Name = 'wpf-deepseek'; Mode = 'deepseek'; Item = ($Window.ContextMenu.Items | Where-Object { $_.Header -eq '查看并刷新 DeepSeek 余额' }) },
+        @{ Name = 'tray-quota'; Mode = 'quota'; Item = ($trayBubble.DropDownItems | Where-Object { $_.Text -eq 'Codex 额度' }) },
+        @{ Name = 'tray-deepseek'; Mode = 'deepseek'; Item = ($trayBubble.DropDownItems | Where-Object { $_.Text -eq 'DeepSeek 余额' }) },
+        @{ Name = 'tray-refresh'; Mode = 'deepseek'; Item = ($trayCredentials.DropDownItems | Where-Object { $_.Text -eq '立即刷新 DeepSeek 余额' }) },
+        @{ Name = 'button-quota'; Mode = 'quota'; Item = $RefreshQuotaBtn },
+        @{ Name = 'button-deepseek'; Mode = 'deepseek'; Item = $RefreshDeepSeekBtn }
+    )
+    foreach ($entry in $entryCases) {
+        Stop-UserBubbleInspection
+        Set-WorkPayload -source 'Codex' -task 'checking a manual query'
+        $script:manualBubbleHidden = $true
+        if ($entry.Item -is [System.Windows.Forms.ToolStripMenuItem]) {
+            $entry.Item.PerformClick()
+        } elseif ($entry.Item -is [System.Windows.Controls.MenuItem]) {
+            $entry.Item.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } else {
+            $entry.Item.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent))
+        }
+        $afterClick = [string]$script:currentBubblePanel
+        Set-WorkPayload -source 'Codex' -task 'working update during query'
+        $manualInspection.entries += [ordered]@{
+            name = $entry.Name; expected = $entry.Mode; afterClick = $afterClick
+            afterStatus = [string]$script:currentBubblePanel
+            active = [string]$script:userInspectPanel
+            hidden = [bool]$script:manualBubbleHidden
+        }
+    }
+    foreach ($mode in @('quota', 'deepseek')) {
+        Stop-UserBubbleInspection
+        Set-WorkPayload -source 'Codex' -task 'reading a manual query'
+        Start-UserBubbleInspection $mode
+        $inspectionNow = [DateTime]::UtcNow
+        Update-UserBubbleInspection $inspectionNow $false
+        $pendingProtected = ($script:currentBubblePanel -eq $mode)
+        if ($mode -eq 'quota') {
+            $script:refreshingUntil = [DateTime]::MinValue
+        } else {
+            $attemptMs = $script:balanceRequestStartedMs
+            Receive-BalanceSnapshot ([pscustomobject]@{ status = 'loading'; lastAttemptAt = $attemptMs })
+            Update-UserBubbleInspection $inspectionNow $false
+            if (-not $script:balanceRequestTimeout) { throw 'loading ended the active balance request' }
+            Receive-BalanceSnapshot ([pscustomobject]@{
+                status = 'ok'; lastAttemptAt = ($attemptMs - 1000); updatedAt = ($attemptMs - 1000)
+                balances = @([pscustomobject]@{currency = 'CNY'; totalBalance = '12.00'})
+            })
+            if (-not $script:balanceRequestTimeout) { throw 'old balance result ended the active request' }
+            Receive-BalanceSnapshot ([pscustomobject]@{
+                status = 'ok'; lastAttemptAt = $attemptMs; updatedAt = $attemptMs
+                balances = @([pscustomobject]@{currency = 'CNY'; totalBalance = '12.00'})
+            })
+        }
+        Update-UserBubbleInspection $inspectionNow $false
+        $readingSeconds = ($script:userInspectUntil - $inspectionNow).TotalSeconds
+        Update-UserBubbleInspection $inspectionNow.AddSeconds(20) $true
+        $hoverProtected = ($script:currentBubblePanel -eq $mode)
+        Update-UserBubbleInspection $inspectionNow.AddSeconds(21) $false
+        $leaveSeconds = ($script:userInspectUntil - $inspectionNow.AddSeconds(21)).TotalSeconds
+        Update-UserBubbleInspection $inspectionNow.AddSeconds(24) $false
+        $manualInspection.lifecycle += [ordered]@{
+            mode = $mode; pendingProtected = $pendingProtected; readingSeconds = $readingSeconds
+            hoverProtected = $hoverProtected; leaveSeconds = $leaveSeconds
+            afterExpiry = [string]$script:currentBubblePanel
+        }
+    }
+    foreach ($transition in @('idle', 'stale', 'pause', 'waiting', 'approval')) {
+        Stop-UserBubbleInspection
+        Set-WorkPayload -source 'Codex' -task 'starting a transition check'
+        Start-UserBubbleInspection 'quota'
+        switch ($transition) {
+            'idle' { Apply-AgentStatus ([pscustomobject]@{state = 'idle'}) }
+            'stale' { Apply-AgentStatus ([pscustomobject]@{state = 'working'; at = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 60000)}) }
+            'pause' {
+                $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000
+                Apply-AgentStatus ([pscustomobject]@{state = 'working'})
+                $Config.PauseMonitorUntil = 0
+            }
+            default { Set-WorkPayload -source 'Codex' -state $transition -task 'attention required' }
+        }
+        $manualInspection.transitions += [ordered]@{
+            state = $transition; panel = [string]$script:currentBubblePanel
+            active = [string]$script:userInspectPanel; open = [bool]$script:isBubbleOpen
+            busy = [bool]$script:agentBusy
+        }
+    }
+    $manualInspection.defaultUnchanged = ([string]$Config.BubbleMode -eq $defaultModeBeforeInspection)
+    Set-WorkPayload -source 'Codex' -task 'checking idle expiry'
+    Start-UserBubbleInspection 'quota'
+    $script:refreshingUntil = [DateTime]::MinValue
+    $idleReadingNow = [DateTime]::UtcNow
+    Update-UserBubbleInspection $idleReadingNow $false
+    Apply-AgentStatus ([pscustomobject]@{state = 'idle'})
+    Update-UserBubbleInspection $idleReadingNow.AddSeconds(6) $false
+    $manualInspection.idleExpired = (-not $script:isBubbleOpen -and -not $script:userInspectPanel)
+    Set-WorkPayload -source 'Codex' -task 'checking explicit choices'
+    Start-UserBubbleInspection 'quota'
+    Set-ActiveBubblePanel 'quote'
+    $manualInspection.panelChangeCancels = (-not $script:userInspectPanel)
+    Start-UserBubbleInspection 'quota'
+    Hide-Bubble
+    $manualInspection.hideCancels = (-not $script:userInspectPanel)
+    Set-WorkPayload -source 'Codex' -state 'waiting' -task 'waiting already active'
+    Start-UserBubbleInspection 'quota'
+    $manualInspection.existingWaitingWins = ($script:currentBubblePanel -eq 'work' -and -not $script:userInspectPanel)
+    Stop-UserBubbleInspection
+
+    # Case 22: secondary refreshes renew protection, and sliders commit keyboard changes.
+    $repositoryAst = [System.Management.Automation.Language.Parser]::ParseFile(${JSON.stringify(ps1Path)}, [ref]$tokens, [ref]$parseErrors)
+    $realBalanceRefresh = $repositoryAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Request-BalanceRefresh'
+    }, $true)
+    Set-Item Function:global:Request-BalanceRefresh -Value $realBalanceRefresh.Body.GetScriptBlock()
+    Set-WorkPayload -source 'Codex' -task 'checking a second request'
+    $script:userInspectPanel = 'deepseek'
+    $script:userInspectUntil = [DateTime]::UtcNow.AddSeconds(5)
+    Set-ActiveBubblePanel 'deepseek'
+    $previousReadingDeadline = $script:userInspectUntil
+    $script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-11)
+    $script:TrayMenu.Tag.DshEnable.Checked = $false
+    $script:TrayMenu.Tag.DshEnable.PerformClick()
+    $secondRequestTime = $previousReadingDeadline.AddSeconds(1)
+    Update-UserBubbleInspection $secondRequestTime $false
+    $renewedInspection = [ordered]@{
+        requestWritten = (Test-Path -LiteralPath $RefreshBalanceFlagPath)
+        requestStillPending = ($script:balanceRequestTimeout -gt $secondRequestTime)
+        deadlineSuspended = ($script:userInspectUntil -eq [DateTime]::MaxValue)
+    }
+    if ($script:agentBusy -and $secondRequestTime -ge $script:userInspectUntil) {
+        Set-ActiveBubblePanel 'work'
+    }
+    $renewedInspection.panelDuringRequest = [string]$script:currentBubblePanel
+    Receive-BalanceSnapshot ([pscustomobject]@{
+        status = 'ok'; lastAttemptAt = $script:balanceRequestStartedMs
+        balances = @([pscustomobject]@{currency = 'CNY'; totalBalance = '12.00'})
+    })
+    Update-UserBubbleInspection $secondRequestTime $false
+    $renewedInspection.readingSeconds = ($script:userInspectUntil - $secondRequestTime).TotalSeconds
+    Stop-UserBubbleInspection
+
+    $realSaveConfig = $repositoryAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Save-Config'
+    }, $true)
+    if ($BaseDir -eq 'D:\AgentPet') { throw 'Slider persistence must use the isolated configuration' }
+    Set-Item Function:global:Save-Config -Value $realSaveConfig.Body.GetScriptBlock()
+    function Send-AttachedMenuKey($target, [System.Windows.Input.Key]$key) {
+        $inputSource = [System.Windows.PresentationSource]::FromVisual($target)
+        if (-not $inputSource) { throw 'Keyboard event target is detached from its popup' }
+        $keyEventArgs = [System.Windows.Input.KeyEventArgs]::new([System.Windows.Input.Keyboard]::PrimaryDevice,
+            $inputSource, 0, $key)
+        $keyEventArgs.RoutedEvent = [System.Windows.Input.Keyboard]::KeyDownEvent
+        $target.RaiseEvent($keyEventArgs)
+        Pump-Wpf
+    }
+    $sliderPersistence = @()
+    foreach ($scenario in @('keyboard-event', 'unfocused-value')) {
+      foreach ($kind in @('scale', 'volume')) {
+        $Config.Scale = 1.0
+        $Config.SoundVolume = 500
+        Save-Config
+        Build-ContextMenu
+        $cm = $Window.ContextMenu
+        $cm.PlacementTarget = $Window
+        $cm.IsOpen = $true
+        Pump-Wpf
+        if ($kind -eq 'scale') {
+            $category = $cm.Items | Where-Object { $_.Header -eq '外观' }
+            $category.IsSubmenuOpen = $true
+            Pump-Wpf
+            $sliderMenu = $category.Items[0]
+            $sliderIndex = 0
+        } else {
+            $sliderMenu = $cm.Items | Where-Object { $_.Header -eq '音效与音量' }
+            $sliderIndex = 1
+        }
+        $sliderMenu.IsSubmenuOpen = $true
+        Pump-Wpf
+        $keyboardSlider = $sliderMenu.Items[$sliderIndex].Header.Children[0]
+        $beforeKey = $keyboardSlider.Value
+        if ($scenario -eq 'keyboard-event') {
+            # Exercise the real key handler using the visible popup's input source.
+            # Desktop activation and physical keyboard focus are separate acceptance checks.
+            Send-AttachedMenuKey $keyboardSlider ([System.Windows.Input.Key]::Right)
+        } else {
+            if ($keyboardSlider.IsKeyboardFocusWithin) { throw 'Unfocused save scenario requires an unfocused slider' }
+            $keyboardSlider.Value += $keyboardSlider.TickFrequency
+            Pump-Wpf
+        }
+        $afterKey = $keyboardSlider.Value
+        $closeSignal = @{ Observed = $false }
+        $closedHandler = [System.Windows.RoutedEventHandler]({ $closeSignal.Observed = $true }.GetNewClosure())
+        $cm.Add_Closed($closedHandler)
+        try {
+            $cm.IsOpen = $false
+            # Popup animations may defer Closed beyond the next dispatcher frame.
+            $closeDeadline = [DateTime]::UtcNow.AddSeconds(2)
+            while (-not $closeSignal.Observed -and [DateTime]::UtcNow -lt $closeDeadline) {
+                Pump-Wpf 20
+            }
+            if (-not $closeSignal.Observed) { throw 'Context menu did not raise Closed within two seconds' }
+        } finally {
+            $cm.Remove_Closed($closedHandler)
+        }
+        $diskConfig = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $sliderPersistence += [ordered]@{
+            kind = $kind; scenario = $scenario; changed = ($afterKey -gt $beforeKey); closed = (-not $cm.IsOpen)
+            expected = $afterKey
+            actual = if ($kind -eq 'scale') { $diskConfig.Scale } else { $diskConfig.SoundVolume }
+        }
+      }
+    }
+    Build-ContextMenu
+    $scalePresets = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '外观' }
+    $scalePresets = $scalePresets.Items[0]
+    $presetSlider = $scalePresets.Items[0].Header.Children[0]
+    $presetSlider.Value = 1.15
+    $checksAt115 = @($scalePresets.Items | Where-Object { $_.IsCheckable -and $_.IsChecked } | ForEach-Object { [string]$_.Header })
+    $presetSlider.Value = 1.10
+    $checksAt110 = @($scalePresets.Items | Where-Object { $_.IsCheckable -and $_.IsChecked } | ForEach-Object { [string]$_.Header })
+    Save-PendingSliderConfig
+
+    # The main harness omits startup/exit handlers. Register the production exit hook
+    # and change a slider in a closed menu to isolate the window-exit save fallback.
+    $closedHook = $repositoryAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member.Value -eq 'Add_Closed' -and $node.Expression.Extent.Text -eq '$Window'
+    }, $true)
+    if (-not $closedHook) { throw 'Production window exit hook was not found' }
+    . ([scriptblock]::Create($closedHook.Extent.Text))
+    $exitSoundMenu = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '音效与音量' }
+    $exitVolumeSlider = $exitSoundMenu.Items[1].Header.Children[0]
+    $exitVolumeSlider.Value += $exitVolumeSlider.TickFrequency
+    $windowExitPersistence = [ordered]@{
+        menuClosed = (-not $Window.ContextMenu.IsOpen)
+        dirtyBeforeExit = [bool]$script:sliderConfigDirty
+        expected = $exitVolumeSlider.Value
+    }
     $Window.Close()
+    $windowExitConfig = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $windowExitPersistence.actual = $windowExitConfig.SoundVolume
+    $windowExitPersistence.dirtyAfterExit = [bool]$script:sliderConfigDirty
 
     $out = [ordered]@{
         astErrorCount              = $astErrorCount
@@ -1061,6 +1484,13 @@ try {
         roleQuotesCheck     = $roleQuotesCheck
         menuCharSync        = $menuCharSync
         topmostLifecycle    = $topmostLifecycle
+        roundedMenu         = $roundedMenu
+        manualInspection    = $manualInspection
+        renewedInspection   = $renewedInspection
+        sliderPersistence   = $sliderPersistence
+        windowExitPersistence = $windowExitPersistence
+        checksAt115         = $checksAt115
+        checksAt110         = $checksAt110
     }
     Write-Output ('RESULT_JSON:' + ($out | ConvertTo-Json -Depth 6 -Compress))
 } finally {
@@ -1086,7 +1516,7 @@ try {
     const jsonLine = (res.stdout || '')
       .split(/\r?\n/)
       .find((line) => line.startsWith('RESULT_JSON:'));
-    assert.ok(jsonLine, `Missing RESULT_JSON line in stdout:\n${res.stdout}`);
+    assert.ok(jsonLine, `Missing RESULT_JSON line\nSTDOUT:\n${res.stdout}\nSTDERR:\n${res.stderr}`);
     const data = JSON.parse(jsonLine.slice('RESULT_JSON:'.length));
 
     // Assertions: static + bindings
@@ -1423,6 +1853,97 @@ try {
     assert.equal(tl.mainTopRestoredOff, false, 'Clearing waiting attention must restore main Topmost=false');
     assert.equal(tl.detailTopRestoredOff, false, 'Clearing waiting attention must restore DetailWindow Topmost=false');
     assert.equal(tl.hiddenAfterSync, true, 'Hidden window must stay hidden when Sync-AgentPetTopmost runs');
+
+    // Case 20: validate template rendering and behavior on the real menu controls.
+    const rm = data.roundedMenu;
+    assert.equal(rm.themes.length, 5);
+    assert.equal(new Set(rm.themes.map(theme => theme.expected)).size, 5);
+    for (const theme of rm.themes) {
+      assert.equal(theme.wpf, theme.expected, theme.character + ': WPF menu theme');
+      assert.equal(theme.tray, theme.expected, theme.character + ': tray menu theme');
+      assert.equal(theme.wpfHover, theme.expectedHover, theme.character + ': WPF hover fill');
+      assert.equal(theme.wpfChecked, theme.expectedChecked, theme.character + ': WPF checked fill');
+      assert.equal(theme.trayHover, theme.expectedHover, theme.character + ': tray hover fill');
+      assert.equal(theme.trayChecked, theme.expectedChecked, theme.character + ': tray checked fill');
+    }
+    assert.deepEqual(rm.trayHoverPixels, [rm.themes.at(-1).expectedHover, rm.themes.at(-1).expectedChecked],
+      'tray hover uses the checked fill only when the hovered row is checked');
+    assert.deepEqual(rm.labels, ['自动跟随', '待机', '思考', '工作', '瞌睡', '开心']);
+    assert.deepEqual(rm.checks, ['happy']);
+    assert.equal(rm.separatorAfterAuto, true);
+    assert.equal(rm.rootRadius, 12);
+    assert.equal(rm.subRadius, 12);
+    assert.equal(rm.submenuVisible, true);
+    assert.equal(rm.subSurface, rm.themes.at(-1).expected);
+    assert.equal(rm.selectedFill, rm.expectedSelectedFill);
+    assert.equal(rm.defaultRowHeight, 34);
+    assert.equal(rm.rowFont, 'Normal');
+    assert.equal(rm.arrow, 'Visible');
+    assert.equal(rm.traySubmenuThemed, true);
+    assert.equal(rm.trayHasNativeGutter, false);
+    assert.ok(rm.trayMenuCount > 1);
+    assert.deepEqual(rm.rootLabels, [
+      '切换角色', '动作形态', '查看并刷新 Codex 额度', '查看并刷新 DeepSeek 余额', '随机台词', '外观',
+      '打盹时间', '定时碎碎念', '音效与音量', '状态播报（播报中）', '悬停详情', '窗口置顶', '重置位置到右下角'
+    ]);
+    assert.equal(rm.rootRowHeight, 32);
+    assert.deepEqual(rm.appearanceLabels.map(label => label.split(' (')[0]), ['立绘缩放比例', '气泡缩放', '气泡字体大小']);
+    assert.equal(rm.bubbleDefaultWithoutTray, 'Visible', '气泡默认偏好 needs a desktop menu entry when the tray is disabled');
+    assert.equal(rm.footer.exitLabel, '退出 AgentPet');
+    assert.equal(rm.footer.versionText, rm.footer.expectedVersion);
+    assert.equal(rm.footer.aligned, true, 'exit and version should be aligned at the left and right of the footer');
+    assert.deepEqual(rm.footer.hits, [true, true, true, true], 'the exit label, version, gap and right padding must all hit the exit item');
+    assert.equal(rm.sliderVisible, true);
+    assert.equal(rm.sliderStaysOpen, true);
+    assert.equal(rm.sliderChanged, true);
+
+    // Case 21 covers real manual entry points, request ownership and reading lifetime.
+    const inspection = data.manualInspection;
+    assert.equal(inspection.entries.length, 7);
+    for (const entry of inspection.entries) {
+      assert.equal(entry.afterClick, entry.expected, entry.name + ': opens requested panel');
+      assert.equal(entry.afterStatus, entry.expected, entry.name + ': survives a work update');
+      assert.equal(entry.active, entry.expected, entry.name + ': activates reading protection');
+      assert.equal(entry.hidden, false, entry.name + ': clears manual hiding');
+    }
+    for (const reading of inspection.lifecycle) {
+      assert.equal(reading.pendingProtected, true, reading.mode + ': remains visible while pending');
+      assert.equal(reading.readingSeconds, 5, reading.mode + ': starts five seconds after completion');
+      assert.equal(reading.hoverProtected, true, reading.mode + ': remains visible while hovered');
+      assert.equal(reading.leaveSeconds, 2, reading.mode + ': restores two seconds after leaving');
+      assert.equal(reading.afterExpiry, 'work', reading.mode + ': restores live work after reading');
+    }
+    for (const transition of inspection.transitions) {
+      const urgent = ['waiting', 'approval'].includes(transition.state);
+      assert.equal(transition.panel, urgent ? 'work' : 'quota', transition.state + ': panel priority');
+      assert.equal(transition.active, urgent ? '' : 'quota', transition.state + ': reading protection');
+      assert.equal(transition.open, true, transition.state + ': keeps the chosen bubble visible');
+      assert.equal(transition.busy, urgent, transition.state + ': still updates actual busy state');
+    }
+    assert.equal(inspection.defaultUnchanged, true, 'manual reading preserves the default panel preference');
+    assert.equal(inspection.idleExpired, true, 'a completed agent leaves the query visible until the reading period expires');
+    assert.equal(inspection.panelChangeCancels, true, 'choosing another panel cancels manual reading');
+    assert.equal(inspection.hideCancels, true, 'explicit hiding cancels manual reading');
+    assert.equal(inspection.existingWaitingWins, true, 'an existing waiting state retains priority over a query');
+
+    assert.equal(data.renewedInspection.requestWritten, true, 'secondary refresh writes a real isolated request flag');
+    assert.equal(data.renewedInspection.requestStillPending, true, 'the secondary request outlives the old reading deadline');
+    assert.equal(data.renewedInspection.deadlineSuspended, true, 'a secondary request suspends the previous reading deadline');
+    assert.equal(data.renewedInspection.panelDuringRequest, 'deepseek', 'secondary refresh survives the expired old deadline');
+    assert.equal(data.renewedInspection.readingSeconds, 5, 'the secondary result starts a new five-second reading period');
+    assert.equal(data.sliderPersistence.length, 4);
+    for (const slider of data.sliderPersistence) {
+      const label = slider.kind + ' ' + slider.scenario;
+      assert.equal(slider.changed, true, label + ': changes the live value');
+      assert.equal(slider.closed, true, label + ': closes the menu');
+      assert.equal(slider.actual, slider.expected, label + ': menu closure persists the value');
+    }
+    assert.equal(data.windowExitPersistence.menuClosed, true, 'window exit is tested independently of menu closure');
+    assert.equal(data.windowExitPersistence.dirtyBeforeExit, true, 'window exit begins with unsaved slider changes');
+    assert.equal(data.windowExitPersistence.actual, data.windowExitPersistence.expected, 'window exit persists unsaved slider changes');
+    assert.equal(data.windowExitPersistence.dirtyAfterExit, false, 'window exit clears committed slider changes');
+    assert.deepEqual(data.checksAt115, ['115%'], 'the preset selection follows the slider');
+    assert.deepEqual(data.checksAt110, [], 'a slider value without a preset clears the old selection');
 
     console.log('PASS: ui-layout-detail (Option B themes/split, fade closure, menu scope, DeepSeek FontScale & DetailWindow HWND sync)');
   } finally {
