@@ -635,6 +635,10 @@ try {
     Pump-Wpf 20
     Pump-Wpf 190
     Pump-Wpf 30
+    $fadeOutDeadline = [DateTime]::UtcNow.AddSeconds(1.5)
+    while ($Bubble.Visibility -ne [System.Windows.Visibility]::Hidden -and [DateTime]::UtcNow -lt $fadeOutDeadline) {
+        Pump-Wpf 20
+    }
     $fadeAfterComplete = [ordered]@{
         vis      = [string]$Bubble.Visibility
         opacity  = Safe-Round $Bubble.Opacity
@@ -652,6 +656,10 @@ try {
     Pump-Wpf 20
     Pump-Wpf 190
     Pump-Wpf 30
+    $fadeInDeadline = [DateTime]::UtcNow.AddSeconds(1.5)
+    while ($Bubble.Opacity -lt 0.99 -and [DateTime]::UtcNow -lt $fadeInDeadline) {
+        Pump-Wpf 20
+    }
     $fadeReopenGuard = [ordered]@{
         vis      = [string]$Bubble.Visibility
         opacity  = Safe-Round $Bubble.Opacity
@@ -1059,15 +1067,24 @@ try {
     }
     $menu = $Window.ContextMenu
     $menu.PlacementTarget = $Window
-    $menu.IsOpen = $true
-    Pump-Wpf
-    $menu.ApplyTemplate() | Out-Null
-    $menuChrome = $menu.Template.FindName('RootMenuChrome', $menu)
-    $visibleMenuRows = @($menu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] -and $_.Visibility -eq 'Visible' })
-    $exitRow = $visibleMenuRows[-1]
-    $exitRow.ApplyTemplate() | Out-Null
-    $exitHitArea = $exitRow.Template.FindName('ExitHitArea', $exitRow)
-    $versionLabel = $exitRow.Template.FindName('VersionLabel', $exitRow)
+    $menuChrome = $null
+    $visibleMenuRows = @()
+    $exitRow = $null
+    $exitHitArea = $null
+    $versionLabel = $null
+    $menuLayoutDeadline = [DateTime]::UtcNow.AddSeconds(2.0)
+    do {
+        if (-not $menu.IsOpen) { $menu.IsOpen = $true }
+        Pump-Wpf 20
+        $menu.ApplyTemplate() | Out-Null
+        $menu.UpdateLayout()
+        $menuChrome = $menu.Template.FindName('RootMenuChrome', $menu)
+        $visibleMenuRows = @($menu.Items | Where-Object { $_ -is [System.Windows.Controls.MenuItem] -and $_.Visibility -eq 'Visible' })
+        $exitRow = $visibleMenuRows[-1]
+        if ($exitRow) { $exitRow.ApplyTemplate() | Out-Null }
+        $exitHitArea = if ($exitRow) { $exitRow.Template.FindName('ExitHitArea', $exitRow) } else { $null }
+        $versionLabel = if ($exitRow) { $exitRow.Template.FindName('VersionLabel', $exitRow) } else { $null }
+    } while ((-not $menu.IsOpen -or -not $menu.IsVisible -or -not $menuChrome -or $menuChrome.ActualWidth -le 0 -or -not $exitHitArea -or $exitHitArea.ActualWidth -le 0 -or -not $versionLabel -or $versionLabel.ActualWidth -le 0) -and [DateTime]::UtcNow -lt $menuLayoutDeadline)
     $exitStart = $exitHitArea.TranslatePoint([System.Windows.Point]::new(0, $exitHitArea.ActualHeight / 2), $menuChrome)
     $exitEnd = $exitHitArea.TranslatePoint([System.Windows.Point]::new($exitHitArea.ActualWidth, $exitHitArea.ActualHeight / 2), $menuChrome)
     $versionStart = $versionLabel.TranslatePoint([System.Windows.Point]::new(0, $versionLabel.ActualHeight / 2), $menuChrome)
@@ -1076,9 +1093,12 @@ try {
     $versionPoint = $versionLabel.TranslatePoint([System.Windows.Point]::new($versionLabel.ActualWidth / 2, $versionLabel.ActualHeight / 2), $menu)
     $gapPoint = $menuChrome.TranslatePoint([System.Windows.Point]::new(($exitEnd.X + $versionStart.X) / 2, $exitStart.Y), $menu)
     $rightPaddingPoint = $exitRow.TranslatePoint([System.Windows.Point]::new($exitRow.ActualWidth - 3, $exitRow.ActualHeight / 2), $menu)
+    $footerHitDetails = @()
     $footerHits = @(
         foreach ($point in @($exitPoint, $versionPoint, $gapPoint, $rightPaddingPoint)) {
-            $hit = $menu.InputHitTest($point)
+            $rawHit = $menu.InputHitTest($point)
+            $footerHitDetails += if ($rawHit) { $rawHit.GetType().Name + ':' + ([string]$rawHit.Name) } else { '<null>' }
+            $hit = $rawHit
             while ($hit -is [System.Windows.Media.Visual] -and $hit -ne $exitRow) {
                 $hit = [System.Windows.Media.VisualTreeHelper]::GetParent($hit)
             }
@@ -1089,7 +1109,14 @@ try {
         exitLabel = [string]$exitRow.Header
         versionText = [string]$versionLabel.Text
         expectedVersion = "AgentPet v$script:AppVersion"
-        aligned = ($exitStart.X -ge 0 -and $exitStart.X -le 16 -and $exitEnd.X -le $versionStart.X -and
+        menuOpen = [bool]$menu.IsOpen
+        menuVisible = [bool]$menu.IsVisible
+        exitRowVisible = [bool]$exitRow.IsVisible
+        menuWidth = Safe-Round $menuChrome.ActualWidth
+        exitWidth = Safe-Round $exitHitArea.ActualWidth
+        hitTypes = $footerHitDetails
+        aligned = ($menuChrome.ActualWidth -gt 0 -and $exitHitArea.ActualWidth -gt 0 -and $versionLabel.ActualWidth -gt 0 -and
+            $exitStart.X -ge 0 -and $exitStart.X -le 16 -and $exitEnd.X -le $versionStart.X -and
             [Math]::Abs($exitStart.Y - $versionStart.Y) -le 1 -and
             ($menuChrome.ActualWidth - $versionEnd.X) -ge 0 -and ($menuChrome.ActualWidth - $versionEnd.X) -le 24)
         hits = $footerHits
@@ -1408,6 +1435,302 @@ try {
     $checksAt110 = @($scalePresets.Items | Where-Object { $_.IsCheckable -and $_.IsChecked } | ForEach-Object { [string]$_.Header })
     Save-PendingSliderConfig
 
+    # Case 23: v1.6.2 fix verification (FIX-01 busy hide, FIX-02 busy quote/hover/cycle/idle, FIX-03 manualBubbleHidden, FIX-04 balance write/display)
+    $tickHook = $repositoryAst.Find({ param($node)
+        $node -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $node.Member.Value -eq 'Add_Tick' -and $node.Expression.Extent.Text -eq '$Timer'
+    }, $true)
+    if (-not $tickHook) { throw 'Production timer tick hook was not found' }
+    $tickSb = [scriptblock]::Create($tickHook.Arguments[0].ScriptBlock.Extent.Text.Trim('{}'))
+    function Invoke-ProdTimerTick {
+        $script:monitorStartTime = [DateTime]::UtcNow
+        $script:lastStatusHeartbeatMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        & $tickSb
+        Pump-Wpf
+    }
+    function Invoke-LeftClickUp($el) {
+        $ev = [System.Windows.Input.MouseButtonEventArgs]::new([System.Windows.Input.Mouse]::PrimaryDevice, 0, [System.Windows.Input.MouseButton]::Left)
+        $ev.RoutedEvent = [System.Windows.UIElement]::MouseLeftButtonUpEvent
+        $el.RaiseEvent($ev)
+        Pump-Wpf
+    }
+    function global:Request-QuotaRefresh {}
+    $case23BackupFlag = $RefreshBalanceFlagPath
+    $case23TempBalanceFlag = Join-Path $BaseDir 'case23-refresh-balance.flag'
+    $RefreshBalanceFlagPath = $case23TempBalanceFlag
+    $Config.Pose = 'auto'
+    $Config.BubbleMode = 'quota'
+    $Config.AutoQuoteMinutes = 0
+    $script:manualBubbleHidden = $false
+    Stop-UserBubbleInspection
+    $trayHideBubble = $script:TrayMenu.Tag.BubbleHide
+    $trayQuoteItem = ($script:TrayMenu.Items | Where-Object { $_.Text -eq '气泡看板' }).DropDownItems | Where-Object { $_.Text -eq '随机台词' } | Select-Object -First 1
+
+    # FIX-01: busy + quota/deepseek -> tray Hide Bubble stays hidden across timer ticks & working updates, but approval still opens
+    Set-WorkPayload -source 'Codex' -task 'busy hide regression check'
+    Start-UserBubbleInspection 'quota'
+    Pump-Wpf
+    $trayHideBubble.PerformClick()
+    Pump-Wpf
+    $busyHideOpenAfterClick = [bool]$script:isBubbleOpen
+    $busyHideFlagAfterClick = [bool]$script:manualBubbleHidden
+    Invoke-ProdTimerTick
+    Invoke-ProdTimerTick
+    Set-WorkPayload -source 'Codex' -task 'working pulse after manual hide'
+    Invoke-ProdTimerTick
+    $busyHideOpenAfterTick = [bool]$script:isBubbleOpen
+    $busyHideFlagAfterTick = [bool]$script:manualBubbleHidden
+    $busyHideWorkVisAfterTick = [string]$WorkStatusPanel.Visibility
+    Set-WorkPayload -source 'Codex' -state 'approval' -task 'approval must wake work'
+    Pump-Wpf
+    $busyHideApprovalOpen = [bool]$script:isBubbleOpen
+    $busyHideApprovalPanel = [string]$script:currentBubblePanel
+
+    # FIX-02: busy quote across 4 entry paths, tick/status retention, hover +2s, quote->quota->deepseek click cycle, busy->idle preserve, approval guard
+    $script:manualBubbleHidden = $false
+    Set-WorkPayload -source 'Codex' -task 'busy quote survival check'
+    $quoteEntries = @()
+    foreach ($qEntry in @('tray-quote', 'wpf-quote', 'wpf-char-switch', 'bubble-cycle')) {
+        Set-WorkPayload -source 'Codex' -task ("entry " + $qEntry)
+        if ($qEntry -eq 'tray-quote') {
+            $trayQuoteItem.PerformClick()
+        } elseif ($qEntry -eq 'wpf-quote') {
+            $wpfQuote = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '随机台词' } | Select-Object -First 1
+            $wpfQuote.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } elseif ($qEntry -eq 'wpf-char-switch') {
+            $wpfRoles = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '切换角色' } | Select-Object -First 1
+            $altRole = $wpfRoles.Items | Where-Object { [string]$_.Tag -ne [string]$Config.Character } | Select-Object -First 1
+            $altRole.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } else {
+            Start-UserBubbleInspection 'deepseek'
+            Pump-Wpf
+            Invoke-LeftClickUp $Bubble
+        }
+        Pump-Wpf
+        $panelInit = [string]$script:currentBubblePanel
+        Invoke-ProdTimerTick
+        Set-WorkPayload -source 'Codex' -task ("pulse " + $qEntry)
+        Invoke-ProdTimerTick
+        $quoteEntries += [ordered]@{
+            entry = $qEntry
+            panelInit = $panelInit
+            panelAfterTick = [string]$script:currentBubblePanel
+            openAfterTick = [bool]$script:isBubbleOpen
+            hiddenAfterTick = [bool]$script:manualBubbleHidden
+        }
+    }
+    # From active busy 'quote', clicking Bubble blank cycles quote -> quota -> deepseek with Start-UserBubbleInspection
+    Show-TemporaryQuoteBubble 'claude' 5.5
+    Pump-Wpf
+    Invoke-LeftClickUp $Bubble
+    $cycleQuoteToQuota = [ordered]@{ panel = [string]$script:currentBubblePanel; active = [string]$script:userInspectPanel }
+    Invoke-LeftClickUp $Bubble
+    $cycleQuotaToDeepSeek = [ordered]@{ panel = [string]$script:currentBubblePanel; active = [string]$script:userInspectPanel }
+
+    # Hover extension (+2s) on temporary quote, 2s grace after leave, & clean expiration back to work
+    Show-TemporaryQuoteBubble 'claude' 5.5
+    $quoteStartDeadline = $script:userInspectUntil
+    $quoteHoverAt = $quoteStartDeadline.AddSeconds(-0.3)
+    Update-TemporaryQuoteInspection $quoteHoverAt $true
+    $quoteExtendedSeconds = ($script:userInspectUntil - $quoteStartDeadline).TotalSeconds
+    $quoteLeaveAt = $quoteHoverAt.AddSeconds(1.0)
+    Update-TemporaryQuoteInspection $quoteLeaveAt $false
+    $quoteLeaveSeconds = ($script:userInspectUntil - $quoteLeaveAt).TotalSeconds
+    $quoteDuringLeavePanel = [string]$script:currentBubblePanel
+    Update-TemporaryQuoteInspection ($quoteLeaveAt.AddSeconds(2.1)) $false
+    $quoteExpiredPanel = [string]$script:currentBubblePanel
+
+    # Busy -> Idle/Pause/Stale/Watchdog -> Re-enter Working preserves full 5.5s temporary quote protection (R-01)
+    $quoteReenterChecks = @()
+    foreach ($endReason in @('idle', 'pause', 'stale', 'watchdog')) {
+        Set-WorkPayload -source 'Codex' -task ('pre-' + $endReason)
+        Show-TemporaryQuoteBubble 'claude' 5.5
+        if ($endReason -eq 'idle') {
+            Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+            Invoke-ProdTimerTick
+        } elseif ($endReason -eq 'pause') {
+            $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 60000
+            Apply-AgentStatus ([pscustomobject]@{ state = 'working'; task = 'paused' })
+            $Config.PauseMonitorUntil = 0
+            Invoke-ProdTimerTick
+        } elseif ($endReason -eq 'stale') {
+            Apply-AgentStatus ([pscustomobject]@{ state = 'working'; at = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - 60000) })
+            Invoke-ProdTimerTick
+        } else {
+            $script:monitorStartTime = [DateTime]::UtcNow.AddSeconds(-20)
+            $script:MonitorProc = $null
+            & $tickSb
+            Pump-Wpf
+            $script:monitorStartTime = [DateTime]::UtcNow
+        }
+        $panelAfterEnd = [string]$script:currentBubblePanel
+        $openAfterEnd = [bool]$script:isBubbleOpen
+        # Resume working well before 5.5s expires -> must NOT be overwritten by work
+        Set-WorkPayload -source 'Codex' -task ('resume-' + $endReason)
+        Invoke-ProdTimerTick
+        $quoteReenterChecks += [ordered]@{
+            reason = $endReason
+            panelAfterEnd = $panelAfterEnd
+            openAfterEnd = $openAfterEnd
+            panelAfterResume = [string]$script:currentBubblePanel
+            openAfterResume = [bool]$script:isBubbleOpen
+        }
+    }
+    $quoteIdlePreservedPanel = $quoteReenterChecks[0].panelAfterEnd
+    $quoteIdlePreservedOpen = $quoteReenterChecks[0].openAfterEnd
+
+    # R-01 idleHoverMinimumHold: hovering at t+1s and leaving at t+1.5s while idle MUST NOT shorten 5.5s hold to 3.8s
+    Set-WorkPayload -source 'Codex' -task 'hover min hold'
+    Show-TemporaryQuoteBubble 'claude' 5.5
+    $qT0 = $script:userInspectUntil.AddSeconds(-5.5)
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    Invoke-ProdTimerTick
+    Update-TemporaryQuoteInspection ($qT0.AddSeconds(1.0)) $true
+    Update-TemporaryQuoteInspection ($qT0.AddSeconds(1.5)) $false
+    Update-TemporaryQuoteInspection ($qT0.AddSeconds(4.0)) $false
+    $quoteIdleAt4sPanel = [string]$script:currentBubblePanel
+    $quoteIdleAt4sOpen = [bool]$script:isBubbleOpen
+    Update-TemporaryQuoteInspection ($qT0.AddSeconds(5.6)) $false
+    $quoteIdleEventuallyClosed = (-not $script:isBubbleOpen -and -not $script:quoteInspectActive)
+
+    # Waiting/approval refuses to be overwritten by quote or character-switch greeting
+    Set-WorkPayload -source 'Codex' -state 'approval' -task 'approval must block quote'
+    $trayQuoteItem.PerformClick()
+    Pump-Wpf
+    $quoteBlockedByApprovalPanel = [string]$script:currentBubblePanel
+    $wpfRoles2 = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '切换角色' } | Select-Object -First 1
+    ($wpfRoles2.Items | Where-Object { [string]$_.Tag -ne [string]$Config.Character } | Select-Object -First 1).RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+    Pump-Wpf
+    $charBlockedByApprovalPanel = [string]$script:currentBubblePanel
+
+    # FIX-03: idle Auto-Quotes suppressed when hidden; all explicit reopen actions clear manualBubbleHidden
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    Stop-UserBubbleInspection
+    $trayHideBubble.PerformClick()
+    Pump-Wpf
+    $Config.AutoQuoteMinutes = 3
+    $script:lastAutoQuoteTime = [DateTime]::UtcNow.AddMinutes(-5)
+    Invoke-ProdTimerTick
+    $idleAutoQuoteBlocked = (-not $script:isBubbleOpen -and [bool]$script:manualBubbleHidden)
+    $Config.AutoQuoteMinutes = 0
+
+    $reopenClearsHide = @()
+    foreach ($reopenKind in @('wpf-quote', 'wpf-char-switch', 'pet-click', 'bubble-scale-preset', 'font-scale-preset')) {
+        Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+        Stop-UserBubbleInspection
+        $trayHideBubble.PerformClick()
+        Pump-Wpf
+        if (-not $script:manualBubbleHidden) { throw ("Precondition manualBubbleHidden failed for " + $reopenKind) }
+        if ($reopenKind -eq 'wpf-quote') {
+            ($Window.ContextMenu.Items | Where-Object { $_.Header -eq '随机台词' } | Select-Object -First 1).RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } elseif ($reopenKind -eq 'wpf-char-switch') {
+            $rolesMenu = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '切换角色' } | Select-Object -First 1
+            ($rolesMenu.Items | Where-Object { [string]$_.Tag -ne [string]$Config.Character } | Select-Object -First 1).RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } elseif ($reopenKind -eq 'pet-click') {
+            $script:isDragging = $false
+            Invoke-LeftClickUp $PetImage
+        } elseif ($reopenKind -eq 'bubble-scale-preset') {
+            $appMenu = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '外观' } | Select-Object -First 1
+            $bsMenu = $appMenu.Items[1]
+            $bsMenu.Items[2].RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        } else {
+            $appMenu = $Window.ContextMenu.Items | Where-Object { $_.Header -eq '外观' } | Select-Object -First 1
+            $fsMenu = $appMenu.Items[2]
+            $fsMenu.Items[2].RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        }
+        Pump-Wpf
+        $reopenClearsHide += [ordered]@{
+            kind = $reopenKind
+            hidden = [bool]$script:manualBubbleHidden
+            open = [bool]$script:isBubbleOpen
+        }
+    }
+
+    # FIX-04 frontend: Request-BalanceRefresh write error does not consume cooldown or lock 15s timeout; Apply-BalanceObject empty COOLDOWN/RATE_LIMITED
+    $balanceUiCases = [ordered]@{}
+    try {
+        $unwritableDir = Join-Path $BaseDir 'case23-flag-dir'
+        New-Item -ItemType Directory -Path $unwritableDir -Force | Out-Null
+        $RefreshBalanceFlagPath = $unwritableDir
+        $script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
+        $script:balanceRequestTimeout = $null
+        $script:balanceRequestStartedMs = [long]0
+        Request-BalanceRefresh
+        $balanceUiCases.failNotice = [string]$DeepSeekStatusNotice.Text
+        $balanceUiCases.failTimeoutNull = ($null -eq $script:balanceRequestTimeout)
+        $balanceUiCases.failStartZero = ($script:balanceRequestStartedMs -eq 0)
+        $balanceUiCases.failDidNotConsumeCooldown = ($script:lastBalanceRefreshRequestTime -eq [DateTime]::MinValue)
+        # Immediate retry after write succeeds must NOT hit cooldown
+        $RefreshBalanceFlagPath = $case23TempBalanceFlag
+        Request-BalanceRefresh
+        $balanceUiCases.retryNotice = [string]$DeepSeekStatusNotice.Text
+        $balanceUiCases.retryFlagWritten = (Test-Path -LiteralPath $case23TempBalanceFlag)
+        $balanceUiCases.retryTimeoutArmed = ($null -ne $script:balanceRequestTimeout -and $script:balanceRequestStartedMs -gt 0)
+    } finally {
+        $RefreshBalanceFlagPath = $case23BackupFlag
+        $script:balanceRequestTimeout = $null
+        $script:balanceRequestStartedMs = [long]0
+    }
+    Apply-BalanceObject ([pscustomobject]@{
+        type = 'balance'; status = 'error'; balances = @()
+        errorCode = 'COOLDOWN'; errorMessage = '刷新过于频繁，请等待 7 秒后再试'
+    })
+    $balanceUiCases.emptyCooldownNotice = [string]$DeepSeekStatusNotice.Text
+    $balanceUiCases.emptyCooldownTitle = [string]$DeepSeekMsgTitle.Text
+    $balanceUiCases.emptyCooldownDetail = [string]$DeepSeekMsgDetail.Text
+    Apply-BalanceObject ([pscustomobject]@{
+        type = 'balance'; status = 'stale'; balances = @()
+        errorCode = 'RATE_LIMITED'; errorMessage = '请求频率超限，重试需等待 12 秒'
+    })
+    $balanceUiCases.emptyRateNotice = [string]$DeepSeekStatusNotice.Text
+    $balanceUiCases.emptyRateTitle = [string]$DeepSeekMsgTitle.Text
+    $balanceUiCases.emptyRateDetail = [string]$DeepSeekMsgDetail.Text
+
+    $case23Regression = [ordered]@{
+        busyHide = [ordered]@{
+            openAfterClick = $busyHideOpenAfterClick
+            flagAfterClick = $busyHideFlagAfterClick
+            openAfterTick = $busyHideOpenAfterTick
+            flagAfterTick = $busyHideFlagAfterTick
+            workVisAfterTick = $busyHideWorkVisAfterTick
+            approvalOpen = $busyHideApprovalOpen
+            approvalPanel = $busyHideApprovalPanel
+        }
+        busyQuote = [ordered]@{
+            entries = $quoteEntries
+            cycleQuoteToQuota = $cycleQuoteToQuota
+            cycleQuotaToDeepSeek = $cycleQuotaToDeepSeek
+            extendedSeconds = [Math]::Round($quoteExtendedSeconds, 2)
+            leaveSeconds = [Math]::Round($quoteLeaveSeconds, 2)
+            duringLeavePanel = $quoteDuringLeavePanel
+            expiredPanel = $quoteExpiredPanel
+            idlePreservedPanel = $quoteIdlePreservedPanel
+            idlePreservedOpen = $quoteIdlePreservedOpen
+            reenterChecks = $quoteReenterChecks
+            idleAt4sPanel = $quoteIdleAt4sPanel
+            idleAt4sOpen = $quoteIdleAt4sOpen
+            idleEventuallyClosed = $quoteIdleEventuallyClosed
+            quoteBlockedByApproval = $quoteBlockedByApprovalPanel
+            charBlockedByApproval = $charBlockedByApprovalPanel
+        }
+        hiddenRules = [ordered]@{
+            idleAutoQuoteBlocked = $idleAutoQuoteBlocked
+            reopenEntries = $reopenClearsHide
+        }
+        balanceUi = $balanceUiCases
+    }
+    # Restore clean idle state and Config values for Case 22's windowExitPersistence check
+    $Config.Character = 'claude'
+    $Config.BubbleScale = 1.0
+    $Config.FontScale = 1.0
+    Update-Theme
+    Update-BubbleScale
+    Update-FontScale
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    $script:manualBubbleHidden = $false
+    Stop-UserBubbleInspection
+    Build-ContextMenu
+
     # The main harness omits startup/exit handlers. Register the production exit hook
     # and change a slider in a closed menu to isolate the window-exit save fallback.
     $closedHook = $repositoryAst.Find({ param($node)
@@ -1491,6 +1814,7 @@ try {
         windowExitPersistence = $windowExitPersistence
         checksAt115         = $checksAt115
         checksAt110         = $checksAt110
+        case23Regression    = $case23Regression
     }
     Write-Output ('RESULT_JSON:' + ($out | ConvertTo-Json -Depth 6 -Compress))
 } finally {
@@ -1891,8 +2215,8 @@ try {
     assert.equal(rm.bubbleDefaultWithoutTray, 'Visible', '气泡默认偏好 needs a desktop menu entry when the tray is disabled');
     assert.equal(rm.footer.exitLabel, '退出 AgentPet');
     assert.equal(rm.footer.versionText, rm.footer.expectedVersion);
-    assert.equal(rm.footer.aligned, true, 'exit and version should be aligned at the left and right of the footer');
-    assert.deepEqual(rm.footer.hits, [true, true, true, true], 'the exit label, version, gap and right padding must all hit the exit item');
+    assert.equal(rm.footer.aligned, true, `exit and version aligned (${JSON.stringify(rm.footer)})`);
+    assert.deepEqual(rm.footer.hits, [true, true, true, true], `exit footer hit-test failed: ${JSON.stringify(rm.footer)}`);
     assert.equal(rm.sliderVisible, true);
     assert.equal(rm.sliderStaysOpen, true);
     assert.equal(rm.sliderChanged, true);
@@ -1944,6 +2268,67 @@ try {
     assert.equal(data.windowExitPersistence.dirtyAfterExit, false, 'window exit clears committed slider changes');
     assert.deepEqual(data.checksAt115, ['115%'], 'the preset selection follows the slider');
     assert.deepEqual(data.checksAt110, [], 'a slider value without a preset clears the old selection');
+
+    // Case 23 assertions: FIX-01..FIX-04 UI & timer interaction regressions
+    const c23 = data.case23Regression;
+    assert.equal(c23.busyHide.openAfterClick, false, 'FIX-01: tray hide must close bubble immediately');
+    assert.equal(c23.busyHide.flagAfterClick, true, 'FIX-01: tray hide must set manualBubbleHidden');
+    assert.equal(c23.busyHide.openAfterTick, false, 'FIX-01: busy non-work hide must stay closed after timer tick & status pulse');
+    assert.equal(c23.busyHide.flagAfterTick, true, 'FIX-01: manualBubbleHidden must stay true');
+    assert.equal(c23.busyHide.workVisAfterTick, 'Collapsed', 'FIX-01: WorkStatusPanel must not pop back to Visible');
+    assert.equal(c23.busyHide.approvalOpen, true, 'FIX-01: approval state must still wake bubble');
+    assert.equal(c23.busyHide.approvalPanel, 'work', 'FIX-01: approval wake must target work panel');
+
+    assert.equal(c23.busyQuote.entries.length, 4);
+    for (const q of c23.busyQuote.entries) {
+      assert.equal(q.panelInit, 'quote', `FIX-02 ${q.entry}: must open quote`);
+      assert.equal(q.panelAfterTick, 'quote', `FIX-02 ${q.entry}: must stay quote across timer tick and working pulse`);
+      assert.equal(q.openAfterTick, true, `FIX-02 ${q.entry}: must keep bubble open`);
+      assert.equal(q.hiddenAfterTick, false, `FIX-02 ${q.entry}: must clear manualBubbleHidden`);
+    }
+    assert.equal(c23.busyQuote.cycleQuoteToQuota.panel, 'quota', 'FIX-02: clicking busy quote must cycle to quota');
+    assert.equal(c23.busyQuote.cycleQuoteToQuota.active, 'quota', 'FIX-02: cycling quote -> quota while busy must activate inspection');
+    assert.equal(c23.busyQuote.cycleQuotaToDeepSeek.panel, 'deepseek', 'FIX-02: clicking quota must cycle to deepseek');
+    assert.equal(c23.busyQuote.cycleQuotaToDeepSeek.active, 'deepseek', 'FIX-02: cycling quota -> deepseek while busy must activate inspection');
+    assert.ok(c23.busyQuote.extendedSeconds >= 1.4, `FIX-02: hover must extend temporary quote (~+1.7s expected, got ${c23.busyQuote.extendedSeconds})`);
+    assert.ok(Math.abs(c23.busyQuote.leaveSeconds - 2) < 0.05, `FIX-02: leaving quote must start 2s grace (got ${c23.busyQuote.leaveSeconds})`);
+    assert.equal(c23.busyQuote.duringLeavePanel, 'quote', 'FIX-02: must stay quote during 2s leave grace');
+    assert.equal(c23.busyQuote.expiredPanel, 'work', 'FIX-02: expired temporary quote must restore work');
+    assert.equal(c23.busyQuote.idlePreservedPanel, 'quote', 'FIX-02: busy -> idle transition must preserve temporary quote');
+    assert.equal(c23.busyQuote.idlePreservedOpen, true, 'FIX-02: busy -> idle transition must keep temporary quote open');
+    assert.equal(c23.busyQuote.reenterChecks.length, 4);
+    for (const rc of c23.busyQuote.reenterChecks) {
+      assert.equal(rc.panelAfterEnd, 'quote', `R-01 ${rc.reason}: ending busy must preserve quote`);
+      assert.equal(rc.openAfterEnd, true, `R-01 ${rc.reason}: ending busy must keep bubble open`);
+      assert.equal(rc.panelAfterResume, 'quote', `R-01 ${rc.reason}: re-entering working within 5.5s must not overwrite quote`);
+      assert.equal(rc.openAfterResume, true, `R-01 ${rc.reason}: re-entering working must keep bubble open`);
+    }
+    assert.equal(c23.busyQuote.idleAt4sPanel, 'quote', 'R-01: early idle hover+leave must NOT shorten 5.5s quote to 3.8s');
+    assert.equal(c23.busyQuote.idleAt4sOpen, true, 'R-01: bubble must remain open at t=4s after t=1s hover + t=1.5s leave');
+    assert.equal(c23.busyQuote.idleEventuallyClosed, true, 'FIX-02: preserved quote must close cleanly after hold expires');
+    assert.equal(c23.busyQuote.quoteBlockedByApproval, 'work', 'FIX-02: quote trigger during approval must stay on work');
+    assert.equal(c23.busyQuote.charBlockedByApproval, 'work', 'FIX-02: role switch during approval must not replace work');
+
+    assert.equal(c23.hiddenRules.idleAutoQuoteBlocked, true, 'FIX-03: manual hide must suppress idle auto-quotes');
+    assert.equal(c23.hiddenRules.reopenEntries.length, 5);
+    for (const r of c23.hiddenRules.reopenEntries) {
+      assert.equal(r.hidden, false, `FIX-03 ${r.kind}: explicit reopen must clear manualBubbleHidden`);
+      assert.equal(r.open, true, `FIX-03 ${r.kind}: explicit reopen must open bubble`);
+    }
+
+    assert.equal(c23.balanceUi.failNotice, '请求失败', 'FIX-04: flag write failure must report 请求失败');
+    assert.equal(c23.balanceUi.failTimeoutNull, true, 'FIX-04: write failure must not arm 15s timeout');
+    assert.equal(c23.balanceUi.failStartZero, true, 'FIX-04: write failure must clear request start');
+    assert.equal(c23.balanceUi.failDidNotConsumeCooldown, true, 'FIX-04: write failure must not consume 10s cooldown');
+    assert.equal(c23.balanceUi.retryNotice, '刷新中...', 'FIX-04: immediate retry after write failure must proceed');
+    assert.equal(c23.balanceUi.retryFlagWritten, true);
+    assert.equal(c23.balanceUi.retryTimeoutArmed, true);
+    assert.equal(c23.balanceUi.emptyCooldownNotice, '冷却中');
+    assert.equal(c23.balanceUi.emptyCooldownTitle, '刷新冷却中');
+    assert.ok(c23.balanceUi.emptyCooldownDetail.includes('7 秒'));
+    assert.equal(c23.balanceUi.emptyRateNotice, '频率限制');
+    assert.equal(c23.balanceUi.emptyRateTitle, '请求频率受限');
+    assert.ok(c23.balanceUi.emptyRateDetail.includes('12 秒'));
 
     console.log('PASS: ui-layout-detail (Option B themes/split, fade closure, menu scope, DeepSeek FontScale & DetailWindow HWND sync)');
   } finally {

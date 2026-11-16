@@ -1187,6 +1187,9 @@ class AgentMonitor {
     };
 
     this.balanceBusy = false;
+    this.pendingForceBalance = false;
+    this.pendingForceBalanceAt = 0;
+    this.stopped = false;
     this.lastBalanceAt = 0;
     this.lastBalanceFetchAttempt = 0;
     this.lastFlagBalanceMtime = 0;
@@ -1263,6 +1266,8 @@ class AgentMonitor {
     this.lastBalanceFetchAttempt = 0;
     this.balanceRetryAfterUntil = 0;
     this.balanceBusy = false;
+    this.pendingForceBalance = false;
+    this.pendingForceBalanceAt = 0;
     this.activeHostSignature = null;
     this.cachedDshPort = null;
     writeErrorLog(`Balance invalidated: ${reason} (new gen: ${this.balanceGeneration})`);
@@ -1287,9 +1292,9 @@ class AgentMonitor {
 
   async findActiveDshBaseUrl(config, deadline = 0) {
     const getRemaining = (capMs, minReq = 100) => {
-      if (!deadline) return capMs;
-      const rem = deadline - Date.now();
-      return rem >= minReq ? Math.min(capMs, rem) : 0;
+      if (!deadline) return Math.floor(capMs);
+      const rem = Math.floor(deadline - Date.now());
+      return rem >= minReq ? Math.min(Math.floor(capMs), rem) : 0;
     };
 
     if (config.DshCredentialReuseEnabled !== undefined && !this._warnedDshReuseDeprecated) {
@@ -1448,6 +1453,7 @@ class AgentMonitor {
 
   start() {
     if (this.timer) return;
+    this.stopped = false;
     this.scan();
     this.pollQuota(true);
     this.pollBalance(true);
@@ -1464,6 +1470,9 @@ class AgentMonitor {
   }
 
   stop() {
+    this.stopped = true;
+    this.pendingForceBalance = false;
+    this.pendingForceBalanceAt = 0;
     if (this.timer) {
       clearInterval(this.timer);
       this.timer = null;
@@ -1483,12 +1492,15 @@ class AgentMonitor {
 
     // AP04: 每轮先消费手动刷新标记，再决定通知或查询，避免配置变化的早退分支留下标记
     let force = false;
+    let forceRequestAt = 0;
     try {
       if (fs.existsSync(this.paths.refreshBalanceFlag)) {
         const st = fs.statSync(this.paths.refreshBalanceFlag);
         if (st.mtimeMs > this.lastFlagBalanceMtime) {
           this.lastFlagBalanceMtime = st.mtimeMs;
           force = true;
+          const flooredMtime = Number.isFinite(st.mtimeMs) ? Math.floor(st.mtimeMs) : 0;
+          forceRequestAt = (flooredMtime > 0 && flooredMtime <= now) ? flooredMtime : now;
         }
         try { fs.unlinkSync(this.paths.refreshBalanceFlag); } catch {}
       }
@@ -1526,7 +1538,7 @@ class AgentMonitor {
       : BALANCE_POLL_MS;
 
     if (force || (now - this.lastBalanceAt >= interval)) {
-      this.pollBalance(force);
+      this.pollBalance(force, force ? { requestAt: forceRequestAt } : undefined);
     }
   }
 
@@ -1552,8 +1564,46 @@ class AgentMonitor {
     });
   }
 
-  async pollBalance(force = false) {
-    if (this.balanceBusy) return;
+  emitBalanceThrottleReceipt(errorCode, errorMessage, now = Date.now()) {
+    const base = this.cachedBalanceData
+      ? {
+          ...this.cachedBalanceData,
+          ...(errorCode === 'RATE_LIMITED' ? { status: 'stale' } : {})
+        }
+      : {
+          type: 'balance',
+          provider: 'unknown',
+          providerFamily: 'deepseek',
+          credentialSource: 'dsh',
+          status: 'error',
+          isAvailable: null,
+          currency: 'CNY',
+          balances: [],
+          hostCounter: null,
+          fetchedAt: now,
+          observedAt: null
+        };
+    this.onChange({
+      ...base,
+      lastAttemptAt: now,
+      errorCode,
+      errorMessage
+    });
+  }
+
+  async pollBalance(force = false, options = {}) {
+    if (this.balanceBusy) {
+      if (force) {
+        const reqAt = Number.isFinite(options?.requestAt) && options.requestAt > 0
+          ? Math.floor(options.requestAt)
+          : Date.now();
+        this.pendingForceBalance = true;
+        this.pendingForceBalanceAt = this.pendingForceBalanceAt > 0
+          ? Math.min(this.pendingForceBalanceAt, reqAt)
+          : reqAt;
+      }
+      return;
+    }
     const now = Date.now();
     const config = this.readPetConfig();
 
@@ -1565,30 +1615,17 @@ class AgentMonitor {
     this.balanceDisabledPublished = false;
 
     if (this.lastBalanceFetchAttempt && (now - this.lastBalanceFetchAttempt < 10_000)) {
-      if (force && this.cachedBalanceData) {
+      if (force) {
         const sec = Math.max(1, Math.ceil((10_000 - (now - this.lastBalanceFetchAttempt)) / 1000));
-        const data = {
-          ...this.cachedBalanceData,
-          lastAttemptAt: now,
-          errorCode: 'COOLDOWN',
-          errorMessage: `刷新过于频繁，请等待 ${sec} 秒后再试`
-        };
-        this.onChange(data);
+        this.emitBalanceThrottleReceipt('COOLDOWN', `刷新过于频繁，请等待 ${sec} 秒后再试`, now);
       }
       return;
     }
 
     if (this.balanceRetryAfterUntil > now) {
-      if (force && this.cachedBalanceData) {
+      if (force) {
         const sec = Math.max(1, Math.ceil((this.balanceRetryAfterUntil - now) / 1000));
-        const data = {
-          ...this.cachedBalanceData,
-          status: 'stale',
-          lastAttemptAt: now,
-          errorCode: 'RATE_LIMITED',
-          errorMessage: `请求频率超限，重试需等待 ${sec} 秒`
-        };
-        this.onChange(data);
+        this.emitBalanceThrottleReceipt('RATE_LIMITED', `请求频率超限，重试需等待 ${sec} 秒`, now);
       }
       return;
     }
@@ -1598,12 +1635,17 @@ class AgentMonitor {
     this.lastBalanceFetchAttempt = now;
     const currentGen = ++this.balanceGeneration;
 
-    // 全链路统一总截止时间预算：10秒（前端设置15秒期限，预留5秒调度冗余）
+    // 全链路统一总截止时间预算：10秒（前端设置15秒期限，预留5秒调度冗余；排队接力须扣除已在途等待时间，统一取整避免 AbortSignal.timeout 浮点越界）
     const TOTAL_BALANCE_BUDGET_MS = 10_000;
-    const deadline = now + TOTAL_BALANCE_BUDGET_MS;
+    const queuedAt = Number.isFinite(options?.queuedAt) && options.queuedAt > 0 ? Math.floor(options.queuedAt) : null;
+    const deadline = Math.floor(
+      queuedAt !== null
+        ? Math.min(now + TOTAL_BALANCE_BUDGET_MS, queuedAt + TOTAL_BALANCE_BUDGET_MS)
+        : (now + TOTAL_BALANCE_BUDGET_MS)
+    );
     const getRemainingBudget = (capMs = 10_000, minReq = 150) => {
-      const rem = deadline - Date.now();
-      return rem >= minReq ? Math.min(capMs, rem) : 0;
+      const rem = Math.floor(deadline - Date.now());
+      return rem >= minReq ? Math.min(Math.floor(capMs), rem) : 0;
     };
 
     try {
@@ -1958,6 +2000,12 @@ class AgentMonitor {
     } finally {
       if (this.balanceGeneration === currentGen) {
         this.balanceBusy = false;
+        if (this.pendingForceBalance && !this.stopped) {
+          const queuedAt = this.pendingForceBalanceAt > 0 ? this.pendingForceBalanceAt : Date.now();
+          this.pendingForceBalance = false;
+          this.pendingForceBalanceAt = 0;
+          void this.pollBalance(true, { queuedAt }).catch(() => {});
+        }
       }
     }
   }

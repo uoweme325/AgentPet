@@ -2,6 +2,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import http from 'node:http';
 import assert from 'node:assert';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
@@ -1432,6 +1433,280 @@ Write-Output "WO36_VERIFIED_OK"
     }
   }
 
+  // =========================================================================
+  // 场景 18: FIX-04 Node 监控无缓存冷却/限流回执 与 balanceBusy 在途标记延后接力
+  // =========================================================================
+  {
+    const s18Dir = path.join(tmpRoot, 's18-fix04-balance');
+    fs.mkdirSync(path.join(s18Dir, 'runtime'), { recursive: true });
+    fs.writeFileSync(path.join(s18Dir, 'config.json'), JSON.stringify({ DeepSeekBalanceEnabled: true }), 'utf8');
+
+    const events = [];
+    const mon = new AgentMonitor({
+      isProbe: true,
+      onChange: (data) => {
+        if (data && data.type === 'balance') events.push(data);
+      }
+    });
+    mon.paths.appDir = s18Dir;
+    mon.paths.refreshBalanceFlag = path.join(s18Dir, 'refresh-balance.flag');
+    mon.paths.balanceFile = path.join(s18Dir, 'runtime-balance.json');
+
+    // 18a: cachedBalanceData === null 且命中 10s 冷却 -> force 仍写出明确 COOLDOWN 终态回执
+    mon.cachedBalanceData = null;
+    mon.lastBalanceFetchAttempt = Date.now() - 2000;
+    const tBefore18a = Date.now();
+    await mon.pollBalance(true);
+    assert.strictEqual(events.length, 1, '18a empty-cache cooldown must emit receipt');
+    assert.strictEqual(events[0].errorCode, 'COOLDOWN');
+    assert.deepStrictEqual(events[0].balances, []);
+    assert.ok(events[0].lastAttemptAt >= tBefore18a, '18a lastAttemptAt must belong to forced request');
+    assert.ok(events[0].errorMessage.includes('刷新过于频繁'));
+
+    // 18b: cachedBalanceData === null 且命中 RATE_LIMITED -> force 仍写出 RATE_LIMITED 终态回执
+    events.length = 0;
+    mon.lastBalanceFetchAttempt = 0;
+    mon.balanceRetryAfterUntil = Date.now() + 25_000;
+    const tBefore18b = Date.now();
+    await mon.pollBalance(true);
+    assert.strictEqual(events.length, 1, '18b empty-cache rate limit must emit receipt');
+    assert.strictEqual(events[0].errorCode, 'RATE_LIMITED');
+    assert.deepStrictEqual(events[0].balances, []);
+    assert.ok(events[0].lastAttemptAt >= tBefore18b, '18b lastAttemptAt must belong to forced request');
+    assert.ok(events[0].errorMessage.includes('请求频率超限'));
+
+    // 18c: balanceBusy === true 在途期间消费新 refresh-balance.flag -> 在途完成后必须接力补发归属新请求的时间戳回执
+    events.length = 0;
+    mon.balanceRetryAfterUntil = 0;
+    mon.lastBalanceFetchAttempt = 0;
+    mon.cachedBalanceData = null;
+    let releaseSlowFetch;
+    mon.findActiveDshBaseUrl = () => new Promise((resolve) => {
+      releaseSlowFetch = () => resolve(null);
+    });
+    const inFlightPoll = mon.pollBalance(false);
+    // 等待略超过 15ms 以确保手动刷新旗标时间严格晚于原在途请求起点
+    await new Promise((r) => setTimeout(r, 25));
+    const tFlagWritten = Date.now();
+    fs.writeFileSync(mon.paths.refreshBalanceFlag, String(tFlagWritten), 'utf8');
+    mon.checkBalanceTrigger();
+    assert.strictEqual(fs.existsSync(mon.paths.refreshBalanceFlag), false, '18c flag should be consumed by checkBalanceTrigger');
+    assert.strictEqual(mon.pendingForceBalance, true, '18c force while balanceBusy must arm pendingForceBalance');
+
+    releaseSlowFetch();
+    await inFlightPoll;
+    assert.strictEqual(mon.pendingForceBalance, false, '18c finally must flush pendingForceBalance');
+    assert.ok(events.length >= 2, `18c expected original result + follow-up forced receipt, got ${events.length}`);
+    const followUp = events[events.length - 1];
+    assert.strictEqual(followUp.errorCode, 'COOLDOWN', '18c follow-up within 10s should emit COOLDOWN receipt');
+    assert.ok(followUp.lastAttemptAt >= tFlagWritten, '18c follow-up lastAttemptAt must satisfy Test-BalanceResultOwnedByRequest');
+
+    mon.pendingForceBalance = true;
+    mon.stop();
+    assert.strictEqual(mon.pendingForceBalance, false, 'stop() must clear pendingForceBalance');
+    assert.strictEqual(mon.pendingForceBalanceAt, 0, 'stop() must clear pendingForceBalanceAt');
+
+    // 18d: R-02 queued budget accounting across 9999 / 10000 / 10001ms & budget exhaustion
+    const realDateNow = Date.now;
+    try {
+      let virtualNow = 2_000_000;
+      Date.now = () => virtualNow;
+      mon.stopped = false;
+      mon.lastFlagBalanceMtime = 0;
+
+      // Case 1: t_done - t0 = 9999ms -> hits COOLDOWN in <1ms with lastAttemptAt >= reqAt
+      events.length = 0;
+      mon.cachedBalanceData = null;
+      mon.lastBalanceFetchAttempt = 0;
+      mon.balanceRetryAfterUntil = 0;
+      mon.pendingForceBalance = false;
+      mon.pendingForceBalanceAt = 0;
+      let releaseFirst;
+      mon.findActiveDshBaseUrl = () => new Promise((resolve) => { releaseFirst = () => resolve(null); });
+      const p9999 = mon.pollBalance(false);
+      virtualNow = 2_001_000; // queued at t0 + 1000
+      await mon.pollBalance(true, { requestAt: virtualNow });
+      assert.strictEqual(mon.pendingForceBalance, true);
+      assert.strictEqual(mon.pendingForceBalanceAt, 2_001_000);
+      virtualNow = 2_009_999; // 9999ms since t0
+      releaseFirst();
+      await p9999;
+      assert.strictEqual(events.at(-1).errorCode, 'COOLDOWN', '18d-9999 must emit COOLDOWN');
+      assert.strictEqual(events.at(-1).lastAttemptAt, 2_009_999);
+
+      // Case 2: t0 = 3_000_000, reqAt = 3_008_000, t_done = 3_010_000 (10000ms elapsed since t0)
+      mon.invalidateBalance('TEST_18D', { emitLoading: false });
+      virtualNow = 3_000_000;
+      events.length = 0;
+      const seen10000 = [];
+      let release10000;
+      mon.findActiveDshBaseUrl = (_cfg, dl) => {
+        seen10000.push(dl);
+        if (seen10000.length === 1) return new Promise((resolve) => { release10000 = () => resolve(null); });
+        return Promise.resolve(null);
+      };
+      const pA = mon.pollBalance(false);
+      virtualNow = 3_008_000;
+      await mon.pollBalance(true, { requestAt: 3_008_000 });
+      virtualNow = 3_010_000; // exactly 10000ms since t0
+      release10000();
+      await pA;
+      await new Promise((r) => setTimeout(r, 0));
+      assert.strictEqual(seen10000.length, 2, '18d-10000 must start follow-up poll');
+      assert.strictEqual(seen10000[1], 3_018_000, '18d-10000 follow-up deadline must equal queuedAt + 10_000, not now + 10_000');
+
+      // t0 = 3_020_000, reqAt = 3_021_004, t_done = 3_030_001 (10001ms since t0, 8997ms already waited -> only 1003ms left)
+      mon.invalidateBalance('TEST_18D_10001', { emitLoading: false });
+      events.length = 0;
+      const seen10001 = [];
+      let release10001;
+      mon.findActiveDshBaseUrl = (_cfg, dl) => {
+        seen10001.push(dl);
+        if (seen10001.length === 1) return new Promise((resolve) => { release10001 = () => resolve(null); });
+        return Promise.resolve(null);
+      };
+      virtualNow = 3_020_000;
+      const pB = mon.pollBalance(false);
+      virtualNow = 3_021_004;
+      await mon.pollBalance(true, { requestAt: 3_021_004 });
+      virtualNow = 3_030_001; // 10001ms since t0
+      release10001();
+      await pB;
+      await new Promise((r) => setTimeout(r, 0));
+      assert.strictEqual(seen10001.length, 2, '18d-10001 must start follow-up within remaining budget');
+      assert.strictEqual(seen10001[1], 3_031_004, '18d-10001 follow-up deadline must stay capped at reqAt + 10_000');
+      assert.ok(events.at(-1).lastAttemptAt >= 3_021_004, '18d-10001 follow-up must belong to manual request');
+
+      // Budget already exhausted: t0 = 3_040_000, reqAt = 3_040_005, t_done = 3_050_050 (queuedMs = 10045ms >= 10_000)
+      mon.invalidateBalance('TEST_18D_EXHAUST', { emitLoading: false });
+      events.length = 0;
+      let followUpCalls = 0;
+      let releaseExhaust;
+      mon.findActiveDshBaseUrl = () => {
+        followUpCalls += 1;
+        if (followUpCalls === 1) return new Promise((resolve) => { releaseExhaust = () => resolve(null); });
+        return Promise.resolve(null);
+      };
+      virtualNow = 3_040_000;
+      const pC = mon.pollBalance(false);
+      virtualNow = 3_040_005;
+      await mon.pollBalance(true, { requestAt: 3_040_005 });
+      virtualNow = 3_050_050; // budget exhausted while waiting on first round
+      releaseExhaust();
+      await pC;
+      await new Promise((r) => setTimeout(r, 0));
+      assert.strictEqual(followUpCalls, 1, '18d-exhausted must NOT start another slow discovery loop when queue budget is exhausted');
+      assert.strictEqual(events.at(-1).errorCode, 'TIMEOUT', '18d-exhausted must immediately emit TIMEOUT owned by manual request');
+      assert.ok(events.at(-1).lastAttemptAt >= 3_040_005, '18d-exhausted TIMEOUT must carry lastAttemptAt >= reqAt');
+    } finally {
+      Date.now = realDateNow;
+    }
+
+    // 18e: R-03 自然文件小数 mtimeMs 与浮点 queuedAt 不得触发 AbortSignal.timeout 非整数越界 (ERR_OUT_OF_RANGE)
+    {
+      let hitPost = 0;
+      let hitState = 0;
+      const dshServer = http.createServer((req, res) => {
+        if (req.method === 'POST' && req.url === '/dsh-pet-7340/balance') {
+          hitPost += 1;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+          return;
+        }
+        if (req.method === 'GET' && req.url === '/dsh-pet-7340/state') {
+          hitState += 1;
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            sections: {
+              balance: {
+                counter: 1,
+                data: {
+                  ok: true,
+                  shape: 'money',
+                  provider: 'deepseek',
+                  is_available: true,
+                  wallets: [{ currency: 'CNY', total: '88.00', toppedUp: '88.00', granted: '0.00' }]
+                }
+              }
+            }
+          }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+      await new Promise((resolve) => dshServer.listen(0, '127.0.0.1', resolve));
+      const dshPort = dshServer.address().port;
+      const origFind = AgentMonitor.prototype.findActiveDshBaseUrl;
+      const realDateNow18e = Date.now;
+      try {
+        fs.writeFileSync(path.join(s18Dir, 'config.json'), JSON.stringify({ DeepSeekBalanceEnabled: true, DshPort: dshPort }), 'utf8');
+        mon.lastConfigSig = `true:${dshPort}:`;
+
+        // 1) 自然 NTFS 文件写入消费：pendingForceBalanceAt 必须为整数毫秒，且真接入 DSH HTTP 端口也不触发浮点越界
+        mon.invalidateBalance('TEST_18E_MTIME', { emitLoading: false });
+        mon.lastFlagBalanceMtime = 0;
+        let releaseBusyNatural;
+        mon.findActiveDshBaseUrl = () => new Promise((resolve) => { releaseBusyNatural = () => resolve(null); });
+        const pNat = mon.pollBalance(false);
+        await new Promise((r) => setTimeout(r, 15));
+        fs.writeFileSync(mon.paths.refreshBalanceFlag, String(Date.now()), 'utf8');
+        mon.checkBalanceTrigger();
+        assert.strictEqual(mon.pendingForceBalance, true, '18e must queue pendingForceBalance');
+        assert.strictEqual(Number.isInteger(mon.pendingForceBalanceAt), true, `18e pendingForceBalanceAt must be integer, got ${mon.pendingForceBalanceAt}`);
+        releaseBusyNatural();
+        await pNat;
+
+        // 2) 模拟真实 checkBalanceTrigger 消费 NTFS 小数 mtimeMs 并在原请求耗满 10s 后接力触发真实 POST+GET HTTP 查询
+        mon.invalidateBalance('TEST_18E_NATURAL_FOLLOWUP', { emitLoading: false });
+        mon.findActiveDshBaseUrl = origFind;
+        mon.lastFlagBalanceMtime = 0;
+        events.length = 0;
+        const fracBaseNow = Math.floor(realDateNow18e());
+        const fracMtimeMs = (fracBaseNow - 8000) + 0.1921; // 比现在早 8000ms 且带自然小数
+        mon.balanceBusy = true;
+        mon.lastBalanceFetchAttempt = fracBaseNow - 10_050;
+        fs.writeFileSync(mon.paths.refreshBalanceFlag, String(fracMtimeMs), 'utf8');
+        setFileMtime(mon.paths.refreshBalanceFlag, fracMtimeMs);
+        mon.checkBalanceTrigger();
+        assert.strictEqual(mon.pendingForceBalance, true, '18e fractional mtime must set pendingForceBalance');
+        assert.strictEqual(Number.isInteger(mon.pendingForceBalanceAt), true, `18e pendingForceBalanceAt from mtime must be integer, got ${mon.pendingForceBalanceAt}`);
+        const queuedFracAt = mon.pendingForceBalanceAt;
+        mon.balanceBusy = false;
+        mon.pendingForceBalance = false;
+        mon.pendingForceBalanceAt = 0;
+        await mon.pollBalance(true, { queuedAt: queuedFracAt });
+        assert.strictEqual(hitPost, 1, '18e fractional follow-up must send real POST /balance');
+        assert.strictEqual(hitState, 1, '18e fractional follow-up must send real GET /state');
+        assert.strictEqual(events.at(-1).status, 'ok', `18e expected status=ok, got ${JSON.stringify(events.at(-1))}`);
+        assert.strictEqual(events.at(-1).errorCode, null);
+        assert.strictEqual(events.at(-1).balances[0].totalBalance, '88.00');
+
+        // 3) 显式传入带小数毫秒的 queuedAt（如 1794822230725.1921 样式）+ 剩余预算 >= 300ms：正常发请求成功
+        mon.invalidateBalance('TEST_18E_FRAC_OK', { emitLoading: false });
+        events.length = 0;
+        const fracNow = Math.floor(realDateNow18e());
+        const fracQueuedAt = fracNow - 7050 + 0.1921;
+        await mon.pollBalance(true, { queuedAt: fracQueuedAt });
+        assert.strictEqual(hitPost, 2);
+        assert.strictEqual(hitState, 2);
+        assert.strictEqual(events.at(-1).status, 'ok');
+
+        // 4) 带小数毫秒且预算耗尽（剩余 < 300ms）：应及时产出 TIMEOUT，不报错 DSH_FETCH_ERROR
+        mon.invalidateBalance('TEST_18E_FRAC_TIMEOUT', { emitLoading: false });
+        events.length = 0;
+        const exhaustedFracAt = Math.floor(realDateNow18e()) - 9850 + 0.73; // 剩余 ~149.27ms < 300ms
+        await mon.pollBalance(true, { queuedAt: exhaustedFracAt });
+        assert.strictEqual(events.at(-1).errorCode, 'TIMEOUT', '18e fractional exhausted must emit TIMEOUT');
+      } finally {
+        Date.now = realDateNow18e;
+        mon.findActiveDshBaseUrl = origFind;
+        await new Promise((resolve) => dshServer.close(resolve));
+      }
+    }
+
+    console.log('[PASS] Scenario 18: FIX-04 Node 无缓存冷却/限流回执与 balanceBusy 在途标记接力/预算封顶/小数时间验证通过');
+  }
 
   console.log('\nAll assertions passed.');
 } catch (e) {

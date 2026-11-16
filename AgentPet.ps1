@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.2"
+$script:AppVersion = "1.6.3"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -3065,6 +3065,7 @@ function Update-Facing {
 $script:isBubbleOpen = $false
 $script:manualBubbleHidden = $false
 $script:userInspectPanel = $null
+$script:quoteInspectActive = $false
 $script:userInspectHovering = $false
 $script:waitingLastAlert = $null
 $script:waitingAttentionActive = $false
@@ -3073,11 +3074,83 @@ $script:bubbleCloseTime = [DateTime]::MaxValue
 
 function Stop-UserBubbleInspection {
     $script:userInspectPanel = $null
+    $script:quoteInspectActive = $false
     $script:userInspectHovering = $false
     $script:userInspectUntil = [DateTime]::MinValue
 }
 
+function Test-HasProtectedUserBubble([DateTime]$now = [DateTime]::UtcNow) {
+    if ($script:userInspectPanel) { return $true }
+    if ($script:quoteInspectActive -and $script:userInspectUntil -gt $now) { return $true }
+    return $false
+}
+
+function Show-TemporaryQuoteBubble([string]$CharacterKey = $Config.Character, [double]$HoldSeconds = 5.5) {
+    $script:manualBubbleHidden = $false
+    $script:lastInteractTime = [DateTime]::UtcNow
+    if ($script:agentBusy -and $script:lastAgentState -in @("waiting", "approval")) {
+        Stop-UserBubbleInspection
+        Set-ActiveBubblePanel "work"
+        Show-Bubble 0
+        return
+    }
+    $QuoteText.Text = Get-RandomCharacterQuote $CharacterKey
+    Stop-UserBubbleInspection
+    Set-ActiveBubblePanel "quote"
+    $now = [DateTime]::UtcNow
+    $script:quoteInspectActive = $true
+    $script:userInspectHovering = [bool]($Bubble -and $Bubble.IsMouseOver)
+    $script:userInspectUntil = $now.AddSeconds($HoldSeconds)
+    Show-Bubble $HoldSeconds
+}
+
+function Update-TemporaryQuoteInspection([DateTime]$now, [bool]$hovered) {
+    if (-not $script:quoteInspectActive) { return }
+    if ($script:agentBusy -and $script:lastAgentState -in @("waiting", "approval")) {
+        Stop-UserBubbleInspection
+        Set-ActiveBubblePanel "work"
+        Show-Bubble 0
+        return
+    }
+    if ($hovered -or $script:userInspectHovering) {
+        $hoverUntil = $now.AddSeconds(2.0)
+        if ($script:userInspectUntil -lt $hoverUntil) {
+            $script:userInspectUntil = $hoverUntil
+        }
+    }
+    $script:userInspectHovering = $hovered
+    if ($now -lt $script:userInspectUntil) {
+        if ($script:bubbleCloseTime -lt $script:userInspectUntil) {
+            $script:bubbleCloseTime = $script:userInspectUntil
+        }
+        return
+    }
+
+    Stop-UserBubbleInspection
+    if ($script:agentBusy) {
+        if (-not $script:manualBubbleHidden) {
+            Set-ActiveBubblePanel "work"
+            Show-Bubble 0
+        } else {
+            Hide-Bubble
+        }
+    } else {
+        Hide-Bubble
+    }
+}
+
+function Show-ScalePreviewBubble {
+    $script:manualBubbleHidden = $false
+    if ($script:agentBusy -and (-not $script:userInspectPanel) -and (-not $script:quoteInspectActive) -and $script:userInspectUntil -le [DateTime]::UtcNow -and $WorkStatusPanel.Visibility -ne [System.Windows.Visibility]::Visible) {
+        Set-ActiveBubblePanel "work"
+        Show-Bubble 0 -Force
+        return
+    }
+    Show-Bubble -HoldSeconds 5.5 -Force
+}
+
 function Start-UserBubbleInspection([ValidateSet('quota', 'deepseek')][string]$mode) {
+    $script:quoteInspectActive = $false
     $script:userInspectPanel = $mode
     $script:userInspectHovering = $false
     $script:userInspectUntil = [DateTime]::MaxValue
@@ -3212,6 +3285,10 @@ function Hide-Bubble {
 function Set-ActiveBubblePanel([string]$mode) {
     if ($script:userInspectPanel -and $script:userInspectPanel -ne $mode) {
         Stop-UserBubbleInspection
+    } elseif ($script:quoteInspectActive -and $mode -ne "quote") {
+        $script:quoteInspectActive = $false
+        $script:userInspectHovering = $false
+        $script:userInspectUntil = [DateTime]::MinValue
     }
     $script:currentBubblePanel = $mode
     if ($mode -ne "work") {
@@ -3681,7 +3758,7 @@ function Initialize-TrayIcon {
         $work.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; Set-ActiveBubblePanel "work"; Show-Bubble 0 -Force })
         $quota.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "quota" })
         $deepseek.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "deepseek" })
-        $quote.Add_Click({ $script:manualBubbleHidden = $false; Set-AgentPetWindowVisible $true; $QuoteText.Text = Get-RandomCharacterQuote $Config.Character; Set-ActiveBubblePanel "quote"; Show-Bubble 5.5 })
+        $quote.Add_Click({ Set-AgentPetWindowVisible $true; Show-TemporaryQuoteBubble $Config.Character 5.5 })
         $defQuota.Add_Click({ $Config.BubbleMode = "quota"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quota" } }; Build-ContextMenu })
         $defDeepseek.Add_Click({ $Config.BubbleMode = "deepseek"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh } }; Build-ContextMenu })
         $defQuote.Add_Click({ $Config.BubbleMode = "quote"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quote" } }; Build-ContextMenu })
@@ -3997,16 +4074,28 @@ function Request-BalanceRefresh([switch]$Silent) {
         return
     }
 
-    $script:lastBalanceRefreshRequestTime = $now
-    if (-not $Silent) {
-        $script:balanceRequestTimeout = $now.AddSeconds(15.0)
-        $script:balanceRequestStartedMs = ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds()
-        if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.ToolTip = $null }
-    }
     try {
         [System.IO.File]::WriteAllText($RefreshBalanceFlagPath, [DateTime]::UtcNow.Ticks.ToString(), [System.Text.Encoding]::UTF8)
-        if ((-not $Silent) -and $DeepSeekStatusNotice) { $DeepSeekStatusNotice.Text = "刷新中..." }
-    } catch {}
+        $script:lastBalanceRefreshRequestTime = $now
+        if (-not $Silent) {
+            $script:balanceRequestTimeout = $now.AddSeconds(15.0)
+            $script:balanceRequestStartedMs = ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds()
+            if ($DeepSeekStatusNotice) {
+                $DeepSeekStatusNotice.ToolTip = $null
+                $DeepSeekStatusNotice.Text = "刷新中..."
+            }
+        }
+    } catch {
+        Log-Throttled "BalanceRefresh" "写入 DeepSeek 余额刷新标记失败：$($_.Exception.Message)" 30
+        if (-not $Silent) {
+            $script:balanceRequestTimeout = $null
+            $script:balanceRequestStartedMs = [long]0
+            if ($DeepSeekStatusNotice) {
+                $DeepSeekStatusNotice.ToolTip = $null
+                $DeepSeekStatusNotice.Text = "请求失败"
+            }
+        }
+    }
 }
 
 # AP05: 结果是否属于本次手动刷新：必须是终态（非 loading），且监控侧的尝试时间不早于本次请求发起时刻
@@ -4244,6 +4333,22 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
         $DeepSeekStatusNotice.Text   = "暂不可用"
         $DeepSeekMsgTitle.Text       = "暂不可用"
         $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { "$($balObj.errorMessage)（点击 ↻ 重试）" } else { "启动后未获取到余额数据（点击 ↻ 重试）" }
+        return
+    }
+
+    if (($st -in @("error", "stale")) -and (-not $balObj.balances -or $balObj.balances.Count -eq 0) -and ($balObj.errorCode -in @("COOLDOWN", "RATE_LIMITED"))) {
+        $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
+        $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
+        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
+        if ($balObj.errorCode -eq "COOLDOWN") {
+            $DeepSeekStatusNotice.Text = "冷却中"
+            $DeepSeekMsgTitle.Text     = "刷新冷却中"
+            $DeepSeekMsgDetail.Text    = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "刷新过于频繁，请稍后再试" }
+        } else {
+            $DeepSeekStatusNotice.Text = "频率限制"
+            $DeepSeekMsgTitle.Text     = "请求频率受限"
+            $DeepSeekMsgDetail.Text    = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "请求频率超限，请稍后再试" }
+        }
         return
     }
 
@@ -4694,9 +4799,7 @@ function Build-ContextMenu {
             Update-TrayTooltip -Force
             Trigger-PetBounce
             Play-ReleaseSound
-            $QuoteText.Text = Get-RandomCharacterQuote $ck
-            Set-ActiveBubblePanel "quote"
-            Show-Bubble 5.5
+            Show-TemporaryQuoteBubble $ck 5.5
             if ($sender.Parent) {
                 foreach ($sub in $sender.Parent.Items) {
                     if ($sub -is [System.Windows.Controls.MenuItem]) {
@@ -4779,11 +4882,9 @@ function Build-ContextMenu {
     $miSayQuote = New-Object System.Windows.Controls.MenuItem
     $miSayQuote.Header = "随机台词"
     $miSayQuote.Add_Click({
-        $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-        Set-ActiveBubblePanel "quote"
         Trigger-PetBounce
         Play-ReleaseSound
-        Show-Bubble 5.5
+        Show-TemporaryQuoteBubble $Config.Character 5.5
     })
     [void]$cm.Items.Add($miSayQuote)
 
@@ -4921,7 +5022,7 @@ function Build-ContextMenu {
             $Config.BubbleScale = [Math]::Max(0.8, [Math]::Min(1.3, [double]$sender.Tag))
             Save-Config
             Update-BubbleScale
-            Show-Bubble -HoldSeconds 5.5 -Force
+            Show-ScalePreviewBubble
             Build-ContextMenu
         })
         [void]$miBubbleScale.Items.Add($bItem)
@@ -4950,7 +5051,7 @@ function Build-ContextMenu {
             $Config.FontScale = [double]$sender.Tag
             Save-Config
             Update-FontScale
-            Show-Bubble -HoldSeconds 5.5 -Force
+            Show-ScalePreviewBubble
             Build-ContextMenu
         })
         [void]$miFont.Items.Add($fItem)
@@ -5204,7 +5305,6 @@ $script:happyUntil        = [DateTime]::MinValue
 $script:agentBusy         = $false
 $script:userInspectUntil  = [DateTime]::MinValue
 $script:refreshingUntil   = [DateTime]::MinValue
-$script:agentBusy         = $false
 $script:isDragging        = $false
 $script:mouseDownScreen   = New-Object System.Windows.Point(0, 0)
 $script:winStartLeft      = 0.0
@@ -5260,6 +5360,7 @@ $PetImage.Add_MouseLeftButtonUp({
         Update-Facing
     } else {
         Stop-UserBubbleInspection
+        $script:manualBubbleHidden = $false
         Trigger-PetBounce
         Play-ReleaseSound
         $script:happyUntil = [DateTime]::UtcNow.AddSeconds(1.8)
@@ -5317,14 +5418,18 @@ $Bubble.Add_MouseLeftButtonUp({
         "quota"
     }
 
-    if ($script:userInspectPanel -and $nextMode -in @("quota", "deepseek")) {
+    if (($script:agentBusy -or $script:userInspectPanel) -and $nextMode -in @("quota", "deepseek")) {
         Start-UserBubbleInspection $nextMode
         $e.Handled = $true
         return
     }
     if ($nextMode -eq "quote") {
-        $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
-    } elseif ($nextMode -eq "deepseek") {
+        Show-TemporaryQuoteBubble $Config.Character 5.5
+        $e.Handled = $true
+        return
+    }
+    $script:manualBubbleHidden = $false
+    if ($nextMode -eq "deepseek") {
         Request-BalanceRefresh
     } else {
         Request-QuotaRefresh
@@ -5492,7 +5597,7 @@ function Apply-AgentStatus($stObj) {
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
-            if (-not $script:userInspectPanel) {
+            if (-not (Test-HasProtectedUserBubble)) {
                 Set-ActiveBubblePanel $Config.BubbleMode
                 Hide-Bubble
             }
@@ -5512,7 +5617,7 @@ function Apply-AgentStatus($stObj) {
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
-            if (-not $script:userInspectPanel) {
+            if (-not (Test-HasProtectedUserBubble)) {
                 Set-ActiveBubblePanel $Config.BubbleMode
                 Hide-Bubble
             }
@@ -5538,7 +5643,7 @@ function Apply-AgentStatus($stObj) {
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
-            if (-not $script:userInspectPanel) {
+            if (-not (Test-HasProtectedUserBubble)) {
                 Set-ActiveBubblePanel $Config.BubbleMode
                 Hide-Bubble
             }
@@ -5933,6 +6038,7 @@ $Timer.Add_Tick({
 
     # Renew inspection before status updates can choose the work panel.
     Update-UserBubbleInspection $now ([bool]$Bubble.IsMouseOver)
+    Update-TemporaryQuoteInspection $now ([bool]$Bubble.IsMouseOver)
 
     # 0.5 Safety revert for balance refresh notice (AP05: report timeout honestly, never "已是最新")
     if (Get-Command Update-BalanceRefreshTimeout -ErrorAction SilentlyContinue) {
@@ -5970,7 +6076,7 @@ $Timer.Add_Tick({
                 $script:waitingLastAlert = $null
                 $script:lastInteractTime = [DateTime]::UtcNow
                 Set-PetSprite "idle"
-                if (-not $script:userInspectPanel) {
+                if (-not (Test-HasProtectedUserBubble)) {
                     Set-ActiveBubblePanel $Config.BubbleMode
                     Hide-Bubble
                 }
@@ -5978,10 +6084,13 @@ $Timer.Add_Tick({
         }
     }
 
-    # 2. Keep bubble open while user is hovering over it
-    if ($script:isBubbleOpen -and (-not $script:agentBusy) -and (-not $script:userInspectPanel)) {
+    # 2. Keep bubble open while user is hovering over it (never shorten an active hold deadline)
+    if ($script:isBubbleOpen -and (-not $script:agentBusy) -and (-not $script:userInspectPanel) -and (-not $script:quoteInspectActive)) {
         if ($Bubble.IsMouseOver) {
-            $script:bubbleCloseTime = $now.AddSeconds(2.8)
+            $hoverCloseAt = $now.AddSeconds(2.8)
+            if ($script:bubbleCloseTime -lt $hoverCloseAt) {
+                $script:bubbleCloseTime = $hoverCloseAt
+            }
         } elseif ($now -ge $script:bubbleCloseTime) {
             Hide-Bubble
         }
@@ -6010,7 +6119,7 @@ $Timer.Add_Tick({
 
         # Auto-Quotes (定时碎碎念)
         $aqMin = [int]$Config.AutoQuoteMinutes
-        if ($aqMin -gt 0 -and (-not $script:isBubbleOpen)) {
+        if ($aqMin -gt 0 -and (-not $script:isBubbleOpen) -and (-not $script:manualBubbleHidden)) {
             if (($now - $script:lastAutoQuoteTime).TotalMinutes -ge $aqMin) {
                 $script:lastAutoQuoteTime = $now
                 $QuoteText.Text = Get-RandomCharacterQuote $Config.Character
@@ -6035,8 +6144,11 @@ $Timer.Add_Tick({
         }
     }
 
-    # P1-2: If agent is busy and user 8s quota inspection expired, restore work panel
-    if ($script:agentBusy -and $script:userInspectUntil -and $now -ge $script:userInspectUntil) {
+    # P1-2: If agent is busy and user temporary view expired, restore work panel unless manually hidden
+    if ($script:agentBusy -and (-not $script:manualBubbleHidden) -and $script:userInspectUntil -gt [DateTime]::MinValue -and $now -ge $script:userInspectUntil) {
+        $script:userInspectUntil = [DateTime]::MinValue
+        $script:quoteInspectActive = $false
+        $script:userInspectHovering = $false
         if ($WorkStatusPanel.Visibility -ne [System.Windows.Visibility]::Visible) {
             Set-ActiveBubblePanel "work"
             Show-Bubble 0
