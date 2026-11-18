@@ -14,7 +14,7 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 | :---: | :---: | :---: |
 | ![小克](preview/claude-idle-preview.png) | ![白龙](preview/dragon-idle-preview.png) | ![双子](preview/gemini-idle-preview.png) |
 
-| DeepSeek娘（大肥鱼） | 智谱娘（ZCode） |
+| 大肥鱼（DeepSeek娘） | 智谱娘（GLM 娘） |
 | :---: | :---: |
 | ![DeepSeek娘](preview/deepseek-idle-preview.png) | ![智谱娘](preview/zcode-idle-preview.png) |
 
@@ -96,7 +96,7 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 #### 桌面置顶自愈、Codex 确认/接管漏报修复与双新角色接入
 
-- **新增 DeepSeek娘（大肥鱼）与智谱娘（ZCode）**：内置两套共 14 张 `384×384` 多状态立绘（智谱娘采用 v2 待机立绘，大肥鱼等待权限使用捧空碗专属图），同步补全角色主题配色、闲聊台词、五角色 7 态工作词库与托盘/WPF 右键菜单切换单选同步。
+- **新增 大肥鱼（DeepSeek娘）与智谱娘（GLM 娘）**：内置两套共 14 张 `384×384` 多状态立绘（智谱娘采用 v2 待机立绘，大肥鱼等待权限使用捧空碗专属图），同步补全角色主题配色、闲聊台词、五角色 7 态工作词库与托盘/WPF 右键菜单切换单选同步。
 - **修复 `Win+D` / 全屏后桌宠消失问题**：移除详情窗引发置顶失衡的 `Owner` 绑定，主窗与已展开详情窗通过 `Sync-AgentPetTopmost` 与 1 秒 Z-order 自愈巡检保持桌面顶层显示（避开菜单展开期间），并严格遵守用户手动隐藏与关闭置顶开关的显隐边界。
 - **修复 Codex 确认与浏览器接管漏报**：精准识别 `mcp__cua_repl` 交互及 `markHandoff` 15 分钟人工接管窗口（失败输出与 `turn_aborted` 中止即时清除等待），同时流式解析最高 `512 KiB` 会话首行并精确过滤 `guardian` 审查代理，保留所有 `thread_spawn` 正常工作子代理的等待通知。
 
