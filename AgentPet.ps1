@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.3"
+$script:AppVersion = "1.6.4"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -188,6 +188,9 @@ public static class AgentPetNative {
     public static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     public static extern bool DestroyIcon(IntPtr hIcon);
 
     public const int SW_HIDE = 0;
@@ -359,10 +362,17 @@ $DefaultConfig = [ordered]@{
     SleepSeconds      = 60
     AutoQuoteMinutes  = 3          # 0 = off, else minutes between random idle quotes
     BubbleMode             = "quota"    # "quota", "deepseek", or "quote"
+    QuotaStampStyle        = "embossed" # "embossed" or "lineart"
     TrayEnabled            = $true       # show a notification-area icon
     StartHidden            = $false      # start with the pet hidden but tray available
     StallDetectSeconds     = 45         # 0 = disable stalled inference
     PauseMonitorUntil      = 0          # UTC milliseconds; 0 = normal broadcasting
+    TaskCompleteSoundEnabled             = $true
+    MuteTaskSoundWhenHidden              = $true
+    QuietHoursEnabled                    = $false
+    QuietHoursStart                      = "23:00"
+    QuietHoursEnd                        = "08:00"
+    AntigravityTranscriptCompleteEnabled = $true
     LowBalanceAlertEnabled = $true
     LowBalanceCnyThreshold = 5.0
     DeepSeekBalanceEnabled    = $true    # enable DeepSeek balance via DSH host
@@ -451,6 +461,18 @@ function Load-Config {
         $Config.BubbleMode = "quota"
     }
     $Config.HoverDetailsEnabled = [bool]$Config.HoverDetailsEnabled
+    # Tray disable switch was removed from the UI, so ensure TrayEnabled always self-heals on load.
+    $Config.TrayEnabled = $true
+    $Config.TaskCompleteSoundEnabled = ($Config.TaskCompleteSoundEnabled -ne $false)
+    $Config.MuteTaskSoundWhenHidden = ($Config.MuteTaskSoundWhenHidden -ne $false)
+    $Config.QuietHoursEnabled = [bool]$Config.QuietHoursEnabled
+    $Config.AntigravityTranscriptCompleteEnabled = [bool]$Config.AntigravityTranscriptCompleteEnabled
+    if ($null -eq $Config.QuietHoursStart -or [string]::IsNullOrWhiteSpace([string]$Config.QuietHoursStart)) {
+        $Config.QuietHoursStart = "23:00"
+    }
+    if ($null -eq $Config.QuietHoursEnd -or [string]::IsNullOrWhiteSpace([string]$Config.QuietHoursEnd)) {
+        $Config.QuietHoursEnd = "08:00"
+    }
     $bs = if ($Config.BubbleScale) { [double]$Config.BubbleScale } else { 1.0 }
     $Config.BubbleScale = [Math]::Max(0.8, [Math]::Min(1.3, $bs))
 }
@@ -572,7 +594,7 @@ $script:CharacterRoster = @(
     @{ Key = "dragon";   Label = "白龙 (GPT娘)" },
     @{ Key = "gemini";   Label = "双子 (Gemini娘)" },
     @{ Key = "deepseek"; Label = "大肥鱼 (DeepSeek娘)" },
-    @{ Key = "zcode";    Label = "智谱娘 (ZCode)" }
+    @{ Key = "zcode";    Label = "智谱娘 (GLM 娘)" }
 )
 
 $script:lastQuoteMap = @{
@@ -635,6 +657,15 @@ function Get-RandomCharacterQuote([string]$charKey) {
         }
         if ($candidate -ne $last) { break }
     }
+    if ($candidate -eq $last) {
+        foreach ($item in $pool) {
+            $other = & $getText $item
+            if ($other -ne $last) {
+                $candidate = $other
+                break
+            }
+        }
+    }
 
     $script:lastQuoteMap[$charKey] = $candidate
     return $candidate
@@ -681,6 +712,7 @@ $WorkHeaderBanner     = $Window.FindName("WorkHeaderBanner")
 $WorkHeaderGradStop0  = $Window.FindName("WorkHeaderGradStop0")
 $WorkHeaderGradStop1  = $Window.FindName("WorkHeaderGradStop1")
 $WorkHeaderRow        = $Window.FindName("WorkHeaderRow")
+$WorkDetailButton     = $Window.FindName("WorkDetailButton")
 $WorkStateChip        = $Window.FindName("WorkStateChip")
 $WorkDot              = $Window.FindName("WorkDot")
 $WorkHeader           = $Window.FindName("WorkHeader")
@@ -697,6 +729,20 @@ $WorkContentGroup     = $Window.FindName("WorkContentGroup")
 $WorkTask             = $Window.FindName("WorkTask")
 
 $QuotaPanel       = $Window.FindName("QuotaPanel")
+$QuotaStubColumn  = $Window.FindName("QuotaStubColumn")
+$QuotaHeaderWash   = $Window.FindName("QuotaHeaderWash")
+$QuotaHeaderPaper  = $Window.FindName("QuotaHeaderPaper")
+$ShortQuotaStamp   = $Window.FindName("ShortQuotaStamp")
+$ShortPercentValue = $Window.FindName("ShortPercentValue")
+$WeekPercentValue  = $Window.FindName("WeekPercentValue")
+$script:currentBubblePanel = "quota"
+$QuotaTicketClip = $Window.FindResource("QuotaTicketPunches").Clone()
+# The outer card mirrors with the pet, while SceneText counter-mirrors the printed stub.
+$ticketMirror = [System.Windows.Media.ScaleTransform]::new(1, 1, 127, 0)
+$facingBinding = [System.Windows.Data.Binding]::new("ScaleX")
+$facingBinding.Source = $TextFacingScale
+[void][System.Windows.Data.BindingOperations]::SetBinding($ticketMirror, [System.Windows.Media.ScaleTransform]::ScaleXProperty, $facingBinding)
+$QuotaTicketClip.Transform = $ticketMirror
 $QuotaSourceIcon  = $Window.FindName("QuotaSourceIcon")
 $QuotaHeader      = $Window.FindName("QuotaHeader")
 $QuotaPlanBadge   = $Window.FindName("QuotaPlanBadge")
@@ -705,12 +751,14 @@ $QuotaResetNotice = $Window.FindName("QuotaResetNotice")
 $RefreshQuotaBtn  = $Window.FindName("RefreshQuotaBtn")
 $ShortLabel       = $Window.FindName("ShortLabel")
 $ShortReset       = $Window.FindName("ShortReset")
+$ShortQuotaAlert  = $Window.FindName("ShortQuotaAlert")
 $ShortPercent     = $Window.FindName("ShortPercent")
 $ShortTrack       = $Window.FindName("ShortTrack")
 $ShortBar         = $Window.FindName("ShortBar")
 $WeekLabel        = $Window.FindName("WeekLabel")
 $WeekReset        = $Window.FindName("WeekReset")
 $WeekPercent      = $Window.FindName("WeekPercent")
+$WeekQuotaAlert   = $Window.FindName("WeekQuotaAlert")
 $WeekTrack        = $Window.FindName("WeekTrack")
 $WeekBar          = $Window.FindName("WeekBar")
 
@@ -730,8 +778,11 @@ $PetHost          = $Window.FindName("PetHost")
 $PetScale         = $Window.FindName("PetScale")
 $PetImage         = $Window.FindName("PetImage")
 
-# Bind DeepSeek Panel Controls
+# Bind DeepSeek Panel Controls (Scheme 3 Journal Header + Frosted Glass Card)
 $DeepSeekPanel           = $Window.FindName("DeepSeekPanel")
+$DeepSeekHeaderBanner    = $Window.FindName("DeepSeekHeaderBanner")
+$DeepSeekHeaderGradStop0 = $Window.FindName("DeepSeekHeaderGradStop0")
+$DeepSeekHeaderGradStop1 = $Window.FindName("DeepSeekHeaderGradStop1")
 $DeepSeekHeaderGrid      = $Window.FindName("DeepSeekHeaderGrid")
 $DeepSeekIcon            = $Window.FindName("DeepSeekIcon")
 $DeepSeekHeader          = $Window.FindName("DeepSeekHeader")
@@ -739,18 +790,51 @@ $DeepSeekBadge           = $Window.FindName("DeepSeekBadge")
 $DeepSeekBadgeText       = $Window.FindName("DeepSeekBadgeText")
 $DeepSeekStatusNotice    = $Window.FindName("DeepSeekStatusNotice")
 $RefreshDeepSeekBtn      = $Window.FindName("RefreshDeepSeekBtn")
+$DeepSeekBodyHost        = $Window.FindName("DeepSeekBodyHost")
+$DeepSeekOrb1Stop0       = $Window.FindName("DeepSeekOrb1Stop0")
+$DeepSeekOrb1Stop1       = $Window.FindName("DeepSeekOrb1Stop1")
+$DeepSeekOrb2Stop0       = $Window.FindName("DeepSeekOrb2Stop0")
+$DeepSeekOrb2Stop1       = $Window.FindName("DeepSeekOrb2Stop1")
+$DeepSeekWatermark       = $Window.FindName("DeepSeekWatermark")
+$DeepSeekFrostedCard     = $Window.FindName("DeepSeekFrostedCard")
 $DeepSeekContentGrid     = $Window.FindName("DeepSeekContentGrid")
 $DeepSeekOkPanel         = $Window.FindName("DeepSeekOkPanel")
 $DeepSeekMainRowGrid     = $Window.FindName("DeepSeekMainRowGrid")
 $DeepSeekCurrencyLabel   = $Window.FindName("DeepSeekCurrencyLabel")
+$DeepSeekMetaBadgeLine   = $Window.FindName("DeepSeekMetaBadgeLine")
+$DeepSeekAvailPill       = $Window.FindName("DeepSeekAvailPill")
+$DeepSeekAvailDot        = $Window.FindName("DeepSeekAvailDot")
+$DeepSeekAvailPillText   = $Window.FindName("DeepSeekAvailPillText")
+$DeepSeekSubMetaText     = $Window.FindName("DeepSeekSubMetaText")
 $DeepSeekAvailableNotice = $Window.FindName("DeepSeekAvailableNotice")
 $DeepSeekTotalText       = $Window.FindName("DeepSeekTotalText")
+$DeepSeekRatioTrack      = $Window.FindName("DeepSeekRatioTrack")
+$DeepSeekToppedUpCol     = $Window.FindName("DeepSeekToppedUpCol")
+$DeepSeekGrantCol        = $Window.FindName("DeepSeekGrantCol")
+$DeepSeekFillBar         = $Window.FindName("DeepSeekFillBar")
+$DeepSeekGrantBar        = $Window.FindName("DeepSeekGrantBar")
 $DeepSeekSubRowGrid      = $Window.FindName("DeepSeekSubRowGrid")
+$DeepSeekRechargeLegend  = $Window.FindName("DeepSeekRechargeLegend")
+$DeepSeekToppedUpDot     = $Window.FindName("DeepSeekToppedUpDot")
 $DeepSeekBreakdownText   = $Window.FindName("DeepSeekBreakdownText")
-$DeepSeekPricingLink     = $Window.FindName("DeepSeekPricingLink")
+$DeepSeekGrantLegend     = $Window.FindName("DeepSeekGrantLegend")
+$DeepSeekGrantDot        = $Window.FindName("DeepSeekGrantDot")
+$DeepSeekGrantText       = $Window.FindName("DeepSeekGrantText")
 $DeepSeekMsgPanel        = $Window.FindName("DeepSeekMsgPanel")
+$DeepSeekMsgHeaderGrid   = $Window.FindName("DeepSeekMsgHeaderGrid")
+$DeepSeekMsgDot          = $Window.FindName("DeepSeekMsgDot")
 $DeepSeekMsgTitle        = $Window.FindName("DeepSeekMsgTitle")
+$DeepSeekMsgStatusPill   = $Window.FindName("DeepSeekMsgStatusPill")
+$DeepSeekMsgStatusText   = $Window.FindName("DeepSeekMsgStatusText")
 $DeepSeekMsgDetail       = $Window.FindName("DeepSeekMsgDetail")
+$DeepSeekMsgDivider      = $Window.FindName("DeepSeekMsgDivider")
+$DeepSeekDivStop0        = $Window.FindName("DeepSeekDivStop0")
+$DeepSeekDivStop1        = $Window.FindName("DeepSeekDivStop1")
+$DeepSeekMsgSubHint      = $Window.FindName("DeepSeekMsgSubHint")
+$DeepSeekMsgRightHint    = $Window.FindName("DeepSeekMsgRightHint")
+$DeepSeekFooterGrid      = $Window.FindName("DeepSeekFooterGrid")
+$DeepSeekFooterLeft      = $Window.FindName("DeepSeekFooterLeft")
+$DeepSeekFooterRight     = $Window.FindName("DeepSeekFooterRight")
 $script:deepSeekTimeoutLayout = $false
 $script:deepSeekSnapshotLabelActive = $false
 
@@ -796,23 +880,28 @@ Get-ChildItem $CharDir -Filter "*.png" | ForEach-Object {
 
 
 # Preload Agent Brand Icons (Codex, DSH, Antigravity, Claude, Gemini)
-$script:AgentIcons = @{}
-$IconDir = Join-Path $BaseDir "assets\icons"
-if (Test-Path $IconDir) {
-    Get-ChildItem $IconDir -Filter "*.png" | ForEach-Object {
+function Import-PetArtwork([string]$directory) {
+    $images = @{}
+    foreach ($file in (Get-ChildItem -LiteralPath $directory -Filter '*.png' -File -ErrorAction SilentlyContinue)) {
         try {
             $bmp = New-Object System.Windows.Media.Imaging.BitmapImage
             $bmp.BeginInit()
             $bmp.CacheOption = [System.Windows.Media.Imaging.BitmapCacheOption]::OnLoad
-            $bmp.UriSource = New-Object System.Uri($_.FullName)
+            $bmp.UriSource = [uri]::new($file.FullName)
             $bmp.EndInit()
             $bmp.Freeze()
-            $key = [System.IO.Path]::GetFileNameWithoutExtension($_.Name).ToLower()
-            $script:AgentIcons[$key] = $bmp
-        } catch {}
+            $images[$file.BaseName] = $bmp
+        } catch {
+            Write-PetLog "Could not load artwork: $($file.Name)"
+        }
     }
+    return $images
 }
-
+$script:AgentIcons = Import-PetArtwork (Join-Path $AssetsDir "icons")
+$script:QuotaStampSets = @{
+    embossed = Import-PetArtwork (Join-Path $AssetsDir "quota-stamps\embossed")
+    lineart  = Import-PetArtwork (Join-Path $AssetsDir "quota-stamps\lineart")
+}
 # Setup fallback aliases for all characters
 foreach ($c in @("claude", "dragon", "gemini", "deepseek", "zcode")) {
     $bustKey = "$c-bust"
@@ -884,26 +973,26 @@ $ColorConv = New-Object System.Windows.Media.ColorConverter
 $Themes = @{
     claude = @{
         SpeakerName    = "Claude娘（小克）"
-        BubbleBg       = "#FFFFF6EC"
-        Border         = "#FFE28532"
-        ShadowColor    = "#885E2F0D"
-        Accent         = "#FFCE6018"
-        HeaderAccent   = "#FFCE6018"
-        DotColor       = "#FFCE6018"
-        SubText        = "#FF8F5B36"
-        MutedText      = "#FFA66838"
-        BodyText       = "#FF4A2E1B"
-        PercentText    = "#FFBA4E0E"
-        TrackBg        = "#FFF3E2D2"
-        BarBrush       = "#FFE57E28"
-        BadgeBg        = "#FFF7E6D5"
-        BadgeFg        = "#FFAA5314"
-        HoverBg        = "#FFFFEAD3"
-        HeaderGrad0    = "#FFFFEAD3"
-        HeaderGrad1    = "#FFFFF2E2"
-        HeaderDivider  = "#FFF7D9BC"
+        BubbleBg       = "#FFFFFCFA"
+        Border         = "#FFF6A05C"
+        ShadowColor    = "#669E5220"
+        Accent         = "#FFC24800"
+        HeaderAccent   = "#FFC04700"
+        DotColor       = "#FFF28C48"
+        SubText        = "#FF6C5040"
+        MutedText      = "#FF745949"
+        BodyText       = "#FF4A382E"
+        PercentText    = "#FFE6732C"
+        TrackBg        = "#FFFFF6EF"
+        BarBrush       = "#FFDF6D26"
+        BadgeBg        = "#FFFFF5EC"
+        BadgeFg        = "#FFDE5B08"
+        HoverBg        = "#FFFFEDE0"
+        HeaderGrad0    = "#FFFFF4EA"
+        HeaderGrad1    = "#FFFFFBF6"
+        HeaderDivider  = "#FFF9DFCA"
         WatermarkGlyph = "✧"
-        WatermarkColor = "#24CE6018"
+        WatermarkColor = "#24E6732C"
     }
     dragon = @{
         SpeakerName    = "白龙娘（GPT娘）"
@@ -913,8 +1002,8 @@ $Themes = @{
         Accent         = "#FF595094"
         HeaderAccent   = "#FF484178"
         DotColor       = "#FF655DA2"
-        SubText        = "#FF6E6799"
-        MutedText      = "#FF8A84B0"
+        SubText        = "#FF625883"
+        MutedText      = "#FF5F567F"
         BodyText       = "#FF2C2645"
         PercentText    = "#FF484178"
         TrackBg        = "#FFE8E6F4"
@@ -936,8 +1025,8 @@ $Themes = @{
         Accent         = "#FF5340C9"
         HeaderAccent   = "#FF4B38BF"
         DotColor       = "#FF6D5CE7"
-        SubText        = "#FF63599E"
-        MutedText      = "#FF7E74B8"
+        SubText        = "#FF5B4F88"
+        MutedText      = "#FF5F528D"
         BodyText       = "#FF2F2859"
         PercentText    = "#FF4B38BF"
         TrackBg        = "#FFEAE6FA"
@@ -959,8 +1048,8 @@ $Themes = @{
         Accent         = "#FF1D5FA7"
         HeaderAccent   = "#FF1A5294"
         DotColor       = "#FF2B72BE"
-        SubText        = "#FF46698F"
-        MutedText      = "#FF6284A8"
+        SubText        = "#FF3C5C80"
+        MutedText      = "#FF3D5D83"
         BodyText       = "#FF19304B"
         PercentText    = "#FF1A5294"
         TrackBg        = "#FFDCEBFA"
@@ -975,15 +1064,15 @@ $Themes = @{
         WatermarkColor = "#242B72BE"
     }
     zcode = @{
-        SpeakerName    = "智谱娘（ZCode）"
+        SpeakerName    = "智谱娘（GLM 娘）"
         BubbleBg       = "#FFF1F4FC"
         Border         = "#FF4A66B0"
         ShadowColor    = "#661A264A"
         Accent         = "#FF2C478E"
         HeaderAccent   = "#FF253D7D"
         DotColor       = "#FF3B59A8"
-        SubText        = "#FF4D5E87"
-        MutedText      = "#FF697AA3"
+        SubText        = "#FF475581"
+        MutedText      = "#FF49597F"
         BodyText       = "#FF1C253B"
         PercentText    = "#FF253D7D"
         TrackBg        = "#FFDFE5F5"
@@ -1053,26 +1142,6 @@ function Get-WorkStateVisualStyle([string]$state, $theme) {
             HeaderColor      = "#FF991B1B"
         }
     }
-    if ($norm -in @("success", "done")) {
-        return @{
-            IsHighlighted    = $false
-            Border           = "#CC10B981"
-            BorderThickness  = 1.5
-            TailThickness    = 1.5
-            TailNearThick    = 1.4
-            ShadowColor      = "#065F46"
-            ShadowOpacity    = 0.24
-            HeaderGrad0      = "#FFECFDF5"
-            HeaderGrad1      = "#FFF6FEF9"
-            HeaderDivider    = "#FFA7F3D0"
-            ChipBg           = "Transparent"
-            ChipBorder       = "Transparent"
-            ChipThickness    = 0.0
-            ChipCornerRadius = 0.0
-            DotColor         = "#FF10B981"
-            HeaderColor      = "#FF059669"
-        }
-    }
     return @{
         IsHighlighted    = $false
         Border           = $theme.Border
@@ -1119,7 +1188,6 @@ function Apply-WorkVisualStyle([string]$state, $theme) {
         $shColor = $ColorConv.ConvertFromString($sv.ShadowColor)
         if ($BubbleShadow) {
             $BubbleShadow.Color      = $shColor
-            $BubbleShadow.BlurRadius = 16
             $BubbleShadow.ShadowDepth = 4
             $BubbleShadow.Opacity    = [double]$sv.ShadowOpacity
         }
@@ -1164,6 +1232,83 @@ function Apply-WorkVisualStyle([string]$state, $theme) {
     return $sv
 }
 
+function New-AlphaColor([byte]$alpha, [string]$hex) {
+    $c = $ColorConv.ConvertFromString($hex)
+    return [System.Windows.Media.Color]::FromArgb($alpha, $c.R, $c.G, $c.B)
+}
+
+function Set-DeepSeekThemeColors($t, $accentBrush, $subBrush, $mutedBrush, $bodyBrush, $pctBrush, $badgeBg, $badgeFg) {
+    $hdrAccentHex = if ($t.HeaderAccent) { $t.HeaderAccent } else { $t.Accent }
+    $hdrAccentBrush = $BrushConv.ConvertFromString($hdrAccentHex)
+
+    if ($DeepSeekHeaderBanner -and $t.HeaderDivider) {
+        try { $DeepSeekHeaderBanner.BorderBrush = $BrushConv.ConvertFromString($t.HeaderDivider) } catch {}
+    }
+    if ($DeepSeekHeaderGradStop0 -and $t.HeaderGrad0) {
+        try { $DeepSeekHeaderGradStop0.Color = $ColorConv.ConvertFromString($t.HeaderGrad0) } catch {}
+    }
+    if ($DeepSeekHeaderGradStop1 -and $t.HeaderGrad1) {
+        try { $DeepSeekHeaderGradStop1.Color = $ColorConv.ConvertFromString($t.HeaderGrad1) } catch {}
+    }
+    if ($DeepSeekOrb1Stop0 -and $DeepSeekOrb1Stop1 -and $t.BarBrush) {
+        try {
+            $DeepSeekOrb1Stop0.Color = New-AlphaColor 54 $t.BarBrush
+            $DeepSeekOrb1Stop1.Color = New-AlphaColor 0 $t.BarBrush
+        } catch {}
+    }
+    if ($DeepSeekOrb2Stop0 -and $DeepSeekOrb2Stop1 -and $t.HeaderGrad0) {
+        try {
+            $DeepSeekOrb2Stop0.Color = New-AlphaColor 52 $t.HeaderGrad0
+            $DeepSeekOrb2Stop1.Color = New-AlphaColor 0 $t.HeaderGrad0
+        } catch {}
+    }
+    if ($DeepSeekWatermark) {
+        $DeepSeekWatermark.Text = if ($t.WatermarkGlyph) { $t.WatermarkGlyph } else { "✧" }
+        if ($t.WatermarkColor) {
+            try { $DeepSeekWatermark.Foreground = $BrushConv.ConvertFromString($t.WatermarkColor) } catch {}
+        }
+    }
+    if ($DeepSeekHeader)          { $DeepSeekHeader.Foreground          = $hdrAccentBrush }
+    if ($DeepSeekBadge)           { $DeepSeekBadge.Background           = $badgeBg }
+    if ($DeepSeekBadgeText)       { $DeepSeekBadgeText.Foreground       = $badgeFg }
+    if ($DeepSeekStatusNotice)    { $DeepSeekStatusNotice.Foreground    = $mutedBrush }
+    if ($RefreshDeepSeekBtn)      { $RefreshDeepSeekBtn.Foreground      = $hdrAccentBrush }
+    if ($DeepSeekCurrencyLabel)   { $DeepSeekCurrencyLabel.Foreground   = $bodyBrush }
+    if ($DeepSeekSubMetaText)     { $DeepSeekSubMetaText.Foreground     = $mutedBrush }
+    if ($DeepSeekTotalText) {
+        $isWarnGold = [bool]$script:isLowBalance -and ($null -eq $script:lastBalanceObject -or $script:lastBalanceObject.isAvailable -ne $false)
+        $DeepSeekTotalText.Foreground = if ($isWarnGold) { $BrushConv.ConvertFromString("#FF85450C") } else { $pctBrush }
+    }
+    if ($DeepSeekRatioTrack -and $t.TrackBg) {
+        try {
+            $trkB = [System.Windows.Media.SolidColorBrush]::new((New-AlphaColor 165 $t.TrackBg))
+            $trkB.Freeze()
+            $DeepSeekRatioTrack.Background = $trkB
+        } catch {}
+    }
+    if ($t.BarBrush) {
+        try {
+            $barB = $BrushConv.ConvertFromString($t.BarBrush)
+            if ($DeepSeekFillBar)     { $DeepSeekFillBar.Background = $barB }
+            if ($DeepSeekToppedUpDot) { $DeepSeekToppedUpDot.Fill   = $barB }
+        } catch {}
+    }
+    if ($DeepSeekBreakdownText)   { $DeepSeekBreakdownText.Foreground   = $subBrush }
+    if ($DeepSeekGrantText)       { $DeepSeekGrantText.Foreground       = $mutedBrush }
+    if ($DeepSeekMsgTitle)        { $DeepSeekMsgTitle.Foreground        = $hdrAccentBrush }
+    if ($DeepSeekMsgDetail)       { $DeepSeekMsgDetail.Foreground       = $bodyBrush }
+    if ($DeepSeekDivStop0 -and $DeepSeekDivStop1 -and $t.HeaderDivider) {
+        try {
+            $DeepSeekDivStop0.Color = New-AlphaColor 80 $t.HeaderDivider
+            $DeepSeekDivStop1.Color = New-AlphaColor 10 $t.HeaderDivider
+        } catch {}
+    }
+    if ($DeepSeekMsgSubHint)      { $DeepSeekMsgSubHint.Foreground      = $mutedBrush }
+    if ($DeepSeekMsgRightHint)    { $DeepSeekMsgRightHint.Foreground    = $subBrush }
+    if ($DeepSeekFooterLeft)      { $DeepSeekFooterLeft.Foreground      = $mutedBrush }
+    if ($DeepSeekFooterRight)     { $DeepSeekFooterRight.Foreground     = $mutedBrush }
+}
+
 function Update-Theme {
     $t = Get-CurrentTheme
     if ($script:TrayMenu) { Update-TrayMenuTheme }
@@ -1185,7 +1330,9 @@ function Update-Theme {
 
     $BubbleBorder.Background      = $bgBrush
     $BubbleBorder.BorderBrush     = $borderBrush
-    $BubbleBorder.BorderThickness = [System.Windows.Thickness]::new(2.2)
+    if ($script:currentBubblePanel -ne "quota") {
+        $BubbleBorder.BorderThickness = [System.Windows.Thickness]::new(2.2)
+    }
     if ($Tail) {
         $Tail.Background      = $bgBrush
         $Tail.BorderBrush     = $borderBrush
@@ -1199,7 +1346,6 @@ function Update-Theme {
     $shadowColor = $ColorConv.ConvertFromString($t.ShadowColor)
     if ($BubbleShadow) {
         $BubbleShadow.Color       = $shadowColor
-        $BubbleShadow.BlurRadius  = 16
         $BubbleShadow.ShadowDepth = 4
         $BubbleShadow.Opacity     = 0.26
     }
@@ -1216,13 +1362,6 @@ function Update-Theme {
         $TailNearShadow.Opacity     = 0.23
     }
 
-    if ($WorkBodyWatermark) {
-        $WorkBodyWatermark.Text = if ($t.WatermarkGlyph) { $t.WatermarkGlyph } else { "✧" }
-        try {
-            $wmStr = if ($t.WatermarkColor) { $t.WatermarkColor } else { "#24CE6018" }
-            $WorkBodyWatermark.Foreground = $BrushConv.ConvertFromString($wmStr)
-        } catch {}
-    }
     if ($WorkCoopHintInline) { $WorkCoopHintInline.Foreground = $mutedBrush }
     if ($script:WorkCoopHintTextBlock -and (-not [Object]::ReferenceEquals($script:WorkCoopHintTextBlock, $WorkCoopHintInline))) {
         $script:WorkCoopHintTextBlock.Foreground = $mutedBrush
@@ -1234,11 +1373,25 @@ function Update-Theme {
         if ($WorkTask.Text -cne $nextWorkText) { $WorkTask.Text = $nextWorkText }
     }
     $activeWorkState = if ($script:currentBubblePanel -eq "work" -and $script:lastAgentState) { $script:lastAgentState } else { "working" }
-    [void](Apply-WorkVisualStyle $activeWorkState $t)
+    if ($script:currentBubblePanel -ne "quota") {
+        [void](Apply-WorkVisualStyle $activeWorkState $t)
+    }
     if ($script:currentBubblePanel -eq "work" -and $WorkStatusPanel -and $WorkStatusPanel.Visibility -eq [System.Windows.Visibility]::Visible) {
         Update-WorkTaskLineBudget
     }
 
+    $QuotaHeaderWash.Color = $ColorConv.ConvertFromString($t.HeaderGrad0)
+    $QuotaHeaderPaper.Color = $bgBrush.Color
+    $Window.Resources["QuotaRuleBrush"] = $BrushConv.ConvertFromString($t.HeaderDivider)
+    $Window.Resources["QuotaStubBrush"] = $badgeBg
+    $stampRole = if ($Themes.ContainsKey([string]$Config.Character)) { [string]$Config.Character } else { "claude" }
+    $stamp = $script:QuotaStampSets.embossed[$stampRole]
+    if ($Config.QuotaStampStyle -eq "lineart" -and $script:QuotaStampSets.lineart[$stampRole]) {
+        $stamp = $script:QuotaStampSets.lineart[$stampRole]
+    }
+    $ShortQuotaStamp.Source = $stamp
+    $WorkBodyWatermark.Source = $stamp
+    $QuotaSourceIcon.Source = $script:AgentIcons["codex"]
     $QuotaHeader.Foreground      = $accentBrush
     $QuotaPlanBadge.Background   = $badgeBg
     $QuotaPlanText.Foreground    = $badgeFg
@@ -1257,16 +1410,7 @@ function Update-Theme {
     $QuoteHint.Foreground    = $badgeFg
     $QuoteText.Foreground    = $bodyBrush
 
-    if ($DeepSeekHeader)          { $DeepSeekHeader.Foreground          = $accentBrush }
-    if ($DeepSeekBadge)           { $DeepSeekBadge.Background           = $badgeBg }
-    if ($DeepSeekBadgeText)       { $DeepSeekBadgeText.Foreground       = $badgeFg }
-    if ($DeepSeekStatusNotice)    { $DeepSeekStatusNotice.Foreground    = $mutedBrush }
-    if ($RefreshDeepSeekBtn)      { $RefreshDeepSeekBtn.Foreground      = $accentBrush }
-    if ($DeepSeekCurrencyLabel)   { $DeepSeekCurrencyLabel.Foreground   = $subBrush }
-    if ($DeepSeekTotalText)       { $DeepSeekTotalText.Foreground       = $pctBrush }
-    if ($DeepSeekBreakdownText)   { $DeepSeekBreakdownText.Foreground   = $mutedBrush }
-    if ($DeepSeekMsgTitle)        { $DeepSeekMsgTitle.Foreground        = $accentBrush }
-    if ($DeepSeekMsgDetail)       { $DeepSeekMsgDetail.Foreground       = $bodyBrush }
+    Set-DeepSeekThemeColors $t $accentBrush $subBrush $mutedBrush $bodyBrush $pctBrush $badgeBg $badgeFg
 
     Update-QuotaColors
     Update-DetailWindowTheme
@@ -1281,29 +1425,48 @@ function Sync-BubbleGeometryAndAnchor {
     $bs = [Math]::Max(0.8, [Math]::Min(1.3, $bs))
     $isWork = ($script:currentBubblePanel -eq "work")
 
-    $targetW = if ($isWork) { 254.0 } else { 264.0 }
-    $baseLeft = if ($isWork) { 30.0 } else { 26.0 }
+    $isTicket = ($script:currentBubblePanel -eq "quota")
+    $targetW = if ($isWork -or $isTicket) { 254.0 } else { 264.0 }
+    # Keep the original non-work card center and bottom anchor as the ticket narrows.
+    $baseLeft = if ($isWork) { 30.0 } elseif ($isTicket) { 31.0 } else { 26.0 }
     $maxWorkH = if ($script:WorkCardMaxHeightOverride -gt 0) { [double]$script:WorkCardMaxHeightOverride } else { 128.0 }
 
-    if ($isWork) {
-        $BubbleBorder.Width     = $targetW
+    $BubbleBorder.Width = $targetW
+    if ($isTicket) {
+        $ticketHeight = 104.0 + [Math]::Round(60.0 * [Math]::Max(0.0, [double]$Config.FontScale - 1.0))
+        $BubbleBorder.Height = $ticketHeight
+        $BubbleBorder.MinHeight = $ticketHeight
+        $BubbleBorder.MaxHeight = $ticketHeight
+        $BubbleBorder.Padding = [System.Windows.Thickness]::new(0)
+        $BubbleBorder.BorderThickness = [System.Windows.Thickness]::new(1, 1, 1, 2)
+        $BubbleBorder.CornerRadius = [System.Windows.CornerRadius]::new(13)
+        $seam = $targetW - $BubbleBorder.BorderThickness.Right - $QuotaStubColumn.Width.Value
+        $QuotaTicketClip.Children[1].Center = [System.Windows.Point]::new($seam, 0)
+        $QuotaTicketClip.Children[2].Center = [System.Windows.Point]::new($seam, $ticketHeight)
+        $BubbleBorder.Clip = $QuotaTicketClip
+    } elseif ($isWork) {
         $BubbleBorder.Height    = [double]::NaN
         $BubbleBorder.MinHeight = 72.0
         $BubbleBorder.MaxHeight = $maxWorkH
         $BubbleBorder.Padding   = [System.Windows.Thickness]::new(0)
     } else {
-        $fsPad = if ($Config.FontScale) { [double]$Config.FontScale } else { 1.0 }
-        $BubbleBorder.Width     = $targetW
         $BubbleBorder.Height    = 130.0
         $BubbleBorder.MinHeight = 130.0
         $BubbleBorder.MaxHeight = 130.0
-        if ($script:currentBubblePanel -eq "deepseek" -and $fsPad -gt 1.05) {
-            $BubbleBorder.Padding = [System.Windows.Thickness]::new(8, 3, 8, 3)
+        if ($script:currentBubblePanel -eq "deepseek") {
+            $BubbleBorder.Padding = [System.Windows.Thickness]::new(0)
+        } elseif ($script:currentBubblePanel -eq "quote" -and [double]$Config.FontScale -ge 1.30) {
+            # Give large text more room without changing the card height or tail anchor.
+            $BubbleBorder.Padding = [System.Windows.Thickness]::new(12, 4, 12, 4)
         } else {
             $BubbleBorder.Padding = [System.Windows.Thickness]::new(12, 8, 12, 8)
         }
     }
 
+    if (-not $isTicket -and $BubbleBorder.Clip) {
+        $BubbleBorder.Clip = $null
+        $BubbleBorder.CornerRadius = [System.Windows.CornerRadius]::new(18)
+    }
     $Bubble.Width  = $targetW
     $Bubble.Height = [double]::NaN
     [System.Windows.Controls.Canvas]::SetLeft($Bubble, $baseLeft + ($bs - 1.0) * 55.0)
@@ -1326,7 +1489,7 @@ function Sync-BubbleGeometryAndAnchor {
     } else {
         if ($isWork) { 72.0 } else { 130.0 }
     }
-    $cardH = if ($isWork) { [Math]::Max(72.0, [Math]::Min($maxWorkH, $rawCardH)) } else { 130.0 }
+    $cardH = if ($isWork) { [Math]::Max(72.0, [Math]::Min($maxWorkH, $rawCardH)) } else { $BubbleBorder.Height }
 
     $tailH = if ($BubbleTailPanel -and $BubbleTailPanel.ActualHeight -gt 1.0) {
         [double]$BubbleTailPanel.ActualHeight
@@ -1339,6 +1502,20 @@ function Sync-BubbleGeometryAndAnchor {
 
     [System.Windows.Controls.Canvas]::SetTop($Bubble, 169.0 - $cardH)
     $Bubble.RenderTransformOrigin = [System.Windows.Point]::new(0.50, [Math]::Round($cardH / $totalH, 4))
+    if ($BubbleShadow) {
+        # The stage clips to the window. Keep the effect inside it at full zoom.
+        # Reflection swaps left and right, so the smaller horizontal margin serves both facings.
+        $stageWidth = $Root.Parent.Width
+        $stageHeight = $Root.Parent.Height
+        $centerX = [System.Windows.Controls.Canvas]::GetLeft($Root) + [System.Windows.Controls.Canvas]::GetLeft($Bubble) + $targetW / 2
+        $halfWidth = $targetW * $bs / 2
+        $bottom = [System.Windows.Controls.Canvas]::GetTop($Root) + 169.0
+        $sideRoom = [Math]::Min($centerX - $halfWidth, $stageWidth - $centerX - $halfWidth)
+        $topRoom = $bottom - $cardH * $bs
+        $bottomRoom = $stageHeight - $bottom - $BubbleShadow.ShadowDepth * $bs
+        $space = [Math]::Min([Math]::Min($sideRoom, $topRoom), $bottomRoom)
+        $BubbleShadow.BlurRadius = [Math]::Max(0.0, [Math]::Min(16.0, [Math]::Floor(($space - 1.0) / $bs)))
+    }
     $Bubble.InvalidateArrange()
     if ($Window.IsLoaded -or $Bubble.IsArrangeValid) {
         $Window.UpdateLayout()
@@ -1403,75 +1580,55 @@ function Sync-DeepSeekFontScale {
     if ($fs -lt 0.80) { $fs = 0.80 }
     if ($fs -gt 1.40) { $fs = 1.40 }
     $pctFs = [Math]::Min(1.25, $fs)
+    $metaFs = [Math]::Min(1.20, $fs)
     $isTimeout = [bool]$script:deepSeekTimeoutLayout
     $isSnapLbl = [bool]$script:deepSeekSnapshotLabelActive
 
-    $baseHeader   = if ($isTimeout) { 11.0 } else { 12.5 }
-    $baseNotice   = if ($isTimeout) { 9.5 } else { 10.0 }
-    $baseCurrency = if ($isSnapLbl -or $isTimeout) { 10.0 } else { 10.8 }
+    $baseHeader   = if ($isTimeout) { 11.0 } else { 11.8 }
+    $baseNotice   = if ($isTimeout) { 9.2 } else { 9.8 }
+    $baseCurrency = if ($isSnapLbl -or $isTimeout) { 10.2 } else { 11.2 }
 
     if ($DeepSeekHeader)          { $DeepSeekHeader.FontSize          = [Math]::Round($baseHeader * $fs, 2) }
-    if ($DeepSeekBadgeText)       { $DeepSeekBadgeText.FontSize       = [Math]::Round(9.5 * $fs, 2) }
+    if ($DeepSeekBadgeText)       { $DeepSeekBadgeText.FontSize       = [Math]::Round(9.0 * $fs, 2) }
     if ($DeepSeekStatusNotice)    { $DeepSeekStatusNotice.FontSize    = [Math]::Round($baseNotice * $fs, 2) }
-    if ($RefreshDeepSeekBtn)      { $RefreshDeepSeekBtn.FontSize      = [Math]::Round(12.5 * $fs, 2) }
+    if ($RefreshDeepSeekBtn)      { $RefreshDeepSeekBtn.FontSize      = [Math]::Round(11.2 * $fs, 2) }
     if ($DeepSeekCurrencyLabel)   { $DeepSeekCurrencyLabel.FontSize   = [Math]::Round($baseCurrency * $fs, 2) }
-    if ($DeepSeekAvailableNotice) { $DeepSeekAvailableNotice.FontSize = [Math]::Round(9.5 * $fs, 2) }
-    if ($DeepSeekTotalText)       { $DeepSeekTotalText.FontSize       = [Math]::Round(18.0 * $pctFs, 2) }
-    if ($DeepSeekBreakdownText)   { $DeepSeekBreakdownText.FontSize   = [Math]::Round(10.0 * $fs, 2) }
-    if ($DeepSeekPricingLink)     { $DeepSeekPricingLink.FontSize     = [Math]::Round(9.5 * $fs, 2) }
-    if ($DeepSeekMsgTitle)        { $DeepSeekMsgTitle.FontSize        = [Math]::Round(12.5 * $fs, 2) }
+    if ($DeepSeekAvailableNotice) { $DeepSeekAvailableNotice.FontSize = [Math]::Round(9.4 * $metaFs, 2) }
+    if ($DeepSeekTotalText)       { $DeepSeekTotalText.FontSize       = [Math]::Round(20.5 * $pctFs, 2) }
+    if ($DeepSeekBreakdownText)   { $DeepSeekBreakdownText.FontSize   = [Math]::Round(10.4 * $fs, 2) }
+    if ($DeepSeekGrantText)       { $DeepSeekGrantText.FontSize       = [Math]::Round(10.4 * $fs, 2) }
+    if ($DeepSeekMsgTitle)        { $DeepSeekMsgTitle.FontSize        = [Math]::Round(11.6 * $pctFs, 2) }
+    if ($DeepSeekMsgStatusText)   { $DeepSeekMsgStatusText.FontSize   = [Math]::Round(9.0 * $metaFs, 2) }
     if ($DeepSeekMsgDetail) {
-        $DeepSeekMsgDetail.FontSize   = [Math]::Round(10.5 * $fs, 2)
-        $DeepSeekMsgDetail.LineHeight = [Math]::Ceiling(14.5 * $fs)
-        $DeepSeekMsgDetail.MaxHeight  = [Math]::Ceiling(44.0 * $fs)
+        $DeepSeekMsgDetail.FontSize   = [Math]::Round(10.0 * $fs, 2)
+        $lineH = [Math]::Ceiling(12.8 * $fs)
+        $DeepSeekMsgDetail.LineHeight = $lineH
+        $DeepSeekMsgDetail.MaxHeight  = [Math]::Ceiling($lineH * 2.0)
     }
-    if ($fs -gt 1.05) {
-        if ($DeepSeekHeaderGrid)  { $DeepSeekHeaderGrid.Margin  = [System.Windows.Thickness]::new(0, 0, 0, 1) }
-        if ($DeepSeekMainRowGrid) { $DeepSeekMainRowGrid.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0) }
-        if ($DeepSeekSubRowGrid)  { $DeepSeekSubRowGrid.Margin  = [System.Windows.Thickness]::new(0, 0, 0, 0) }
-        if ($DeepSeekContentGrid) { $DeepSeekContentGrid.MinHeight = 0 }
-    } else {
-        if ($DeepSeekHeaderGrid)  { $DeepSeekHeaderGrid.Margin  = [System.Windows.Thickness]::new(0, 0, 0, 5) }
-        if ($DeepSeekMainRowGrid) { $DeepSeekMainRowGrid.Margin = [System.Windows.Thickness]::new(0, 1, 0, 1) }
-        if ($DeepSeekSubRowGrid)  { $DeepSeekSubRowGrid.Margin  = [System.Windows.Thickness]::new(0, 3, 0, 0) }
-        if ($DeepSeekContentGrid) { $DeepSeekContentGrid.MinHeight = 56 }
-    }
-    if ($script:currentBubblePanel -eq "deepseek" -and $BubbleBorder) {
-        if ($fs -gt 1.05) {
-            $BubbleBorder.Padding = [System.Windows.Thickness]::new(8, 3, 8, 3)
-        } else {
-            $BubbleBorder.Padding = [System.Windows.Thickness]::new(12, 8, 12, 8)
-        }
-    }
+    if ($DeepSeekMsgSubHint)      { $DeepSeekMsgSubHint.FontSize      = [Math]::Round(9.4 * $metaFs, 2) }
+    if ($DeepSeekMsgRightHint)    { $DeepSeekMsgRightHint.FontSize    = [Math]::Round(9.4 * $metaFs, 2) }
+    # Keep the footer's original maximum height so the larger base size does not squeeze the balance rows.
+    $footerFontSize = [Math]::Round([Math]::Min(11.0, 10.2 * $fs), 2)
+    if ($DeepSeekFooterLeft)      { $DeepSeekFooterLeft.FontSize      = $footerFontSize }
+    if ($DeepSeekFooterRight)     { $DeepSeekFooterRight.FontSize     = $footerFontSize }
 
+    $compact = ($fs -gt 1.05)
+    $bodyPadW = if ($compact) { 13.0 } else { 17.0 }
+    $cardPadW = if ($compact) { 15.0 } else { 17.0 }
+    $bodyInnerW = [Math]::Max(80.0, 264.0 - 4.4 - $bodyPadW - $cardPadW - 1.2)
+    $inf = [System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity)
+
+    # Compute header notice wrapping early so vertical tightness can react cleanly to 2-row header + 2-row subrow
+    $noticeWrapped = $false
     if ($DeepSeekHeaderGrid -is [System.Windows.Controls.Grid] -and $DeepSeekStatusNotice -is [System.Windows.FrameworkElement]) {
-        $inf = [System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity)
-        if ($DeepSeekPricingLink -is [System.Windows.FrameworkElement] -and $DeepSeekSubRowGrid -is [System.Windows.Controls.Grid]) {
-            if ($DeepSeekPricingLink.Parent -ne $DeepSeekSubRowGrid) {
-                if ($DeepSeekPricingLink.Parent) { [void]$DeepSeekPricingLink.Parent.Children.Remove($DeepSeekPricingLink) }
-                [void]$DeepSeekSubRowGrid.Children.Add($DeepSeekPricingLink)
-            }
-            [System.Windows.Controls.Grid]::SetRow($DeepSeekPricingLink, 0)
-            [System.Windows.Controls.Grid]::SetColumn($DeepSeekPricingLink, 1)
-            [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekPricingLink, 1)
-            $DeepSeekPricingLink.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
-        }
         [System.Windows.Controls.Grid]::SetRow($DeepSeekStatusNotice, 0)
         [System.Windows.Controls.Grid]::SetColumn($DeepSeekStatusNotice, 1)
         [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekStatusNotice, 1)
         $DeepSeekStatusNotice.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
-        $DeepSeekStatusNotice.Margin = [System.Windows.Thickness]::new(2, 0, 2, 0)
+        $DeepSeekStatusNotice.Margin = [System.Windows.Thickness]::new(3, 0, 4, 0)
 
-        if ($DeepSeekAvailableNotice -is [System.Windows.FrameworkElement]) {
-            [System.Windows.Controls.Grid]::SetRow($DeepSeekAvailableNotice, 0)
-            [System.Windows.Controls.Grid]::SetColumn($DeepSeekAvailableNotice, 1)
-            [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekAvailableNotice, 1)
-            $DeepSeekAvailableNotice.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
-            $DeepSeekAvailableNotice.Margin = [System.Windows.Thickness]::new(4, 0, 4, 1)
-        }
-
-        $padW = if ($fs -gt 1.05) { 16.0 } else { 24.0 }
-        $cardInnerW = 264.0 - 4.4 - $padW
+        $hdrPadW = if ($compact) { 15.5 } else { 18.5 }
+        $cardInnerW = 264.0 - 4.4 - $hdrPadW
         $col0Stack = if ($DeepSeekHeader) { $DeepSeekHeader.Parent -as [System.Windows.FrameworkElement] } else { $null }
         $col0W = 0.0
         if ($col0Stack) { $col0Stack.InvalidateMeasure(); $col0Stack.Measure($inf); $col0W = $col0Stack.DesiredSize.Width }
@@ -1481,33 +1638,219 @@ function Sync-DeepSeekFontScale {
         $availCol1W = [Math]::Max(0.0, $cardInnerW - $col0W - $btnW)
 
         if ($DeepSeekStatusNotice.DesiredSize.Width -gt ($availCol1W + 0.5)) {
+            $noticeWrapped = $true
             [System.Windows.Controls.Grid]::SetRow($DeepSeekStatusNotice, 1)
             [System.Windows.Controls.Grid]::SetColumn($DeepSeekStatusNotice, 0)
-            [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekStatusNotice, 3)
+            [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekStatusNotice, 2)
             $DeepSeekStatusNotice.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
-            $DeepSeekStatusNotice.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
-            if ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible -and ($DeepSeekPricingLink -is [System.Windows.FrameworkElement])) {
-                if ($DeepSeekPricingLink.Parent) { [void]$DeepSeekPricingLink.Parent.Children.Remove($DeepSeekPricingLink) }
-                [void]$DeepSeekHeaderGrid.Children.Add($DeepSeekPricingLink)
-                [System.Windows.Controls.Grid]::SetRow($DeepSeekPricingLink, 1)
-                [System.Windows.Controls.Grid]::SetColumn($DeepSeekPricingLink, 0)
-                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekPricingLink, 3)
-                $DeepSeekPricingLink.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
-            }
+            $DeepSeekStatusNotice.Margin = [System.Windows.Thickness]::new(0, 1, 0, 0)
         }
+    }
 
-        if ($DeepSeekAvailableNotice -is [System.Windows.FrameworkElement] -and (-not [string]::IsNullOrEmpty($DeepSeekAvailableNotice.Text)) -and ($DeepSeekCurrencyLabel -is [System.Windows.FrameworkElement]) -and ($DeepSeekTotalText -is [System.Windows.FrameworkElement])) {
-            $DeepSeekCurrencyLabel.InvalidateMeasure(); $DeepSeekCurrencyLabel.Measure($inf)
-            $DeepSeekAvailableNotice.InvalidateMeasure(); $DeepSeekAvailableNotice.Measure($inf)
-            $DeepSeekTotalText.InvalidateMeasure(); $DeepSeekTotalText.Measure($inf)
-            $availMainCol0 = [Math]::Max(0.0, $cardInnerW - $DeepSeekAvailableNotice.DesiredSize.Width - $DeepSeekTotalText.DesiredSize.Width)
-            if ($DeepSeekCurrencyLabel.DesiredSize.Width -gt ($availMainCol0 + 0.5)) {
-                [System.Windows.Controls.Grid]::SetRow($DeepSeekAvailableNotice, 1)
-                [System.Windows.Controls.Grid]::SetColumn($DeepSeekAvailableNotice, 0)
-                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekAvailableNotice, 3)
-                $DeepSeekAvailableNotice.Margin = [System.Windows.Thickness]::new(0, 0, 0, 0)
+    # P2-01: Adaptive single-row vs two-row legend so Recharge & Grant never overlap at 1.3x-1.4x or 4-digit balances
+    $useTwoRowSub = $false
+    if ($DeepSeekSubRowGrid -is [System.Windows.Controls.Grid] -and $DeepSeekRechargeLegend -is [System.Windows.FrameworkElement] -and $DeepSeekGrantLegend -is [System.Windows.FrameworkElement]) {
+        [System.Windows.Controls.Grid]::SetRow($DeepSeekRechargeLegend, 0)
+        [System.Windows.Controls.Grid]::SetColumn($DeepSeekRechargeLegend, 0)
+        [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekRechargeLegend, 1)
+        [System.Windows.Controls.Grid]::SetRow($DeepSeekGrantLegend, 0)
+        [System.Windows.Controls.Grid]::SetColumn($DeepSeekGrantLegend, 1)
+        [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekGrantLegend, 1)
+        $DeepSeekGrantLegend.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+        $DeepSeekGrantLegend.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+
+        if ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible -and $DeepSeekGrantLegend.Visibility -eq [System.Windows.Visibility]::Visible) {
+            if ($DeepSeekBreakdownText) { $DeepSeekBreakdownText.InvalidateMeasure(); $DeepSeekBreakdownText.Measure($inf) }
+            $DeepSeekRechargeLegend.InvalidateMeasure(); $DeepSeekRechargeLegend.Measure($inf)
+            $DeepSeekGrantLegend.InvalidateMeasure(); $DeepSeekGrantLegend.Measure($inf)
+            if (($DeepSeekRechargeLegend.DesiredSize.Width + $DeepSeekGrantLegend.DesiredSize.Width + 8.0) -gt $bodyInnerW) {
+                $useTwoRowSub = $true
+                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekRechargeLegend, 2)
+                [System.Windows.Controls.Grid]::SetRow($DeepSeekGrantLegend, 1)
+                [System.Windows.Controls.Grid]::SetColumn($DeepSeekGrantLegend, 0)
+                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekGrantLegend, 2)
+                $DeepSeekGrantLegend.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+                $DeepSeekGrantLegend.Margin = [System.Windows.Thickness]::new(0, 1.5, 0, 0)
             }
         }
+    }
+
+    # P2-02: Adaptive message header grid so DeepSeekMsgTitle & DeepSeekMsgStatusPill never intersect
+    $useTwoRowMsgHdr = $false
+    if ($DeepSeekMsgHeaderGrid -is [System.Windows.Controls.Grid] -and $DeepSeekMsgTitle -is [System.Windows.FrameworkElement] -and $DeepSeekMsgStatusPill -is [System.Windows.FrameworkElement]) {
+        [System.Windows.Controls.Grid]::SetRow($DeepSeekMsgTitle, 0)
+        [System.Windows.Controls.Grid]::SetColumn($DeepSeekMsgTitle, 1)
+        [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekMsgTitle, 1)
+        [System.Windows.Controls.Grid]::SetRow($DeepSeekMsgStatusPill, 0)
+        [System.Windows.Controls.Grid]::SetColumn($DeepSeekMsgStatusPill, 2)
+        [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekMsgStatusPill, 1)
+        $DeepSeekMsgStatusPill.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Right
+        $DeepSeekMsgStatusPill.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+
+        if ($DeepSeekMsgPanel -and $DeepSeekMsgPanel.Visibility -eq [System.Windows.Visibility]::Visible) {
+            $msgDotW = 0.0
+            if ($DeepSeekMsgDot -is [System.Windows.FrameworkElement]) {
+                $DeepSeekMsgDot.InvalidateMeasure(); $DeepSeekMsgDot.Measure($inf); $msgDotW = $DeepSeekMsgDot.DesiredSize.Width
+            }
+            $DeepSeekMsgTitle.InvalidateMeasure(); $DeepSeekMsgTitle.Measure($inf)
+            $DeepSeekMsgStatusPill.InvalidateMeasure(); $DeepSeekMsgStatusPill.Measure($inf)
+            if (($msgDotW + $DeepSeekMsgTitle.DesiredSize.Width + $DeepSeekMsgStatusPill.DesiredSize.Width + 8.0) -gt $bodyInnerW) {
+                $useTwoRowMsgHdr = $true
+                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekMsgTitle, 2)
+                [System.Windows.Controls.Grid]::SetRow($DeepSeekMsgStatusPill, 1)
+                [System.Windows.Controls.Grid]::SetColumn($DeepSeekMsgStatusPill, 1)
+                [System.Windows.Controls.Grid]::SetColumnSpan($DeepSeekMsgStatusPill, 2)
+                $DeepSeekMsgStatusPill.HorizontalAlignment = [System.Windows.HorizontalAlignment]::Left
+                $DeepSeekMsgStatusPill.Margin = [System.Windows.Thickness]::new(0, 2, 0, 0)
+            }
+        }
+    }
+
+    $msgCompactRoom = ($DeepSeekMsgPanel -and $DeepSeekMsgPanel.Visibility -eq [System.Windows.Visibility]::Visible -and ($fs -ge 1.14 -or $useTwoRowMsgHdr))
+    $extraTight = ($isTimeout -and ($useTwoRowSub -or $useTwoRowMsgHdr) -and $fs -ge 1.25) -or ($msgCompactRoom -and $fs -ge 1.25)
+    $twoRowOkTight = ($DeepSeekOkPanel -and $DeepSeekOkPanel.Visibility -eq [System.Windows.Visibility]::Visible -and $useTwoRowSub -and ($noticeWrapped -or $fs -ge 1.25))
+    $dualRowOkTight = ($twoRowOkTight -and $noticeWrapped)
+    if ($DeepSeekMsgDivider) {
+        $DeepSeekMsgDivider.Visibility = if ($msgCompactRoom -and $fs -ge 1.25) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    }
+    if ($DeepSeekMsgDetail) {
+        $detailGap = if ($msgCompactRoom -and $fs -ge 1.25) { 0 } else { 1 }
+        $DeepSeekMsgDetail.Margin = [System.Windows.Thickness]::new(0, $detailGap, 0, $detailGap)
+    }
+
+    $metaLineH = if ($twoRowOkTight) { [Math]::Ceiling(10.8 * $metaFs) } else { [Math]::Ceiling(12.2 * $metaFs) }
+    if ($DeepSeekAvailPillText) {
+        $DeepSeekAvailPillText.FontSize   = [Math]::Round(9.6 * $metaFs, 2)
+        $DeepSeekAvailPillText.LineHeight = $metaLineH
+    }
+    if ($DeepSeekSubMetaText) {
+        $DeepSeekSubMetaText.FontSize     = [Math]::Round(9.6 * $metaFs, 2)
+        $DeepSeekSubMetaText.LineHeight   = $metaLineH
+    }
+
+    # Trim font internal leading in large-scale two-row breakdown cards so Row 0 stays strictly inside FrostedCard and above RatioTrack
+    $blkStrat = [System.Windows.LineStackingStrategy]::BlockLineHeight
+    $maxStrat = [System.Windows.LineStackingStrategy]::MaxHeight
+    if ($dualRowOkTight) {
+        if ($DeepSeekHeader) {
+            $DeepSeekHeader.LineStackingStrategy = $blkStrat
+            $DeepSeekHeader.LineHeight = [Math]::Ceiling($DeepSeekHeader.FontSize * 1.15)
+        }
+        if ($DeepSeekStatusNotice) {
+            $DeepSeekStatusNotice.LineStackingStrategy = $blkStrat
+            $DeepSeekStatusNotice.LineHeight = [Math]::Ceiling($DeepSeekStatusNotice.FontSize * 1.12)
+            $DeepSeekStatusNotice.Margin = [System.Windows.Thickness]::new(0)
+        }
+    } else {
+        if ($DeepSeekHeader) {
+            $DeepSeekHeader.LineStackingStrategy = $maxStrat
+            $DeepSeekHeader.LineHeight = [double]::NaN
+        }
+        if ($DeepSeekStatusNotice) {
+            $DeepSeekStatusNotice.LineStackingStrategy = $maxStrat
+            $DeepSeekStatusNotice.LineHeight = [double]::NaN
+        }
+    }
+    if ($twoRowOkTight) {
+        if ($DeepSeekCurrencyLabel) {
+            $DeepSeekCurrencyLabel.LineStackingStrategy = $blkStrat
+            $DeepSeekCurrencyLabel.LineHeight = [Math]::Ceiling($DeepSeekCurrencyLabel.FontSize * 1.10)
+        }
+        if ($DeepSeekTotalText) {
+            $DeepSeekTotalText.LineStackingStrategy = $blkStrat
+            $DeepSeekTotalText.LineHeight = [Math]::Ceiling($DeepSeekTotalText.FontSize * 1.06)
+            $DeepSeekTotalText.Margin = [System.Windows.Thickness]::new(6, 0, 0, 0)
+        }
+        if ($DeepSeekBreakdownText) {
+            $DeepSeekBreakdownText.LineStackingStrategy = $blkStrat
+            $DeepSeekBreakdownText.LineHeight = [Math]::Ceiling($DeepSeekBreakdownText.FontSize * 1.08)
+        }
+        if ($DeepSeekGrantText) {
+            $DeepSeekGrantText.LineStackingStrategy = $blkStrat
+            $DeepSeekGrantText.LineHeight = [Math]::Ceiling($DeepSeekGrantText.FontSize * 1.08)
+        }
+        if ($DeepSeekAvailPill) {
+            $DeepSeekAvailPill.Padding = [System.Windows.Thickness]::new(4.5, 0.5, 4.5, 0.5)
+        }
+        if ($DeepSeekGrantLegend) {
+            $DeepSeekGrantLegend.Margin = [System.Windows.Thickness]::new(0, 0.5, 0, 0)
+        }
+    } else {
+        if ($DeepSeekCurrencyLabel) {
+            $DeepSeekCurrencyLabel.LineStackingStrategy = $maxStrat
+            $DeepSeekCurrencyLabel.LineHeight = [double]::NaN
+        }
+        if ($DeepSeekTotalText) {
+            $DeepSeekTotalText.LineStackingStrategy = $maxStrat
+            $DeepSeekTotalText.LineHeight = [double]::NaN
+            $DeepSeekTotalText.Margin = [System.Windows.Thickness]::new(6, -1, 0, 0)
+        }
+        if ($DeepSeekBreakdownText) {
+            $DeepSeekBreakdownText.LineStackingStrategy = $maxStrat
+            $DeepSeekBreakdownText.LineHeight = [double]::NaN
+        }
+        if ($DeepSeekGrantText) {
+            $DeepSeekGrantText.LineStackingStrategy = $maxStrat
+            $DeepSeekGrantText.LineHeight = [double]::NaN
+        }
+        if ($DeepSeekAvailPill) {
+            $DeepSeekAvailPill.Padding = [System.Windows.Thickness]::new(5.5, 1.5, 5.5, 1.5)
+        }
+    }
+
+    if ($dualRowOkTight) {
+        if ($DeepSeekHeaderBanner)  { $DeepSeekHeaderBanner.Padding  = [System.Windows.Thickness]::new(8, 1.5, 7.5, 1.5) }
+        if ($DeepSeekBodyHost)      { $DeepSeekBodyHost.Padding      = [System.Windows.Thickness]::new(6.5, 1.0, 6.5, 1.0) }
+        if ($DeepSeekFrostedCard)   { $DeepSeekFrostedCard.Padding   = [System.Windows.Thickness]::new(7.5, 1.0, 7.5, 1.0) }
+        if ($DeepSeekMetaBadgeLine) { $DeepSeekMetaBadgeLine.Margin  = [System.Windows.Thickness]::new(0, 0.5, 0, 0) }
+        if ($DeepSeekRatioTrack) {
+            $DeepSeekRatioTrack.Height = 4.0
+            $DeepSeekRatioTrack.Margin = [System.Windows.Thickness]::new(0, 1.0, 0, 1.0)
+        }
+        if ($DeepSeekFooterGrid)    { $DeepSeekFooterGrid.Margin     = [System.Windows.Thickness]::new(2, 1, 2, 0) }
+    } elseif ($twoRowOkTight -or $extraTight) {
+        if ($DeepSeekHeaderBanner)  { $DeepSeekHeaderBanner.Padding  = [System.Windows.Thickness]::new(8, 2, 7.5, 2) }
+        if ($DeepSeekBodyHost)      { $DeepSeekBodyHost.Padding      = [System.Windows.Thickness]::new(6.5, 1.5, 6.5, 1.5) }
+        if ($DeepSeekFrostedCard)   { $DeepSeekFrostedCard.Padding   = [System.Windows.Thickness]::new(7.5, 1.5, 7.5, 1.5) }
+        if ($DeepSeekMetaBadgeLine) { $DeepSeekMetaBadgeLine.Margin  = [System.Windows.Thickness]::new(0, 1, 0, 0) }
+        if ($DeepSeekRatioTrack) {
+            $DeepSeekRatioTrack.Height = 4.5
+            $DeepSeekRatioTrack.Margin = [System.Windows.Thickness]::new(0, 1.5, 0, 1.5)
+        }
+        if ($DeepSeekFooterGrid)    { $DeepSeekFooterGrid.Margin     = [System.Windows.Thickness]::new(2, 1, 2, 0) }
+    } elseif ($compact) {
+        if ($DeepSeekHeaderBanner)  { $DeepSeekHeaderBanner.Padding  = [System.Windows.Thickness]::new(8, 2.5, 7.5, 2.5) }
+        if ($DeepSeekBodyHost)      { $DeepSeekBodyHost.Padding      = [System.Windows.Thickness]::new(6.5, 2, 6.5, 1.5) }
+        if ($DeepSeekFrostedCard)   { $DeepSeekFrostedCard.Padding   = [System.Windows.Thickness]::new(7.5, 2.5, 7.5, 2.5) }
+        if ($DeepSeekMetaBadgeLine) { $DeepSeekMetaBadgeLine.Margin  = [System.Windows.Thickness]::new(0, 2, 0, 0) }
+        if ($DeepSeekRatioTrack) {
+            $DeepSeekRatioTrack.Height = 4.8
+            $DeepSeekRatioTrack.Margin = [System.Windows.Thickness]::new(0, 2, 0, 2.5)
+        }
+        if ($DeepSeekFooterGrid)    { $DeepSeekFooterGrid.Margin     = [System.Windows.Thickness]::new(2, 1.5, 2, 0) }
+    } else {
+        if ($DeepSeekHeaderBanner)  { $DeepSeekHeaderBanner.Padding  = [System.Windows.Thickness]::new(10, 4, 8.5, 4) }
+        if ($DeepSeekBodyHost)      { $DeepSeekBodyHost.Padding      = [System.Windows.Thickness]::new(8.5, 4, 8.5, 3.5) }
+        if ($DeepSeekFrostedCard)   { $DeepSeekFrostedCard.Padding   = [System.Windows.Thickness]::new(8.5, 4, 8.5, 4) }
+        if ($DeepSeekMetaBadgeLine) { $DeepSeekMetaBadgeLine.Margin  = [System.Windows.Thickness]::new(0, 3, 0, 0) }
+        if ($DeepSeekRatioTrack) {
+            $DeepSeekRatioTrack.Height = 6.0
+            $DeepSeekRatioTrack.Margin = [System.Windows.Thickness]::new(0, 3, 0, 4)
+        }
+        if ($DeepSeekFooterGrid)    { $DeepSeekFooterGrid.Margin     = [System.Windows.Thickness]::new(3, 2, 3, 0) }
+    }
+
+    if ($RefreshDeepSeekBtn -and $DeepSeekHeaderBanner) {
+        # Use the banner padding as part of the right-hand hit area without reducing the body budget.
+        $bannerPadding = $DeepSeekHeaderBanner.Padding
+        $RefreshDeepSeekBtn.Margin = [System.Windows.Thickness]::new(0, -$bannerPadding.Top, 0, -$bannerPadding.Bottom)
+    }
+    if ($DeepSeekFooterGrid) {
+        $hideFooterForCompact = ($useTwoRowSub -or $msgCompactRoom -or ($isTimeout -and $fs -ge 1.15))
+        $DeepSeekFooterGrid.Visibility = if ($hideFooterForCompact) { [System.Windows.Visibility]::Collapsed } else { [System.Windows.Visibility]::Visible }
+    }
+    if ($script:currentBubblePanel -eq "deepseek" -and $BubbleBorder) {
+        $BubbleBorder.Padding = [System.Windows.Thickness]::new(0)
     }
 }
 
@@ -1522,9 +1865,6 @@ function Update-FontScale {
         $WorkDot.Width = $dotSz
         $WorkDot.Height = $dotSz
     }
-    if ($WorkBodyWatermark) {
-        $WorkBodyWatermark.FontSize = [Math]::Round([Math]::Min(32.0, 28.0 * $fs), 1)
-    }
     Sync-WorkSourcesVisualScale $fs
     $WorkTask.FontSize         = [Math]::Round(12.5 * $fs, 1)
     $WorkTask.LineHeight       = [Math]::Ceiling(18.0 * $fs)
@@ -1537,12 +1877,37 @@ function Update-FontScale {
     $WeekLabel.FontSize        = [Math]::Round(11.5 * $fs, 1)
     $WeekReset.FontSize        = [Math]::Round(10.5 * $fs, 1)
     $WeekPercent.FontSize      = [Math]::Round(18.0 * $pctFs, 1)
+    $alertFontSize = [Math]::Round(10.0 * [Math]::Min(1.20, $fs), 1)
+    if ($ShortQuotaAlert) { $ShortQuotaAlert.FontSize = $alertFontSize }
+    if ($WeekQuotaAlert) { $WeekQuotaAlert.FontSize = $alertFontSize }
+    # Reserve space for both warning text and percentage without shifting the seam on refresh.
+    $QuotaStubColumn.Width = [System.Windows.GridLength]::new(78 + [Math]::Ceiling(45.0 * [Math]::Max(0.0, $fs - 1.0)))
+    $metaDock = if ($fs -ge 1.15) { [System.Windows.Controls.Dock]::Top } else { [System.Windows.Controls.Dock]::Left }
+    [System.Windows.Controls.DockPanel]::SetDock($QuotaPlanBadge, $metaDock)
+    $QuotaPlanBadge.HorizontalAlignment = if ($fs -ge 1.15) { "Right" } else { "Left" }
+    $stackTime = $fs -ge 1.30
+    $timeCell = if ($stackTime) { 0 } else { 1 }
+    foreach ($reset in @($ShortReset, $WeekReset)) {
+        [System.Windows.Controls.Grid]::SetRow($reset, [int]$stackTime)
+        [System.Windows.Controls.Grid]::SetColumn($reset, $timeCell)
+        [System.Windows.Controls.Grid]::SetColumnSpan($reset, (2 - $timeCell))
+        $reset.Margin = [System.Windows.Thickness]::new((5 * $timeCell), 0, 0, 0)
+        $reset.LineHeight = [Math]::Ceiling(12.0 * $fs)
+    }
+    foreach ($label in @($ShortLabel, $WeekLabel)) {
+        $label.LineHeight = [Math]::Ceiling(13.0 * $fs)
+    }
     $QuoteSpeaker.FontSize     = [Math]::Round(12.5 * $fs, 1)
     $QuoteHint.FontSize        = [Math]::Round(10.0 * $fs, 1)
     $QuoteText.FontSize        = [Math]::Round(13.5 * $fs, 1)
     $QuoteText.LineHeight      = [Math]::Round(20.0 * $fs, 1)
+    $QuoteText.MaxHeight       = 3 * $QuoteText.LineHeight
     Sync-DeepSeekFontScale
-    Update-WorkTaskLineBudget
+    if ($script:currentBubblePanel -in @("quote", "quota")) {
+        Sync-BubbleGeometryAndAnchor
+    } else {
+        Update-WorkTaskLineBudget
+    }
     Update-DetailWindowFontScale
     if ($script:DetailWindow -and $script:DetailWindow.IsVisible) {
         Update-DetailWindowPosition
@@ -1573,8 +1938,12 @@ $script:LastDetailMetaKey = $null
 $script:DetailHoverTimer = $null
 $script:detailTriggerEnterAt = [DateTime]::MinValue
 $script:detailLeaveAt = [DateTime]::MinValue
+$script:detailHoverFading = $false
+$script:detailPinned = $false
+$script:detailReturnFocus = [IntPtr]::Zero
 $script:TrayHoverDetailMenuItem = $null
 $script:WpfHoverDetailMenuItem = $null
+$script:WpfViewTaskDetailMenuItem = $null
 $script:WorkCoopHintTextBlock = $null
 $script:WorkOtherActiveCount = 0
 $script:WorkActiveSecondaryStyles = @()
@@ -2169,6 +2538,12 @@ function Update-WorkTaskLineBudget {
     $bwX = $BubbleBorder.BorderThickness.Left + $BubbleBorder.BorderThickness.Right
     $bwY = $BubbleBorder.BorderThickness.Top + $BubbleBorder.BorderThickness.Bottom
     $availBannerW = [Math]::Max(80.0, $cardW - $bwX - 23.0)
+    if ($WorkDetailButton) {
+        $WorkDetailButton.Visibility = if (Test-TaskDetailAvailable) { 'Visible' } else { 'Collapsed' }
+        if ($WorkDetailButton.Visibility -eq 'Visible') {
+            $availBannerW -= $WorkDetailButton.Width + $WorkDetailButton.Margin.Left + $WorkDetailButton.Margin.Right
+        }
+    }
 
     $otherStyles = if ($script:WorkActiveSecondaryStyles) { @($script:WorkActiveSecondaryStyles) } else { @() }
     $otherCount = $otherStyles.Count
@@ -2398,6 +2773,12 @@ function Update-DetailWindowTheme {
         $hoverBg = $BrushConv.ConvertFromString($t.HoverBg)
         $track = $BrushConv.ConvertFromString($t.TrackBg)
         $headerDiv = if ($t.HeaderDivider) { $BrushConv.ConvertFromString($t.HeaderDivider) } else { $track }
+        $edge = $bg.Color
+        $clearEdge = [System.Windows.Media.Color]::FromArgb(0, $edge.R, $edge.G, $edge.B)
+        $script:DetailWindow.Resources['DetailScrollThumbBrush'] = $sub
+        $script:DetailWindow.Resources['DetailScrollTrackBrush'] = $track
+        $script:DetailWindow.Resources['DetailScrollSurfaceColor'] = $edge
+        $script:DetailWindow.Resources['DetailScrollClearColor'] = $clearEdge
 
         if ($script:DetailCardBorder) {
             $script:DetailCardBorder.Background = $bg
@@ -2465,6 +2846,14 @@ function Ensure-DetailWindow {
         $script:DetailFooterBorder   = $dw.FindName("DetailFooterBorder")
         $script:DetailFooterText     = $dw.FindName("DetailFooterText")
 
+        $script:DetailScrollViewer.Add_ScrollChanged({
+            param($viewer, $e)
+            $top = $script:DetailWindow.FindName('DetailScrollFadeTop')
+            $bottom = $script:DetailWindow.FindName('DetailScrollFadeBottom')
+            $top.Visibility = if ($viewer.VerticalOffset -gt 0.5) { 'Visible' } else { 'Hidden' }
+            $bottom.Visibility = if ($viewer.ScrollableHeight - $viewer.VerticalOffset -gt 0.5) { 'Visible' } else { 'Hidden' }
+        })
+
         $dw.ShowActivated = $false
         $dw.Focusable = $false
         $dw.Topmost = [bool]$Window.Topmost
@@ -2488,6 +2877,21 @@ function Ensure-DetailWindow {
         })
         $dw.Add_MouseLeftButtonUp({
             param($s, $e)
+            $e.Handled = $true
+        })
+        $dw.Add_PreviewKeyDown({
+            param($sender, $e)
+            if (-not $sender.Focusable) { return }
+            switch ($e.Key) {
+                { $_ -eq [System.Windows.Input.Key]::Escape }   { Close-HoverDetailCard }
+                { $_ -eq [System.Windows.Input.Key]::Up }       { $script:DetailScrollViewer.LineUp() }
+                { $_ -eq [System.Windows.Input.Key]::Down }     { $script:DetailScrollViewer.LineDown() }
+                { $_ -eq [System.Windows.Input.Key]::PageUp }   { $script:DetailScrollViewer.PageUp() }
+                { $_ -eq [System.Windows.Input.Key]::PageDown } { $script:DetailScrollViewer.PageDown() }
+                { $_ -eq [System.Windows.Input.Key]::Home }     { $script:DetailScrollViewer.ScrollToTop() }
+                { $_ -eq [System.Windows.Input.Key]::End }      { $script:DetailScrollViewer.ScrollToBottom() }
+                default    { return }
+            }
             $e.Handled = $true
         })
         $dw.Add_Closed({
@@ -2752,17 +3156,74 @@ function Update-DetailWindowPosition {
     } catch {}
 }
 
-function Open-HoverDetailCard {
-    if (-not [bool]$Config.HoverDetailsEnabled) { return }
+function Test-TaskDetailAvailable {
+    return ($null -ne $script:lastWorkStatusObj -and
+        [string]$script:lastWorkStatusObj.state -notin @('', 'idle', 'done', 'success', 'aborted', 'failed'))
+}
+
+function Set-DetailCardOpacity([double]$opacity, [double]$milliseconds = 0.0) {
+    if (-not $script:DetailRootGrid) { return }
+    $opacityProperty = [System.Windows.UIElement]::OpacityProperty
+    $currentOpacity = [double]$script:DetailRootGrid.Opacity
+    $script:DetailRootGrid.BeginAnimation($opacityProperty, $null)
+    $script:DetailRootGrid.Opacity = $opacity
+    if ($milliseconds -gt 0) {
+        $fade = New-AgentPetEaseAnimation $currentOpacity $opacity $milliseconds
+        $script:DetailRootGrid.BeginAnimation($opacityProperty, $fade)
+    }
+}
+
+function Open-HoverDetailCard([switch]$Pin, [switch]$NoAnimation) {
+    if ($Pin) {
+        if (-not (Test-TaskDetailAvailable)) { return }
+    } elseif (-not [bool]$Config.HoverDetailsEnabled) { return }
     if (-not $script:lastWorkStatusObj -or $script:currentBubblePanel -ne "work" -or (-not $script:isBubbleOpen) -or $script:trayWindowHidden -or $script:isDragging) { return }
     if (-not (Ensure-DetailWindow)) { return }
     Update-DetailWindowContent $script:lastWorkStatusObj
     Update-DetailWindowPosition
     if (-not $script:DetailWindow.IsVisible) {
+        if (-not $NoAnimation) { Set-DetailCardOpacity 0.25 }
         $script:DetailWindow.ShowActivated = $false
         $script:DetailWindow.Show()
         Update-DetailWindowPosition
         Sync-AgentPetTopmost -Force
+        if (-not $NoAnimation) { Set-DetailCardOpacity 1.0 110 }
+    }
+    if ($Pin) {
+        if ($NoAnimation -or $script:detailHoverFading) { Set-DetailCardOpacity 1.0 }
+        $script:detailHoverFading = $false
+        $script:detailPinned = $true
+        if ($WorkDetailButton) {
+            $WorkDetailButton.Tag = 'Pinned'
+            $WorkDetailButton.ToolTip = '关闭任务详情'
+            [System.Windows.Automation.AutomationProperties]::SetName($WorkDetailButton, '关闭任务详情')
+        }
+        Sync-DetailHoverTimerState
+    }
+}
+
+function Show-TaskDetailFromMenu([switch]$Keyboard) {
+    if (-not (Test-TaskDetailAvailable)) { return }
+    if ($script:trayWindowHidden) {
+        $petHwnd = [System.Windows.Interop.WindowInteropHelper]::new($Window).Handle
+        [void][AgentPetNative]::ShowWindow($petHwnd, [AgentPetNative]::SW_SHOWNOACTIVATE)
+        $script:trayWindowHidden = $false
+    }
+    $script:manualBubbleHidden = $false
+    Stop-UserBubbleInspection
+    Set-ActiveBubblePanel 'work'
+    Show-Bubble 0 -Force -NoScale
+    Open-HoverDetailCard -Pin -NoAnimation:$Keyboard
+    if ($Keyboard -and $script:detailPinned -and $script:DetailWindow.IsVisible) {
+        $script:DetailWindow.Focusable = $true
+        $script:DetailScrollViewer.Focusable = $true
+        $detailHwnd = [System.Windows.Interop.WindowInteropHelper]::new($script:DetailWindow).Handle
+        $foreground = [AgentPetNative]::GetForegroundWindow()
+        if ($foreground -ne $detailHwnd) {
+            $script:detailReturnFocus = $foreground
+        }
+        [void]$script:DetailWindow.Activate()
+        [void][System.Windows.Input.Keyboard]::Focus($script:DetailScrollViewer)
     }
 }
 
@@ -2770,6 +3231,13 @@ function Close-HoverDetailCard {
     param([switch]$Dispose)
     $script:detailTriggerEnterAt = [DateTime]::MinValue
     $script:detailLeaveAt = [DateTime]::MinValue
+    $script:detailHoverFading = $false
+    $script:detailPinned = $false
+    if ($WorkDetailButton -and $WorkDetailButton.Tag -eq 'Pinned') {
+        $WorkDetailButton.Tag = $null
+        $WorkDetailButton.ToolTip = '查看任务详情'
+        [System.Windows.Automation.AutomationProperties]::SetName($WorkDetailButton, '查看任务详情')
+    }
     if ($script:DetailHoverTimer) {
         try {
             if ($Dispose -or (-not [bool]$Config.HoverDetailsEnabled) -or (-not $script:isBubbleOpen) -or ($script:currentBubblePanel -ne "work") -or $script:trayWindowHidden) {
@@ -2779,11 +3247,22 @@ function Close-HoverDetailCard {
     }
     if ($script:DetailWindow) {
         try {
+            $detailHwnd = [System.Windows.Interop.WindowInteropHelper]::new($script:DetailWindow).Handle
+            $returnFocus = if ($detailHwnd -ne [IntPtr]::Zero -and [AgentPetNative]::GetForegroundWindow() -eq $detailHwnd) {
+                $script:detailReturnFocus
+            } else { [IntPtr]::Zero }
+            $script:detailReturnFocus = [IntPtr]::Zero
             if ($Dispose) {
                 $script:DetailWindow.Close()
                 $script:DetailWindow = $null
-            } elseif ($script:DetailWindow.IsVisible) {
-                $script:DetailWindow.Hide()
+            } else {
+                if ($script:DetailWindow.IsVisible) { $script:DetailWindow.Hide() }
+                Set-DetailCardOpacity 1.0
+                $script:DetailWindow.Focusable = $false
+                if ($script:DetailScrollViewer) { $script:DetailScrollViewer.Focusable = $false }
+            }
+            if ($returnFocus -ne [IntPtr]::Zero -and [AgentPetNative]::IsWindowVisible($returnFocus)) {
+                [void][AgentPetNative]::SetForegroundWindow($returnFocus)
             }
         } catch {}
     }
@@ -2803,11 +3282,15 @@ function Get-AgentPetCursorScreenPosition {
 }
 
 function Update-DetailHoverState {
-    if (-not [bool]$Config.HoverDetailsEnabled -or $script:trayWindowHidden -or (-not $script:isBubbleOpen) -or ($script:currentBubblePanel -ne "work") -or $script:isDragging -or (-not $script:lastWorkStatusObj)) {
+    if ($script:trayWindowHidden -or (-not $script:isBubbleOpen) -or ($script:currentBubblePanel -ne "work") -or $script:isDragging -or (-not $script:lastWorkStatusObj)) {
         Close-HoverDetailCard
         return
     }
-    if (($Window.ContextMenu -and $Window.ContextMenu.IsOpen) -or ($script:TrayMenu -and $script:TrayMenu.Visible)) {
+    if ($script:detailPinned) {
+        if (-not (Test-TaskDetailAvailable)) { Close-HoverDetailCard }
+        return
+    }
+    if (-not [bool]$Config.HoverDetailsEnabled -or ($Window.ContextMenu -and $Window.ContextMenu.IsOpen) -or ($script:TrayMenu -and $script:TrayMenu.Visible)) {
         Close-HoverDetailCard
         return
     }
@@ -2815,15 +3298,21 @@ function Update-DetailHoverState {
     $now = [DateTime]::UtcNow
     $screenPt = Get-AgentPetCursorScreenPosition
     $inSources = (Test-ElementHit $WorkSourcesPanel $screenPt) -or (Test-ElementHit $WorkSourceBadge $screenPt)
-    $inTrigger = (-not $inSources) -and ((Test-ElementHit $WorkHeaderBanner $screenPt) -or (Test-ElementHit $WorkHeaderRow $screenPt) -or (Test-ElementHit $WorkTask $screenPt))
+    $inTrigger = (-not $inSources) -and (-not (Test-ElementHit $WorkDetailButton $screenPt)) -and
+        ((Test-ElementHit $WorkHeaderBanner $screenPt) -or (Test-ElementHit $WorkHeaderRow $screenPt) -or (Test-ElementHit $WorkTask $screenPt))
     $inDetail = $false
     if ($script:DetailWindow -and $script:DetailWindow.IsVisible -and $script:DetailCardBorder) {
-        $inDetail = Test-ElementHit $script:DetailCardBorder $screenPt
+        $inDetail = (Test-ElementHit $script:DetailCardBorder $screenPt) -or
+            (Test-ElementHit $script:DetailArrowTop $screenPt) -or (Test-ElementHit $script:DetailArrowBottom $screenPt)
     }
 
     $isOpen = [bool]($script:DetailWindow -and $script:DetailWindow.IsVisible)
     if ($inTrigger -or ($isOpen -and $inDetail)) {
         $script:detailLeaveAt = [DateTime]::MinValue
+        if ($script:detailHoverFading) {
+            $script:detailHoverFading = $false
+            Set-DetailCardOpacity 1.0
+        }
         if (-not $isOpen) {
             if ($script:detailTriggerEnterAt -eq [DateTime]::MinValue) {
                 $script:detailTriggerEnterAt = $now
@@ -2839,15 +3328,20 @@ function Update-DetailHoverState {
                 $script:detailLeaveAt = $now
             }
             $graceMs = if ($inSources) { 120 } else { 220 }
-            if (($now - $script:detailLeaveAt).TotalMilliseconds -ge $graceMs) {
+            $remainingMs = $graceMs - ($now - $script:detailLeaveAt).TotalMilliseconds
+            if ($remainingMs -le 0) {
                 Close-HoverDetailCard
+            } elseif (-not $script:detailHoverFading -and $remainingMs -le 110) {
+                # Fade within the existing leave grace. Explicit closes still release focus immediately.
+                $script:detailHoverFading = $true
+                Set-DetailCardOpacity 0.15 $remainingMs
             }
         }
     }
 }
 
 function Sync-DetailHoverTimerState {
-    if ([bool]$Config.HoverDetailsEnabled -and $script:isBubbleOpen -and $script:currentBubblePanel -eq "work" -and (-not $script:trayWindowHidden)) {
+    if (([bool]$Config.HoverDetailsEnabled -or $script:detailPinned) -and $script:isBubbleOpen -and $script:currentBubblePanel -eq "work" -and (-not $script:trayWindowHidden)) {
         Ensure-DetailHoverTimer
         if (-not $script:DetailHoverTimer.IsEnabled) {
             $script:DetailHoverTimer.Start()
@@ -2889,6 +3383,14 @@ if ($WorkHeaderRow) {
 }
 if ($WorkTask) {
     $WorkTask.Add_MouseEnter({ Sync-DetailHoverTimerState })
+}
+if ($WorkDetailButton) {
+    $WorkDetailButton.Add_Click({
+        param($sender, $e)
+        $e.Handled = $true
+        if ($script:detailPinned) { Close-HoverDetailCard }
+        else { Open-HoverDetailCard -Pin }
+    })
 }
 
 function Get-CharacterVisibleGeometry {
@@ -3205,13 +3707,24 @@ function Update-UserBubbleInspection([DateTime]$now, [bool]$hovered) {
     }
 }
 
-function Show-Bubble([double]$holdSeconds = 5.2, [switch]$Force) {
+function New-AgentPetEaseAnimation([double]$from, [double]$to, [double]$milliseconds, [switch]$EaseIn) {
+    $duration = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds($milliseconds))
+    $animation = [System.Windows.Media.Animation.DoubleAnimation]::new($from, $to, $duration)
+    $animation.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+    $easing = [System.Windows.Media.Animation.CubicEase]::new()
+    $easing.EasingMode = if ($EaseIn) { 'EaseIn' } else { 'EaseOut' }
+    $animation.EasingFunction = $easing
+    return $animation
+}
+
+function Show-Bubble([double]$holdSeconds = 5.2, [switch]$Force, [switch]$NoScale) {
     if ($holdSeconds -gt 0) {
         $script:bubbleCloseTime = [DateTime]::UtcNow.AddSeconds($holdSeconds)
     } else {
         $script:bubbleCloseTime = [DateTime]::MaxValue
     }
 
+    $wasVisible = $Bubble.Visibility -eq [System.Windows.Visibility]::Visible
     $Bubble.Visibility = [System.Windows.Visibility]::Visible
     if ($Tail) {
         $Tail.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
@@ -3224,21 +3737,32 @@ function Show-Bubble([double]$holdSeconds = 5.2, [switch]$Force) {
         $TailNear.Visibility = [System.Windows.Visibility]::Visible
     }
 
-    if ($script:isBubbleOpen -and $Bubble.Opacity -gt 0.85) {
-        $Bubble.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
-        $Bubble.Opacity = 1.0
+    if ($BubbleScale -and $NoScale) {
+        $BubbleScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $null)
+        $BubbleScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $null)
+    }
+    if ($script:isBubbleOpen) {
         Sync-DetailHoverTimerState
         return
     }
     $script:isBubbleOpen = $true
     $script:bubbleAnimVersion++
 
-    # Smooth Opacity Fade-In (140ms) driven solely by parent Bubble so card & tails share 1 opacity timeline
-    $dur = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(140))
+    $startOpacity = if ($wasVisible) { [double]$Bubble.Opacity } else { 0.0 }
+    $milliseconds = 140.0
+    $Bubble.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
     $Bubble.Opacity = 1.0
-    $bFade = New-Object System.Windows.Media.Animation.DoubleAnimation(0.0, 1.0, $dur)
-    $bFade.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+    $bFade = New-AgentPetEaseAnimation $startOpacity 1.0 $milliseconds
     $Bubble.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $bFade)
+    if (-not $NoScale -and -not $wasVisible -and $BubbleScale) {
+        $scaleTarget = [double]$BubbleScale.GetAnimationBaseValue([System.Windows.Media.ScaleTransform]::ScaleXProperty)
+        # Small quota cards keep their full hit area during entry.
+        if ($scaleTarget -ge 1.0 -or $script:currentBubblePanel -in @('quote', 'work')) {
+            $popIn = New-AgentPetEaseAnimation ($scaleTarget * 0.97) $scaleTarget $milliseconds
+            $BubbleScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleXProperty, $popIn)
+            $BubbleScale.BeginAnimation([System.Windows.Media.ScaleTransform]::ScaleYProperty, $popIn)
+        }
+    }
     Sync-DetailHoverTimerState
 }
 
@@ -3252,11 +3776,10 @@ function Hide-Bubble {
     $verVar = Get-Variable -Scope Script -Name bubbleAnimVersion -ErrorAction SilentlyContinue
     $openVar = Get-Variable -Scope Script -Name isBubbleOpen -ErrorAction SilentlyContinue
 
-    $dur = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(130))
     $startOp = [double]$Bubble.Opacity
+    $Bubble.BeginAnimation([System.Windows.UIElement]::OpacityProperty, $null)
     $Bubble.Opacity = 0.0
-    $bFade = New-Object System.Windows.Media.Animation.DoubleAnimation($startOp, 0.0, $dur)
-    $bFade.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+    $bFade = New-AgentPetEaseAnimation $startOp 0.0 130 -EaseIn
     $bFade.Add_Completed({
         $curVer = if ($null -ne $verVar) {
             $verVar.Value
@@ -3688,6 +4211,15 @@ function Initialize-TrayIcon {
         [void]$bubbleDefault.DropDownItems.Add($defQuota); [void]$bubbleDefault.DropDownItems.Add($defDeepseek); [void]$bubbleDefault.DropDownItems.Add($defQuote)
         [void]$menu.Items.Add($bubbleDefault)
 
+        $stampStyleMenu = New-Object System.Windows.Forms.ToolStripMenuItem("气泡印章风格")
+        $stampEmbossedItem = New-Object System.Windows.Forms.ToolStripMenuItem("精致压纹")
+        $stampEmbossedItem.Tag = "embossed"
+        $stampLineartItem = New-Object System.Windows.Forms.ToolStripMenuItem("简笔画压纹")
+        $stampLineartItem.Tag = "lineart"
+        [void]$stampStyleMenu.DropDownItems.Add($stampEmbossedItem)
+        [void]$stampStyleMenu.DropDownItems.Add($stampLineartItem)
+        [void]$menu.Items.Add($stampStyleMenu)
+
         $broadcast = New-Object System.Windows.Forms.ToolStripMenuItem("状态播报")
         $pause10 = New-Object System.Windows.Forms.ToolStripMenuItem("暂停 10 分钟")
         $pause30 = New-Object System.Windows.Forms.ToolStripMenuItem("暂停 30 分钟")
@@ -3695,11 +4227,58 @@ function Initialize-TrayIcon {
         [void]$broadcast.DropDownItems.Add($pause10); [void]$broadcast.DropDownItems.Add($pause30); [void]$broadcast.DropDownItems.Add($resume)
         [void]$menu.Items.Add($broadcast)
 
+        $trayTaskCompleteMenu = New-Object System.Windows.Forms.ToolStripMenuItem("任务完成提醒")
+        $trayTaskSoundItem = New-Object System.Windows.Forms.ToolStripMenuItem("任务完成声音提醒")
+        $trayTaskSoundItem.CheckOnClick = $true
+        $trayTaskSoundItem.Checked = ($Config.TaskCompleteSoundEnabled -ne $false)
+        $trayAgCompleteItem = New-Object System.Windows.Forms.ToolStripMenuItem("Antigravity 完成提示音")
+        $trayAgCompleteItem.CheckOnClick = $true
+        $trayAgCompleteItem.Checked = [bool]$Config.AntigravityTranscriptCompleteEnabled
+        $trayMuteHiddenItem = New-Object System.Windows.Forms.ToolStripMenuItem("隐藏气泡/桌宠时关闭铃声")
+        $trayMuteHiddenItem.CheckOnClick = $true
+        $trayMuteHiddenItem.Checked = ($Config.MuteTaskSoundWhenHidden -ne $false)
+        $trayQuietEnableItem = New-Object System.Windows.Forms.ToolStripMenuItem("启用免打扰时段静音")
+        $trayQuietEnableItem.CheckOnClick = $true
+        $trayQuietEnableItem.Checked = [bool]$Config.QuietHoursEnabled
+        $trayQuietPresetsMenu = New-Object System.Windows.Forms.ToolStripMenuItem("免打扰时段设置")
+        $quietPresetDefs = @(
+            @{ Label = "夜间 (23:00–08:00)"; Tag = "23:00-08:00" },
+            @{ Label = "晚睡 (00:00–09:00)"; Tag = "00:00-09:00" },
+            @{ Label = "早睡 (22:00–07:00)"; Tag = "22:00-07:00" },
+            @{ Label = "午休 (12:30–14:00)"; Tag = "12:30-14:00" }
+        )
+        foreach ($qp in $quietPresetDefs) {
+            $qpItem = New-Object System.Windows.Forms.ToolStripMenuItem($qp.Label)
+            $qpItem.Tag = $qp.Tag
+            $qpItem.Add_Click({
+                param($sender, $e)
+                Set-QuietHoursPreset ([string]$sender.Tag)
+            })
+            [void]$trayQuietPresetsMenu.DropDownItems.Add($qpItem)
+        }
+        $trayPreviewSoundItem = New-Object System.Windows.Forms.ToolStripMenuItem("试听完成提示音")
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayTaskSoundItem)
+        [void]$trayTaskCompleteMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayAgCompleteItem)
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayMuteHiddenItem)
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayQuietEnableItem)
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayQuietPresetsMenu)
+        [void]$trayTaskCompleteMenu.DropDownItems.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        [void]$trayTaskCompleteMenu.DropDownItems.Add($trayPreviewSoundItem)
+        [void]$menu.Items.Add($trayTaskCompleteMenu)
+
         $trayHoverDetailItem = New-Object System.Windows.Forms.ToolStripMenuItem("悬停详情")
         $trayHoverDetailItem.CheckOnClick = $true
         $trayHoverDetailItem.Checked = [bool]$Config.HoverDetailsEnabled
         $script:TrayHoverDetailMenuItem = $trayHoverDetailItem
         [void]$menu.Items.Add($trayHoverDetailItem)
+        $trayViewTaskDetail = New-Object System.Windows.Forms.ToolStripMenuItem("查看任务详情")
+        $trayViewTaskDetail.Available = $false
+        $trayViewTaskDetail.Add_Click({
+            [void]$Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::ContextIdle,
+                [Action]{ Show-TaskDetailFromMenu -Keyboard })
+        })
+        [void]$menu.Items.Add($trayViewTaskDetail)
 
         $trayLowBalItem = New-Object System.Windows.Forms.ToolStripMenuItem("DeepSeek 余额过低提醒")
         $trayLowBalItem.CheckOnClick = $true
@@ -3731,7 +4310,6 @@ function Initialize-TrayIcon {
                 Save-Config; Update-Theme
                 $pose = if ($Config.Pose -and $Config.Pose -ne "auto") { [string]$Config.Pose } else { "happy" }
                 Set-PetSprite $pose; Set-TrayIconForRole; Update-TrayTooltip -Force
-                Build-ContextMenu
                 Sync-CharacterMenuChecks
             })
             [void]$roles.DropDownItems.Add($item)
@@ -3741,14 +4319,10 @@ function Initialize-TrayIcon {
 
         $reset = New-Object System.Windows.Forms.ToolStripMenuItem("重置位置到右下角")
         $full = New-Object System.Windows.Forms.ToolStripMenuItem("打开完整菜单")
-        [void]$menu.Items.Add($reset); [void]$menu.Items.Add($full)
-        $settings = New-Object System.Windows.Forms.ToolStripMenuItem("托盘设置")
-        $trayEnabledItem = New-Object System.Windows.Forms.ToolStripMenuItem("启用托盘图标")
         $startHiddenItem = New-Object System.Windows.Forms.ToolStripMenuItem("启动时隐藏桌宠")
-        $trayEnabledItem.CheckOnClick = $true
         $startHiddenItem.CheckOnClick = $true
-        [void]$settings.DropDownItems.Add($trayEnabledItem); [void]$settings.DropDownItems.Add($startHiddenItem)
-        [void]$menu.Items.Add($settings)
+        $startHiddenItem.Checked = [bool]$Config.StartHidden
+        [void]$menu.Items.Add($reset); [void]$menu.Items.Add($full); [void]$menu.Items.Add($startHiddenItem)
         [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
         $exit = New-Object System.Windows.Forms.ToolStripMenuItem("退出 AgentPet")
         [void]$menu.Items.Add($exit)
@@ -3759,13 +4333,42 @@ function Initialize-TrayIcon {
         $quota.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "quota" })
         $deepseek.Add_Click({ Set-AgentPetWindowVisible $true; Start-UserBubbleInspection "deepseek" })
         $quote.Add_Click({ Set-AgentPetWindowVisible $true; Show-TemporaryQuoteBubble $Config.Character 5.5 })
-        $defQuota.Add_Click({ $Config.BubbleMode = "quota"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quota" } }; Build-ContextMenu })
-        $defDeepseek.Add_Click({ $Config.BubbleMode = "deepseek"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh } }; Build-ContextMenu })
-        $defQuote.Add_Click({ $Config.BubbleMode = "quote"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quote" } }; Build-ContextMenu })
+        $defQuota.Add_Click({ $Config.BubbleMode = "quota"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quota" } } })
+        $defDeepseek.Add_Click({ $Config.BubbleMode = "deepseek"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "deepseek"; Request-BalanceRefresh } } })
+        $defQuote.Add_Click({ $Config.BubbleMode = "quote"; Save-Config; if (-not $script:agentBusy) { if (-not (Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)) { Set-ActiveBubblePanel "quote" } } })
+        $stampEmbossedItem.Add_Click({ param($sender, $e); Set-QuotaStampStyle ([string]$sender.Tag) -Preview })
+        $stampLineartItem.Add_Click({ param($sender, $e); Set-QuotaStampStyle ([string]$sender.Tag) -Preview })
         $bubbleHide.Add_Click({ $script:manualBubbleHidden = $true; Hide-Bubble })
-        $pause10.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 600000; Save-Config; Update-TrayTooltip -Force })
-        $pause30.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1800000; Save-Config; Update-TrayTooltip -Force })
+        $pause10.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 600000; Reset-TaskCompletionTracker "Paused"; Save-Config; Update-TrayTooltip -Force })
+        $pause30.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1800000; Reset-TaskCompletionTracker "Paused"; Save-Config; Update-TrayTooltip -Force })
         $resume.Add_Click({ $Config.PauseMonitorUntil = 0; Save-Config; Update-TrayTooltip -Force })
+        $trayTaskSoundItem.Add_Click({
+            param($sender, $e)
+            $Config.TaskCompleteSoundEnabled = [bool]$sender.Checked
+            Save-Config
+            Sync-WpfTaskCompleteMenu
+        })
+        $trayAgCompleteItem.Add_Click({
+            param($sender, $e)
+            $Config.AntigravityTranscriptCompleteEnabled = [bool]$sender.Checked
+            Save-Config
+            Sync-WpfTaskCompleteMenu
+        })
+        $trayMuteHiddenItem.Add_Click({
+            param($sender, $e)
+            $Config.MuteTaskSoundWhenHidden = [bool]$sender.Checked
+            Save-Config
+            Sync-WpfTaskCompleteMenu
+        })
+        $trayQuietEnableItem.Add_Click({
+            param($sender, $e)
+            $Config.QuietHoursEnabled = [bool]$sender.Checked
+            Save-Config
+            Sync-WpfTaskCompleteMenu
+        })
+        $trayPreviewSoundItem.Add_Click({
+            [void](Play-TaskCompleteSound -Preview)
+        })
         $reset.Add_Click({
             $wa = [System.Windows.SystemParameters]::WorkArea
             $Window.Left = $wa.Right - $Window.Width - 28; $Window.Top = $wa.Bottom - $Window.Height - 16
@@ -3789,28 +4392,16 @@ function Initialize-TrayIcon {
                     Request-BalanceRefresh                      # 没有有效数据 → 先刷新，等数据回来再判定
                 }
             }
-            Build-ContextMenu
         })
         $trayDshEnableItem.Add_Click({
             param($sender, $e)
             $Config.DeepSeekBalanceEnabled = [bool]$sender.Checked
             Save-Config
             Request-BalanceRefresh
-            Build-ContextMenu
         })
         $trayDshRefreshItem.Add_Click({
             Set-AgentPetWindowVisible $true
             Start-UserBubbleInspection "deepseek"
-        })
-        $trayEnabledItem.Add_Click({
-            param($sender, $e)
-            $Config.TrayEnabled = [bool]$sender.Checked
-            Save-Config
-            if (-not $Config.TrayEnabled -and $script:NotifyIcon) {
-                $script:NotifyIcon.Visible = $false
-                $script:NotifyIcon.Dispose()
-                $script:NotifyIcon = $null
-            }
         })
         $startHiddenItem.Add_Click({
             param($sender, $e)
@@ -3820,19 +4411,28 @@ function Initialize-TrayIcon {
         $exit.Add_Click({ Request-AgentPetExit })
         $script:NotifyIcon.Add_DoubleClick({ Set-AgentPetWindowVisible $true })
         $menu.Tag = @{
-            DefQuota     = $defQuota
-            DefDeepseek  = $defDeepseek
-            DefQuote     = $defQuote
-            Show         = $show
-            Hide         = $hide
-            BubbleHide   = $bubbleHide
-            HoverDetail  = $trayHoverDetailItem
-            LowBal       = $trayLowBalItem
-            DshEnable    = $trayDshEnableItem
-            TrayEnabled  = $trayEnabledItem
-            StartHidden  = $startHiddenItem
-            Broadcast    = $broadcast
-            Roles        = $roles
+            DefQuota         = $defQuota
+            DefDeepseek      = $defDeepseek
+            DefQuote         = $defQuote
+            StampStyleMenu   = $stampStyleMenu
+            StampEmbossed    = $stampEmbossedItem
+            StampLineart     = $stampLineartItem
+            Show             = $show
+            Hide             = $hide
+            BubbleHide       = $bubbleHide
+            HoverDetail      = $trayHoverDetailItem
+            ViewTaskDetail   = $trayViewTaskDetail
+            LowBal           = $trayLowBalItem
+            DshEnable        = $trayDshEnableItem
+            StartHidden      = $startHiddenItem
+            Broadcast        = $broadcast
+            TaskCompleteMenu = $trayTaskCompleteMenu
+            TaskSound        = $trayTaskSoundItem
+            AgComplete       = $trayAgCompleteItem
+            MuteHidden       = $trayMuteHiddenItem
+            QuietEnable      = $trayQuietEnableItem
+            QuietPresets     = $trayQuietPresetsMenu
+            Roles            = $roles
         }
         $menu.Add_Opening({
             param($sender, $e)
@@ -3842,13 +4442,33 @@ function Initialize-TrayIcon {
             $m.DefQuota.Checked    = ($Config.BubbleMode -eq "quota")
             $m.DefDeepseek.Checked = ($Config.BubbleMode -eq "deepseek")
             $m.DefQuote.Checked    = ($Config.BubbleMode -eq "quote")
+            Sync-QuotaStampStyleMenuChecks
             $m.Show.Text = if ($script:trayWindowHidden) { "显示 / 唤起桌宠" } else { "显示 / 唤起桌宠（当前显示）" }
             $m.Hide.Text = if ($script:trayWindowHidden) { "隐藏桌宠（当前隐藏）" } else { "隐藏桌宠" }
             $m.BubbleHide.Checked  = [bool]$script:manualBubbleHidden
+            $m.TaskSound.Checked   = ($Config.TaskCompleteSoundEnabled -ne $false)
+            $m.AgComplete.Checked  = [bool]$Config.AntigravityTranscriptCompleteEnabled
+            $m.MuteHidden.Checked  = ($Config.MuteTaskSoundWhenHidden -ne $false)
+            $m.QuietEnable.Checked = [bool]$Config.QuietHoursEnabled
+            $qStart = if ($Config.QuietHoursStart) { [string]$Config.QuietHoursStart } else { "23:00" }
+            $qEnd = if ($Config.QuietHoursEnd) { [string]$Config.QuietHoursEnd } else { "08:00" }
+            $inQuiet = ([bool]$Config.QuietHoursEnabled -and (Test-InQuietHours ([datetime]::Now) $qStart $qEnd))
+            $m.QuietPresets.Text = "免打扰时段设置 ($qStart–$qEnd)"
+            $m.TaskCompleteMenu.Text = if ($Config.TaskCompleteSoundEnabled -eq $false) {
+                "任务完成提醒（已关闭）"
+            } elseif ($inQuiet) {
+                "任务完成提醒（免打扰生效中）"
+            } else {
+                "任务完成提醒（已开启）"
+            }
+            $curPresetKey = "$qStart-$qEnd"
+            foreach ($qpItem in $m.QuietPresets.DropDownItems) {
+                if ($qpItem.Tag) { $qpItem.Checked = ([string]$qpItem.Tag -eq $curPresetKey) }
+            }
             $m.HoverDetail.Checked = [bool]$Config.HoverDetailsEnabled
+            $m.ViewTaskDetail.Available = (Test-TaskDetailAvailable)
             $m.LowBal.Checked      = ($Config.LowBalanceAlertEnabled -ne $false)
             $m.DshEnable.Checked   = ($Config.DeepSeekBalanceEnabled -ne $false)
-            $m.TrayEnabled.Checked = [bool]$Config.TrayEnabled
             $m.StartHidden.Checked = [bool]$Config.StartHidden
             $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
             $remain = if ($pauseUntil -gt [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) { [int][Math]::Ceiling(($pauseUntil - [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) / 60000.0) } else { 0 }
@@ -3856,6 +4476,7 @@ function Initialize-TrayIcon {
             foreach ($roleItem in $m.Roles.DropDownItems) { if ($roleItem.Tag) { $roleItem.Checked = ([string]$roleItem.Tag -eq [string]$Config.Character) } }
         })
         $script:TrayMenu = $menu
+        Sync-QuotaStampStyleMenuChecks
         Update-TrayMenuTheme
         $script:NotifyIcon.ContextMenuStrip = $menu
         Write-PetLog "Tray icon initialized successfully."
@@ -3876,8 +4497,8 @@ function Request-AgentPetExit {
 # ============================================================================
 # 9. Codex Quota Formatting, Reset Countdown & Semantic Colors
 # ============================================================================
-$script:lastShortRemaining = 100
-$script:lastWeekRemaining  = 100
+$script:lastShortRemaining = $null
+$script:lastWeekRemaining  = $null
 $script:lastQuotaObject    = $null
 $script:refreshingUntil    = [DateTime]::MinValue
 
@@ -3892,12 +4513,12 @@ function Format-ResetCountdown([long]$resetsAtEpoch) {
     if ($span.TotalMinutes -lt 1) {
         return "即将重置"
     } elseif ($span.TotalHours -lt 1) {
-        return "$([int][Math]::Ceiling($span.TotalMinutes)) 分钟后重置"
+        return "$([int][Math]::Ceiling($span.TotalMinutes))分钟后重置"
     } elseif ($span.TotalHours -lt 24) {
         $h = [int][Math]::Floor($span.TotalHours)
         $m = $span.Minutes
-        if ($m -gt 0) { return "${h} 小时 ${m} 分后重置" }
-        return "${h} 小时后重置"
+        if ($m -gt 0) { return "${h}小时${m}分后重置" }
+        return "${h}小时后重置"
     } else {
         $localReset = [DateTimeOffset]::FromUnixTimeSeconds($resetsAtEpoch).LocalDateTime
         $nowLocal = [DateTime]::Now
@@ -3912,39 +4533,54 @@ function Update-QuotaColors {
     $t = Get-CurrentTheme
     $normalBar = $BrushConv.ConvertFromString($t.BarBrush)
     $normalPct = $BrushConv.ConvertFromString($t.PercentText)
-    $amberBrush = $BrushConv.ConvertFromString("#FFE68A00")
-    $redBrush   = $BrushConv.ConvertFromString("#FFD9383A")
-
-    if ($script:lastShortRemaining -le 10) {
-        $ShortBar.Background     = $redBrush
-        $ShortPercent.Foreground = $redBrush
-    } elseif ($script:lastShortRemaining -le 25) {
-        $ShortBar.Background     = $amberBrush
-        $ShortPercent.Foreground = $amberBrush
-    } else {
-        $ShortBar.Background     = $normalBar
-        $ShortPercent.Foreground = $normalPct
-    }
-
-    if ($script:lastWeekRemaining -le 10) {
-        $WeekBar.Background     = $redBrush
-        $WeekPercent.Foreground = $redBrush
-    } elseif ($script:lastWeekRemaining -le 25) {
-        $WeekBar.Background     = $amberBrush
-        $WeekPercent.Foreground = $amberBrush
-    } else {
-        $WeekBar.Background     = $normalBar
-        $WeekPercent.Foreground = $normalPct
+    $lowBrush   = $BrushConv.ConvertFromString("#FFB55300")
+    $criticalBrush = $BrushConv.ConvertFromString("#FFCF3628")
+    foreach ($row in @(
+        @{ remaining = $script:lastShortRemaining; label = $ShortLabel; percent = $ShortPercent; value = $ShortPercentValue; bar = $ShortBar; alert = $ShortQuotaAlert }
+        @{ remaining = $script:lastWeekRemaining; label = $WeekLabel; percent = $WeekPercent; value = $WeekPercentValue; bar = $WeekBar; alert = $WeekQuotaAlert }
+    )) {
+        $level = ""
+        $barBrush = $normalBar
+        $textBrush = $normalPct
+        $known = $null -ne $row.remaining
+        $remaining = [Math]::Max(0, [Math]::Min(100, [int]$row.remaining))
+        $row.value.Text = if ($known) { [string]$remaining } else { "—" }
+        $row.value.NextInline.Text = if ($known) { "%" } else { "" }
+        # Star columns keep the bar proportional even if data arrives before the ticket is measured.
+        $columns = $row.bar.Parent.ColumnDefinitions
+        $columns[0].Width = [System.Windows.GridLength]::new($remaining, [System.Windows.GridUnitType]::Star)
+        $columns[1].Width = [System.Windows.GridLength]::new((100 - $remaining), [System.Windows.GridUnitType]::Star)
+        if ($known -and $remaining -le 10) {
+            $level = "紧张"
+            $barBrush = $criticalBrush
+            $textBrush = $criticalBrush
+        } elseif ($known -and $remaining -le 25) {
+            $level = "偏低"
+            $barBrush = $lowBrush
+            $textBrush = $lowBrush
+        }
+        $row.bar.Background = $barBrush
+        $row.percent.Foreground = $textBrush
+        if ($row.alert) {
+            $row.alert.Text = if ($level) { "⚠ $level" } else { "" }
+            $row.alert.Foreground = $textBrush
+            $row.alert.Visibility = if ($level) { [System.Windows.Visibility]::Visible } else { [System.Windows.Visibility]::Collapsed }
+        }
+        $accessibleName = "$($row.label.Text)剩余 $($row.percent.Text)"
+        if ($level) { $accessibleName += "，额度$level" }
+        [System.Windows.Automation.AutomationProperties]::SetName($row.percent, $accessibleName)
     }
 }
 
 function Apply-QuotaObject($qObj) {
     if (-not $qObj) { return }
     $script:refreshingUntil = [DateTime]::MinValue
-    $script:lastQuotaObject = $qObj
-    if ($QuotaSourceIcon -and $script:AgentIcons.ContainsKey("codex")) {
-        $QuotaSourceIcon.Source = $script:AgentIcons["codex"]
+    Set-RefreshButtonBusy $RefreshQuotaBtn $false
+    if ($qObj.ok -eq $false) {
+        if ($ShortReset) { $ShortReset.Text = "请求失败" }
+        return
     }
+    $script:lastQuotaObject = $qObj
     try {
         $label = if ($qObj.planLabel) { [string]$qObj.planLabel } else { "" }
         if ($label -and $label -ne "离线快照") {
@@ -3990,19 +4626,11 @@ function Apply-QuotaObject($qObj) {
                 }
 
                 if ($w.id -eq "fiveHour" -or $w.label -eq "5h" -or $w.minutes -eq 300) {
-                    $tw = if ($ShortTrack -and $ShortTrack.ActualWidth -gt 20) { $ShortTrack.ActualWidth } else { 238.0 }
-                    $barWidth = [Math]::Max(0, [Math]::Min($tw, [Math]::Round($tw * ($rem / 100.0))))
                     $script:lastShortRemaining = $rem
-                    $ShortPercent.Text = "$rem%"
-                    $ShortReset.Text   = $resetText
-                    $ShortBar.Width    = $barWidth
+                    $ShortReset.Text = $resetText
                 } elseif ($w.id -eq "weekly" -or $w.label -eq "Weekly" -or $w.minutes -eq 10080) {
-                    $tw = if ($WeekTrack -and $WeekTrack.ActualWidth -gt 20) { $WeekTrack.ActualWidth } else { 238.0 }
-                    $barWidth = [Math]::Max(0, [Math]::Min($tw, [Math]::Round($tw * ($rem / 100.0))))
                     $script:lastWeekRemaining = $rem
-                    $WeekPercent.Text = "$rem%"
-                    $WeekReset.Text   = $resetText
-                    $WeekBar.Width    = $barWidth
+                    $WeekReset.Text = $resetText
                 } else {
                     # P2: Safely preserve unknown quota windows without crashing or overwriting 5h/weekly
                     Log-Throttled "ExtraQuotaWindow" "Observed additional quota window: ID=$($w.id), Label=$($w.label), Minutes=$($w.minutes)" 60
@@ -4032,18 +4660,34 @@ function Read-InitialQuotaSnapshot {
 }
 
 function Request-QuotaRefresh {
+    $now = [DateTime]::UtcNow
+    if ($script:refreshingUntil -gt $now) { return }
     try {
+        [System.IO.File]::WriteAllText($RefreshFlagPath, ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds().ToString(), [System.Text.Encoding]::UTF8)
+        $script:refreshingUntil = $now.AddSeconds(14.0)
+        Set-RefreshButtonBusy $RefreshQuotaBtn $true
         if ($ShortReset) {
             $ShortReset.Text = "刷新中..."
         }
-        $script:refreshingUntil = [DateTime]::UtcNow.AddSeconds(14.0)
-        [System.IO.File]::WriteAllText($RefreshFlagPath, [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds().ToString(), [System.Text.Encoding]::UTF8)
     } catch {
         Log-Throttled "QuotaRefresh" "写入 Codex 额度刷新标记失败：$($_.Exception.Message)" 30
         $script:refreshingUntil = [DateTime]::MinValue
+        Set-RefreshButtonBusy $RefreshQuotaBtn $false
         if ($ShortReset) {
             $ShortReset.Text = "请求失败"
         }
+    }
+}
+
+function Update-QuotaRefreshTimeout([DateTime]$now) {
+    if ($script:refreshingUntil -eq [DateTime]::MinValue -or $now -lt $script:refreshingUntil) { return }
+    $script:refreshingUntil = [DateTime]::MinValue
+    Set-RefreshButtonBusy $RefreshQuotaBtn $false
+    if ($script:lastQuotaObject) {
+        Apply-QuotaObject $script:lastQuotaObject
+        $QuotaResetNotice.Text = "刷新超时"
+    } elseif ($ShortReset) {
+        $ShortReset.Text = "刷新超时"
     }
 }
 
@@ -4063,8 +4707,18 @@ $script:balanceRequestTimeout = $null
 # AP05: 本次手动刷新的发起时刻（Unix 毫秒），与监控侧 lastAttemptAt 同单位，用于判断结果归属
 $script:balanceRequestStartedMs = [long]0
 
+function Set-RefreshButtonBusy($button, [bool]$busy) {
+    if (-not $button) { return }
+    # Keep the button in the mouse route while busy so its hot area cannot cycle the bubble.
+    $button.Tag = if ($busy) { 'Refreshing' } else { $null }
+    $status = if ($busy) { '刷新中，请稍候' } else { '' }
+    [System.Windows.Automation.AutomationProperties]::SetItemStatus($button, $status)
+    $button.ToolTip = if ($busy) { $status } else { [System.Windows.Automation.AutomationProperties]::GetName($button) }
+}
+
 function Request-BalanceRefresh([switch]$Silent) {
     $now = [DateTime]::UtcNow
+    if ($script:balanceRequestTimeout -and $now -le $script:balanceRequestTimeout) { return }
     $span = ($now - $script:lastBalanceRefreshRequestTime).TotalSeconds
     if ($span -lt 10.0) {
         if (-not $Silent) {
@@ -4080,6 +4734,7 @@ function Request-BalanceRefresh([switch]$Silent) {
         if (-not $Silent) {
             $script:balanceRequestTimeout = $now.AddSeconds(15.0)
             $script:balanceRequestStartedMs = ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds()
+            Set-RefreshButtonBusy $RefreshDeepSeekBtn $true
             if ($DeepSeekStatusNotice) {
                 $DeepSeekStatusNotice.ToolTip = $null
                 $DeepSeekStatusNotice.Text = "刷新中..."
@@ -4090,6 +4745,7 @@ function Request-BalanceRefresh([switch]$Silent) {
         if (-not $Silent) {
             $script:balanceRequestTimeout = $null
             $script:balanceRequestStartedMs = [long]0
+            Set-RefreshButtonBusy $RefreshDeepSeekBtn $false
             if ($DeepSeekStatusNotice) {
                 $DeepSeekStatusNotice.ToolTip = $null
                 $DeepSeekStatusNotice.Text = "请求失败"
@@ -4139,8 +4795,10 @@ function Set-BalanceTimeoutNotice {
         if ($DeepSeekCurrencyLabel) {
             $DeepSeekCurrencyLabel.Text = "人民币 CNY · 上次快照（$syncStr）"
         }
+        if ($DeepSeekFooterLeft) { $DeepSeekFooterLeft.Text = "● 超时 · 当前为上次快照" }
     } else {
         $DeepSeekStatusNotice.ToolTip = "本次刷新 15 秒内未获得结果"
+        if ($DeepSeekFooterLeft) { $DeepSeekFooterLeft.Text = "状态 · 本次刷新超时" }
     }
     if (Get-Command Sync-DeepSeekFontScale -ErrorAction SilentlyContinue) { Sync-DeepSeekFontScale }
 }
@@ -4161,6 +4819,7 @@ function Receive-BalanceSnapshot($balObj) {
         if ($owned) {
             $script:balanceRequestTimeout = $null
             $script:balanceRequestStartedMs = [long]0
+            Set-RefreshButtonBusy $RefreshDeepSeekBtn $false
         }
         $script:lastBalanceObject = $balObj
         if ($DeepSeekStatusNotice) { $DeepSeekStatusNotice.ToolTip = $null }
@@ -4222,6 +4881,7 @@ function Receive-BalanceSnapshot($balObj) {
 function Update-BalanceRefreshTimeout([DateTime]$now) {
     if (-not $script:balanceRequestTimeout -or $now -le $script:balanceRequestTimeout) { return }
     $script:balanceRequestTimeout = $null
+    Set-RefreshButtonBusy $RefreshDeepSeekBtn $false
     # 保留 balanceRequestStartedMs：超时后本次结果到达仍能被识别并正常更新
     Set-BalanceTimeoutNotice
 }
@@ -4274,6 +4934,136 @@ function Check-LowBalanceAlert($balObj) {
     Show-Bubble 6.5
 }
 
+function Set-DeepSeekPillVisual($pill, $dot, $lbl, [string]$text, [string]$dotHex, [string]$bgHex, [string]$bdHex, [string]$fgHex) {
+    if ($lbl) { $lbl.Text = $text }
+    if ($BrushConv) {
+        try {
+            if ($dot) { $dot.Fill = $BrushConv.ConvertFromString($dotHex) }
+            if ($pill) {
+                $pill.Background  = $BrushConv.ConvertFromString($bgHex)
+                $pill.BorderBrush = $BrushConv.ConvertFromString($bdHex)
+            }
+            if ($lbl) { $lbl.Foreground = $BrushConv.ConvertFromString($fgHex) }
+        } catch {}
+    }
+}
+
+function Get-DeepSeekThresholdFormat {
+    $v = if ($null -ne $Config.LowBalanceCnyThreshold) { [double]$Config.LowBalanceCnyThreshold } else { 5.0 }
+    return ("¥{0:F2}" -f $v)
+}
+
+function Set-DeepSeekMsgVisual([string]$chipText, [string]$dotHex, [string]$bgHex, [string]$bdHex, [string]$fgHex, [string]$subHint, [string]$rightHint, [string]$footerLeft) {
+    Set-DeepSeekPillVisual $DeepSeekMsgStatusPill $DeepSeekMsgDot $DeepSeekMsgStatusText $chipText $dotHex $bgHex $bdHex $fgHex
+    if ($DeepSeekMsgSubHint)   { $DeepSeekMsgSubHint.Text   = $subHint }
+    if ($DeepSeekMsgRightHint) { $DeepSeekMsgRightHint.Text = $rightHint }
+    if ($DeepSeekFooterLeft)   { $DeepSeekFooterLeft.Text   = $footerLeft }
+}
+
+function Update-DeepSeekBalanceRatioAndLegend($cnyInfo, [string]$statusKind, [bool]$isLowNow) {
+    $themeObj = if (Get-Command Get-CurrentTheme -ErrorAction SilentlyContinue) { Get-CurrentTheme } else { $null }
+    $threshFmt = Get-DeepSeekThresholdFormat
+
+    if ($statusKind -eq "unavail") {
+        Set-DeepSeekPillVisual $DeepSeekAvailPill $DeepSeekAvailDot $DeepSeekAvailPillText "不可用" "#FFEF4444" "#A8FEF2F2" "#7AFCA5A5" "#FFB91C1C"
+        if ($DeepSeekSubMetaText) { $DeepSeekSubMetaText.Text = "预警线 $threshFmt" }
+        if ($DeepSeekFooterLeft)  { $DeepSeekFooterLeft.Text  = "⚠ 账户当前不可用 · 请检查 DSH" }
+    } elseif ($isLowNow) {
+        Set-DeepSeekPillVisual $DeepSeekAvailPill $DeepSeekAvailDot $DeepSeekAvailPillText "低额预警" "#FFF59E0B" "#A8FFFBEB" "#80FCD34D" "#FFB45309"
+        if ($DeepSeekSubMetaText) { $DeepSeekSubMetaText.Text = "已低于 $threshFmt" }
+        if ($DeepSeekFooterLeft)  { $DeepSeekFooterLeft.Text  = "▲ 余额偏低 · 建议充值" }
+    } else {
+        Set-DeepSeekPillVisual $DeepSeekAvailPill $DeepSeekAvailDot $DeepSeekAvailPillText "可用" "#FF10B981" "#A8EAFBF3" "#7A86EFAC" "#FF047857"
+        if ($DeepSeekSubMetaText) { $DeepSeekSubMetaText.Text = "预警线 $threshFmt" }
+        if ($DeepSeekFooterLeft)  { $DeepSeekFooterLeft.Text  = "● 余额健康 · 已同步" }
+    }
+
+    if ($DeepSeekTotalText -and $BrushConv) {
+        try {
+            if ($isLowNow -and $statusKind -ne "unavail") {
+                $DeepSeekTotalText.Foreground = $BrushConv.ConvertFromString("#FF85450C")
+            } elseif ($themeObj -and $themeObj.PercentText) {
+                $DeepSeekTotalText.Foreground = $BrushConv.ConvertFromString($themeObj.PercentText)
+            }
+        } catch {}
+    }
+
+    $topNum = 0.0; $grantNum = 0.0
+    $hasTop = ($null -ne $cnyInfo.toppedUpBalance) -and [double]::TryParse([string]$cnyInfo.toppedUpBalance, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$topNum)
+    $hasGrant = ($null -ne $cnyInfo.grantedBalance) -and [double]::TryParse([string]$cnyInfo.grantedBalance, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$grantNum)
+    $topNum = [Math]::Max(0.0, $topNum)
+    $grantNum = [Math]::Max(0.0, $grantNum)
+    $sumVal = $topNum + $grantNum
+
+    if ($hasTop -and $hasGrant) {
+        $showPct = ($sumVal -gt 0.0001 -and $grantNum -gt 0.0001)
+        if ($showPct) {
+            $tPct = [int][Math]::Round(($topNum / $sumVal) * 100.0)
+            $gPct = [Math]::Max(0, 100 - $tPct)
+            $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance) (${tPct}%)"
+            if ($DeepSeekGrantText) { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance) (${gPct}%)" }
+        } else {
+            $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance)"
+            if ($DeepSeekGrantText) { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance)" }
+        }
+        if ($DeepSeekGrantLegend) { $DeepSeekGrantLegend.Visibility = [System.Windows.Visibility]::Visible }
+    } elseif ($hasTop) {
+        $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance)"
+        if ($DeepSeekGrantText)   { $DeepSeekGrantText.Text = "赠金 未提供" }
+        if ($DeepSeekGrantLegend) { $DeepSeekGrantLegend.Visibility = [System.Windows.Visibility]::Visible }
+    } elseif ($hasGrant) {
+        $DeepSeekBreakdownText.Text = "充值 未提供"
+        if ($DeepSeekGrantText)   { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance)" }
+        if ($DeepSeekGrantLegend) { $DeepSeekGrantLegend.Visibility = [System.Windows.Visibility]::Visible }
+    } else {
+        $DeepSeekBreakdownText.Text = "充值/赠金明细暂不可用"
+        if ($DeepSeekGrantLegend) { $DeepSeekGrantLegend.Visibility = [System.Windows.Visibility]::Collapsed }
+    }
+
+    if ($BrushConv) {
+        try {
+            if ($DeepSeekGrantDot) {
+                if ($hasGrant -and $grantNum -gt 0.0001) {
+                    $DeepSeekGrantDot.Fill = $DeepSeekGrantBar.Background
+                    $DeepSeekGrantDot.Opacity = 1.0
+                } else {
+                    $mHex = if ($themeObj -and $themeObj.MutedText) { $themeObj.MutedText } else { "#FFA66838" }
+                    $DeepSeekGrantDot.Fill = $BrushConv.ConvertFromString($mHex)
+                    $DeepSeekGrantDot.Opacity = 0.45
+                }
+            }
+            if ($DeepSeekGrantText -and $themeObj) {
+                $txtHex = if ($hasGrant -and $grantNum -gt 0.0001) { $themeObj.SubText } else { $themeObj.MutedText }
+                if ($txtHex) { $DeepSeekGrantText.Foreground = $BrushConv.ConvertFromString($txtHex) }
+            }
+        } catch {}
+    }
+
+    if ($DeepSeekFillBar -and $DeepSeekGrantBar -and $DeepSeekToppedUpCol -and $DeepSeekGrantCol) {
+        if ($sumVal -gt 0.0001 -and $hasTop -and $hasGrant) {
+            $hasBothSegs = ($topNum -gt 0.0001 -and $grantNum -gt 0.0001)
+            $DeepSeekToppedUpCol.Width = [System.Windows.GridLength]::new([Math]::Max(0.0, $topNum / $sumVal), [System.Windows.GridUnitType]::Star)
+            $DeepSeekGrantCol.Width    = [System.Windows.GridLength]::new([Math]::Max(0.0, $grantNum / $sumVal), [System.Windows.GridUnitType]::Star)
+            if ($topNum -gt 0.0001) {
+                $DeepSeekFillBar.Visibility = [System.Windows.Visibility]::Visible
+                $DeepSeekFillBar.CornerRadius = if ($hasBothSegs) { [System.Windows.CornerRadius]::new(2.75, 0, 0, 2.75) } else { [System.Windows.CornerRadius]::new(2.75) }
+            } else {
+                $DeepSeekFillBar.Visibility = [System.Windows.Visibility]::Collapsed
+            }
+            if ($grantNum -gt 0.0001) {
+                $DeepSeekGrantBar.Visibility = [System.Windows.Visibility]::Visible
+                $DeepSeekGrantBar.Margin = if ($hasBothSegs) { [System.Windows.Thickness]::new(1.5, 0, 0, 0) } else { [System.Windows.Thickness]::new(0) }
+                $DeepSeekGrantBar.CornerRadius = if ($hasBothSegs) { [System.Windows.CornerRadius]::new(0, 2.75, 2.75, 0) } else { [System.Windows.CornerRadius]::new(2.75) }
+            } else {
+                $DeepSeekGrantBar.Visibility = [System.Windows.Visibility]::Collapsed
+            }
+        } else {
+            $DeepSeekFillBar.Visibility  = [System.Windows.Visibility]::Collapsed
+            $DeepSeekGrantBar.Visibility = [System.Windows.Visibility]::Collapsed
+        }
+    }
+}
+
 function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     if (-not $balObj -or -not $DeepSeekPanel) { return }
     $script:lastBalanceObject = $balObj
@@ -4281,12 +5071,16 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     $script:deepSeekSnapshotLabelActive = $false
     try {
     if ($DeepSeekHeader -is [System.Windows.Controls.TextBlock]) {
-        $DeepSeekHeader.Text = "DeepSeek 官方余额"
+        $DeepSeekHeader.Text = "DeepSeek 余额"
+    }
+    if ($DeepSeekBadge -is [System.Windows.FrameworkElement]) {
+        $DeepSeekBadge.Visibility = [System.Windows.Visibility]::Collapsed
     }
     if ($DeepSeekIcon -and $script:AgentIcons.ContainsKey("dsh")) {
         $DeepSeekIcon.Source = $script:AgentIcons["dsh"]
     }
 
+    $threshFmt = Get-DeepSeekThresholdFormat
     $st = [string]$balObj.status
     if ($st -ne "ok" -and $st -ne "stale") {
         # loading / error / dsh_not_running / unconfigured / dsh_disabled：
@@ -4297,20 +5091,20 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     if ($st -eq "dsh_not_running") {
         $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
         $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
         $DeepSeekStatusNotice.Text   = "未连接"
         $DeepSeekMsgTitle.Text       = "DSH 未运行"
         $DeepSeekMsgDetail.Text      = "请启动 DeepSeek Harness 后查看余额"
+        Set-DeepSeekMsgVisual "宿主离线" "#FFF59E0B" "#A8FFFBEB" "#80FCD34D" "#FFB45309" "待机中 · 低额预警 $threshFmt" "点右上 ↻ 重连" "状态 · 等待连接 DSH"
         return
     }
 
     if ($st -eq "unconfigured" -or $st -eq "dsh_disabled") {
         $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
         $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
         $DeepSeekStatusNotice.Text   = "已停用"
         $DeepSeekMsgTitle.Text       = "余额服务未启用"
         $DeepSeekMsgDetail.Text      = "可在托盘或右键菜单中开启 DeepSeek 余额服务"
+        Set-DeepSeekMsgVisual "已停用" "#FF94A3B8" "#A8F1F5F9" "#80CBD5E1" "#FF475569" "已关闭 · 预警线 $threshFmt" "托盘或菜单可开启" "状态 · 余额服务已停用"
         return
     }
 
@@ -4319,9 +5113,9 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
         if (-not $balObj.balances -or $balObj.balances.Count -eq 0) {
             $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
             $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-            $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
             $DeepSeekMsgTitle.Text       = if ($IsInitialStartup) { "启动同步中..." } else { "正在查询余额..." }
             $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "首次联网请求中，请稍候~" }
+            Set-DeepSeekMsgVisual "同步中" "#FF6366F1" "#A8EEF2FF" "#80A5B4FC" "#FF4338CA" "连接中 · 低额预警 $threshFmt" "正在拉取..." "状态 · 正在同步余额"
             return
         }
     }
@@ -4329,25 +5123,26 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
     if ($st -eq "unavailable") {
         $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
         $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
         $DeepSeekStatusNotice.Text   = "暂不可用"
         $DeepSeekMsgTitle.Text       = "暂不可用"
         $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { "$($balObj.errorMessage)（点击 ↻ 重试）" } else { "启动后未获取到余额数据（点击 ↻ 重试）" }
+        Set-DeepSeekMsgVisual "暂不可用" "#FFF59E0B" "#A8FFFBEB" "#80FCD34D" "#FFB45309" "暂无快照 · 预警线 $threshFmt" "点右上 ↻ 重试" "状态 · 暂未获取有效余额"
         return
     }
 
     if (($st -in @("error", "stale")) -and (-not $balObj.balances -or $balObj.balances.Count -eq 0) -and ($balObj.errorCode -in @("COOLDOWN", "RATE_LIMITED"))) {
         $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
         $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Collapsed
         if ($balObj.errorCode -eq "COOLDOWN") {
             $DeepSeekStatusNotice.Text = "冷却中"
             $DeepSeekMsgTitle.Text     = "刷新冷却中"
             $DeepSeekMsgDetail.Text    = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "刷新过于频繁，请稍后再试" }
+            Set-DeepSeekMsgVisual "冷却保护" "#FFF59E0B" "#A8FFFBEB" "#80FCD34D" "#FFB45309" "10秒间隔 · 预警线 $threshFmt" "稍后再点 ↻" "状态 · 请求冷却中"
         } else {
             $DeepSeekStatusNotice.Text = "频率限制"
             $DeepSeekMsgTitle.Text     = "请求频率受限"
             $DeepSeekMsgDetail.Text    = if ($balObj.errorMessage) { [string]$balObj.errorMessage } else { "请求频率超限，请稍后再试" }
+            Set-DeepSeekMsgVisual "频率受限" "#FFEF4444" "#A8FEF2F2" "#7AFCA5A5" "#FFB91C1C" "请求过频 · 预警线 $threshFmt" "请稍后再试" "状态 · 接口限流保护"
         }
         return
     }
@@ -4362,11 +5157,13 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
             $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
             $DeepSeekStatusNotice.Text   = "查询失败"
             $title = "余额获取失败"
-            if ($balObj.errorCode -eq "DSH_CREDENTIAL_MISSING") { $title = "DSH 凭据未配置" }
-            elseif ($balObj.errorCode -eq "DSH_UNSUPPORTED") { $title = "服务商不支持" }
-            elseif ($balObj.errorCode -eq "DSH_NOT_RUNNING") { $title = "DSH 未运行" }
+            $chip  = "查询异常"
+            if ($balObj.errorCode -eq "DSH_CREDENTIAL_MISSING") { $title = "DSH 凭据未配置"; $chip = "缺少凭据" }
+            elseif ($balObj.errorCode -eq "DSH_UNSUPPORTED") { $title = "服务商不支持"; $chip = "不适用" }
+            elseif ($balObj.errorCode -eq "DSH_NOT_RUNNING") { $title = "DSH 未运行"; $chip = "宿主离线" }
             $DeepSeekMsgTitle.Text = $title
             $DeepSeekMsgDetail.Text      = if ($balObj.errorMessage) { "$($balObj.errorMessage)（点击 ↻ 重试）" } else { "请在 DSH 中检查服务商配置（点击 ↻ 重试）" }
+            Set-DeepSeekMsgVisual $chip "#FFEF4444" "#A8FEF2F2" "#7AFCA5A5" "#FFB91C1C" "配置检查 · 预警线 $threshFmt" "点右上 ↻ 重试" "状态 · 余额查询失败"
             return
         }
     }
@@ -4386,18 +5183,15 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
         if ($null -eq $cnyInfo) {
             $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Collapsed
             $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Visible
-            $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Visible
-            $DeepSeekBadgeText.Text      = "官方"
             $DeepSeekStatusNotice.Text   = "无CNY余额"
-            $DeepSeekMsgTitle.Text       = "当前账户未返回人民币余额"
-            $DeepSeekMsgDetail.Text      = "DeepSeek 官方返回列表中未包含 CNY 余额明细"
+            $DeepSeekMsgTitle.Text       = "未返回人民币余额"
+            $DeepSeekMsgDetail.Text      = "DeepSeek 返回列表中未包含 CNY 余额明细"
+            Set-DeepSeekMsgVisual "无CNY明细" "#FFF59E0B" "#A8FFFBEB" "#80FCD34D" "#FFB45309" "仅展示人民币 · 阈值 $threshFmt" "点右上 ↻ 刷新" "状态 · 未返回 CNY 余额"
             return
         }
 
         $DeepSeekOkPanel.Visibility  = [System.Windows.Visibility]::Visible
         $DeepSeekMsgPanel.Visibility = [System.Windows.Visibility]::Collapsed
-        $DeepSeekBadge.Visibility    = [System.Windows.Visibility]::Visible
-        $DeepSeekBadgeText.Text      = "官方"
 
         if ($balObj.errorCode -eq "COOLDOWN") {
             $DeepSeekStatusNotice.Text = "冷却中"
@@ -4429,25 +5223,23 @@ function Apply-BalanceObject($balObj, [switch]$IsInitialStartup) {
             }
         }
 
-        $DeepSeekCurrencyLabel.Text = "人民币 CNY · DSH 宿主"
+        $DeepSeekCurrencyLabel.Text = "人民币 CNY · DSH"
         $DeepSeekTotalText.Text = "¥ $($cnyInfo.totalBalance)"
-
-        # Safe breakdown rendering: do NOT fake 0.00 if toppedUp or granted are null
-        if ($null -ne $cnyInfo.toppedUpBalance -and $null -ne $cnyInfo.grantedBalance) {
-            $DeepSeekBreakdownText.Text = "充值: ¥ $($cnyInfo.toppedUpBalance)   赠金: ¥ $($cnyInfo.grantedBalance)"
-        } elseif ($null -ne $cnyInfo.toppedUpBalance) {
-            $DeepSeekBreakdownText.Text = "充值: ¥ $($cnyInfo.toppedUpBalance)   赠金: 未提供"
-        } elseif ($null -ne $cnyInfo.grantedBalance) {
-            $DeepSeekBreakdownText.Text = "充值: 未提供   赠金: ¥ $($cnyInfo.grantedBalance)"
-        } else {
-            $DeepSeekBreakdownText.Text = "充值/赠金明细暂不可用"
-        }
-
         $DeepSeekAvailableNotice.Text = if ($balObj.isAvailable -eq $false) { "（账户不可用）" } else { "" }
 
         # 开关只管提醒，判定始终执行；启动快照仍不打扰
         if ($st -eq "ok" -and (-not $IsInitialStartup)) {
             Check-LowBalanceAlert $balObj
+        }
+
+        $totNum = 0.0
+        $threshVal = if ($null -ne $Config.LowBalanceCnyThreshold) { [double]$Config.LowBalanceCnyThreshold } else { 5.0 }
+        $hasTotNum = [double]::TryParse([string]$cnyInfo.totalBalance, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$totNum)
+        $isLowNow = [bool]($script:isLowBalance -or ($hasTotNum -and $totNum -lt $threshVal))
+        $vKind = if ($balObj.isAvailable -eq $false) { "unavail" } elseif ($isLowNow) { "low" } else { "ok" }
+        Update-DeepSeekBalanceRatioAndLegend $cnyInfo $vKind $isLowNow
+        if ($st -eq "stale" -and $vKind -eq "ok" -and $DeepSeekFooterLeft) {
+            $DeepSeekFooterLeft.Text = "● 上次缓存快照 · 待同步"
         }
     }
     } finally {
@@ -4495,49 +5287,76 @@ function Read-InitialBalanceSnapshot {
 # ============================================================================
 # 10. Q-Bounce Squash & Stretch Animation + Low-Latency Audio
 # ============================================================================
-function Trigger-PetBounce {
-    $sb = New-Object System.Windows.Media.Animation.Storyboard
-
-    $kx = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.0,  [TimeSpan]::FromMilliseconds(0))))
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.16, [TimeSpan]::FromMilliseconds(65))))
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(0.91, [TimeSpan]::FromMilliseconds(155))))
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.05, [TimeSpan]::FromMilliseconds(245))))
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(0.98, [TimeSpan]::FromMilliseconds(320))))
-    [void]$kx.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.0,  [TimeSpan]::FromMilliseconds(390))))
-
-    $ky = New-Object System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.0,  [TimeSpan]::FromMilliseconds(0))))
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(0.84, [TimeSpan]::FromMilliseconds(65))))
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.11, [TimeSpan]::FromMilliseconds(155))))
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(0.96, [TimeSpan]::FromMilliseconds(245))))
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.02, [TimeSpan]::FromMilliseconds(320))))
-    [void]$ky.KeyFrames.Add((New-Object System.Windows.Media.Animation.LinearDoubleKeyFrame(1.0,  [TimeSpan]::FromMilliseconds(390))))
-
-    [System.Windows.Media.Animation.Storyboard]::SetTarget($kx, $PetHost)
-    [System.Windows.Media.Animation.Storyboard]::SetTargetProperty($kx, (New-Object System.Windows.PropertyPath("RenderTransform.ScaleX")))
-    [System.Windows.Media.Animation.Storyboard]::SetTarget($ky, $PetHost)
-    [System.Windows.Media.Animation.Storyboard]::SetTargetProperty($ky, (New-Object System.Windows.PropertyPath("RenderTransform.ScaleY")))
-
-    [void]$sb.Children.Add($kx)
-    [void]$sb.Children.Add($ky)
-    $sb.Begin()
+function Start-PetPressSquash {
+    if (-not $PetScale) { return }
+    try {
+        $xProperty = [System.Windows.Media.ScaleTransform]::ScaleXProperty
+        $yProperty = [System.Windows.Media.ScaleTransform]::ScaleYProperty
+        $dur = [System.Windows.Duration]::new([TimeSpan]::FromMilliseconds(75))
+        $ease = [System.Windows.Media.Animation.CubicEase]::new()
+        $ease.EasingMode = [System.Windows.Media.Animation.EasingMode]::EaseOut
+        $ease.Freeze()
+        $ax = [System.Windows.Media.Animation.DoubleAnimation]::new([double]$PetScale.ScaleX, 1.11, $dur)
+        $ay = [System.Windows.Media.Animation.DoubleAnimation]::new([double]$PetScale.ScaleY, 0.86, $dur)
+        $ax.EasingFunction = $ease
+        $ay.EasingFunction = $ease
+        $ax.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::HoldEnd
+        $ay.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::HoldEnd
+        $PetScale.BeginAnimation($xProperty, $ax)
+        $PetScale.BeginAnimation($yProperty, $ay)
+    } catch {}
 }
 
-$pressPath   = Join-Path $AssetsDir "press.wav"
-$releasePath = Join-Path $AssetsDir "release.wav"
+function Trigger-PetBounce {
+    if (-not $PetScale) { return }
+    $xProperty = [System.Windows.Media.ScaleTransform]::ScaleXProperty
+    $yProperty = [System.Windows.Media.ScaleTransform]::ScaleYProperty
+    $curX = [double]$PetScale.ScaleX
+    $curY = [double]$PetScale.ScaleY
+    if ($curY -lt 0.96 -or $curX -gt 1.04) {
+        $times = @(0, 85, 170, 245, 310)
+        $scaleX = @($curX, 0.92, 1.04, 0.99, 1.0)
+        $scaleY = @($curY, 1.10, 0.97, 1.01, 1.0)
+    } else {
+        $times = @(0, 65, 155, 245, 320, 390)
+        $scaleX = @($curX, 1.16, 0.91, 1.05, 0.98, 1.0)
+        $scaleY = @($curY, 0.84, 1.11, 0.96, 1.02, 1.0)
+    }
+    $spline = [System.Windows.Media.Animation.KeySpline]::new(0.45, 0.0, 0.4, 1.0)
+    $spline.Freeze()
+    $stretchX = [System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames]::new()
+    $stretchY = [System.Windows.Media.Animation.DoubleAnimationUsingKeyFrames]::new()
+    $stretchX.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+    $stretchY.FillBehavior = [System.Windows.Media.Animation.FillBehavior]::Stop
+    for ($i = 0; $i -lt $times.Count; $i++) {
+        $keyTime = [System.Windows.Media.Animation.KeyTime]::FromTimeSpan([TimeSpan]::FromMilliseconds($times[$i]))
+        [void]$stretchX.KeyFrames.Add([System.Windows.Media.Animation.SplineDoubleKeyFrame]::new($scaleX[$i], $keyTime, $spline))
+        [void]$stretchY.KeyFrames.Add([System.Windows.Media.Animation.SplineDoubleKeyFrame]::new($scaleY[$i], $keyTime, $spline))
+    }
+    $PetScale.BeginAnimation($xProperty, $stretchX)
+    $PetScale.BeginAnimation($yProperty, $stretchY)
+}
+
+$pressPath        = Join-Path $AssetsDir "press.wav"
+$releasePath      = Join-Path $AssetsDir "release.wav"
+$taskCompletePath = Join-Path $AssetsDir "task_complete.wav"
 
 $script:PressPlayer = New-Object System.Windows.Media.MediaPlayer
 $script:ReleasePlayer = New-Object System.Windows.Media.MediaPlayer
+$script:TaskCompletePlayer = New-Object System.Windows.Media.MediaPlayer
 try {
     if (Test-Path $pressPath) { $script:PressPlayer.Open([System.Uri]$pressPath) }
     if (Test-Path $releasePath) { $script:ReleasePlayer.Open([System.Uri]$releasePath) }
+    if (Test-Path $taskCompletePath) { $script:TaskCompletePlayer.Open([System.Uri]$taskCompletePath) }
 } catch {}
 
 function Play-PressSound {
     if (-not $Config.SoundEnabled) { return }
     try {
+        if ($script:ReleasePlayer) { try { $script:ReleasePlayer.Stop() } catch {} }
+        if (-not $script:PressPlayer) { return }
         $vol = [double]([Math]::Max(0, [Math]::Min(1000, $Config.SoundVolume)) / 1000.0)
+        $script:PressPlayer.Stop()
         $script:PressPlayer.Volume = $vol
         $script:PressPlayer.Position = [TimeSpan]::Zero
         $script:PressPlayer.Play()
@@ -4547,7 +5366,10 @@ function Play-PressSound {
 function Play-ReleaseSound {
     if (-not $Config.SoundEnabled) { return }
     try {
+        if ($script:PressPlayer) { try { $script:PressPlayer.Stop() } catch {} }
+        if (-not $script:ReleasePlayer) { return }
         $vol = [double]([Math]::Max(0, [Math]::Min(1000, $Config.SoundVolume)) / 1000.0)
+        $script:ReleasePlayer.Stop()
         $script:ReleasePlayer.Volume = $vol
         $script:ReleasePlayer.Position = [TimeSpan]::Zero
         $script:ReleasePlayer.Play()
@@ -4564,6 +5386,76 @@ function Play-ApproveSound {
         $t.Start()
     } catch { try { [System.Media.SystemSounds]::Exclamation.Play() } catch {} }
 }
+
+# --- BEGIN TASK COMPLETE SOUND HELPERS ---
+function ConvertFrom-HHmmToMinutes([string]$hhmm) {
+    if ([string]::IsNullOrWhiteSpace($hhmm)) { return $null }
+    $trimmed = $hhmm.Trim()
+    if ($trimmed -notmatch '^([01]\d|2[0-3]):([0-5]\d)$') { return $null }
+    $hh = [int]$Matches[1]
+    $mm = [int]$Matches[2]
+    return ($hh * 60) + $mm
+}
+
+function Test-InQuietHours([datetime]$localNow, [string]$startStr, [string]$endStr) {
+    $startMin = ConvertFrom-HHmmToMinutes $startStr
+    $endMin = ConvertFrom-HHmmToMinutes $endStr
+    if ($null -eq $startMin -or $null -eq $endMin) {
+        Log-Throttled "QuietHoursInvalid" "Invalid QuietHours HH:mm config ('$startStr' - '$endStr'); quiet hours disabled." 300
+        return $false
+    }
+    if ($startMin -eq $endMin) {
+        Log-Throttled "QuietHoursEmptyRange" "QuietHours start and end are identical ('$startStr'); treating as empty window." 300
+        return $false
+    }
+    $nowMin = ($localNow.Hour * 60) + $localNow.Minute
+    if ($startMin -lt $endMin) {
+        return (($nowMin -ge $startMin) -and ($nowMin -lt $endMin))
+    }
+    return (($nowMin -ge $startMin) -or ($nowMin -lt $endMin))
+}
+
+function Test-IsPetOrBubbleHidden {
+    return ([bool]$script:manualBubbleHidden -or [bool]$script:trayWindowHidden)
+}
+
+function Test-ShouldMuteTaskCompleteSound([datetime]$localNow = [datetime]::Now) {
+    if ($Config.TaskCompleteSoundEnabled -eq $false) { return $true }
+    if (($Config.MuteTaskSoundWhenHidden -ne $false) -and (Test-IsPetOrBubbleHidden)) { return $true }
+    if ([bool]$Config.QuietHoursEnabled -and (Test-InQuietHours $localNow ([string]$Config.QuietHoursStart) ([string]$Config.QuietHoursEnd))) {
+        return $true
+    }
+    return $false
+}
+
+function Set-QuietHoursPreset([string]$presetText) {
+    if ([string]::IsNullOrWhiteSpace($presetText)) { return }
+    $parts = $presetText.Split('-')
+    if ($parts.Count -ne 2) { return }
+    if ($null -eq (ConvertFrom-HHmmToMinutes $parts[0]) -or $null -eq (ConvertFrom-HHmmToMinutes $parts[1])) { return }
+    $Config.QuietHoursStart = $parts[0].Trim()
+    $Config.QuietHoursEnd = $parts[1].Trim()
+    $Config.QuietHoursEnabled = $true
+    Save-Config
+    if ($script:WpfTaskCompleteMenu) { Sync-WpfTaskCompleteMenu }
+}
+
+function Play-TaskCompleteSound {
+    param(
+        [switch]$Preview,
+        [datetime]$LocalNow = [datetime]::Now
+    )
+    if (-not $Preview -and (Test-ShouldMuteTaskCompleteSound $LocalNow)) { return $false }
+    try {
+        if (-not $script:TaskCompletePlayer) { return $false }
+        $vol = [double]([Math]::Max(0, [Math]::Min(1000, $Config.SoundVolume)) / 1000.0)
+        $script:TaskCompletePlayer.Volume = $vol
+        $script:TaskCompletePlayer.Position = [TimeSpan]::Zero
+        $script:TaskCompletePlayer.Play()
+        return $true
+    } catch { return $false }
+}
+# --- END TASK COMPLETE SOUND HELPERS ---
 
 # ============================================================================
 # 12. Custom Rounded WPF ContextMenu (Modeled after T7moris/GPT-Niang)
@@ -4630,7 +5522,7 @@ $MenuXaml = @"
               <Popup x:Name="PART_Popup" Placement="Right" HorizontalOffset="-2" VerticalOffset="-8"
                      PlacementTarget="{Binding RelativeSource={RelativeSource TemplatedParent}}"
                      IsOpen="{Binding IsSubmenuOpen, RelativeSource={RelativeSource TemplatedParent}}"
-                     AllowsTransparency="True" Focusable="False" PopupAnimation="None">
+                     AllowsTransparency="True" Focusable="False" PopupAnimation="Fade">
                 <Border x:Name="SubmenuChrome" Background="{DynamicResource MenuSurfaceBrush}"
                         BorderBrush="{DynamicResource MenuBorderBrush}" BorderThickness="1" CornerRadius="12"
                         Padding="6" Margin="6,5,10,10" MinWidth="176" SnapsToDevicePixels="True">
@@ -4687,7 +5579,8 @@ $MenuXaml = @"
                       Background="{TemplateBinding Background}" CornerRadius="7"/>
               <Border x:Name="ExitHitArea" Background="Transparent" Cursor="Hand"
                       Padding="{TemplateBinding Padding}" CornerRadius="7">
-                <ContentPresenter ContentSource="Header" RecognizesAccessKey="True" VerticalAlignment="Center"/>
+                 <ContentPresenter x:Name="ExitHeaderPresenter" ContentSource="Header" RecognizesAccessKey="True"
+                                   VerticalAlignment="Center" Margin="24,0,0,0"/>
               </Border>
               <TextBlock x:Name="VersionLabel" Grid.Column="1" Text="{TemplateBinding Tag}"
                          Foreground="{DynamicResource MenuMutedBrush}" FontSize="12" Margin="14,0,11,0"
@@ -4746,6 +5639,36 @@ function Sync-CharacterMenuChecks {
     }
 }
 
+function Sync-QuotaStampStyleMenuChecks {
+    $style = if ([string]$Config.QuotaStampStyle -eq "lineart") { "lineart" } else { "embossed" }
+    if ($script:TrayMenu -and $script:TrayMenu.Tag) {
+        if ($script:TrayMenu.Tag.StampEmbossed) { $script:TrayMenu.Tag.StampEmbossed.Checked = ($style -eq "embossed") }
+        if ($script:TrayMenu.Tag.StampLineart)  { $script:TrayMenu.Tag.StampLineart.Checked  = ($style -eq "lineart") }
+    }
+    if ($script:WpfStampStyleMenu -and $script:WpfStampStyleMenu.Items) {
+        foreach ($sub in $script:WpfStampStyleMenu.Items) {
+            if ($sub -is [System.Windows.Controls.MenuItem] -and $sub.Tag) {
+                $sub.IsChecked = ([string]$sub.Tag -eq $style)
+            }
+        }
+    }
+}
+
+function Set-QuotaStampStyle([string]$Style, [switch]$Preview) {
+    $norm = if ([string]$Style -eq "lineart") { "lineart" } else { "embossed" }
+    $Config.QuotaStampStyle = $norm
+    Save-Config
+    Update-Theme
+    Sync-QuotaStampStyleMenuChecks
+    $busy = [bool]$script:agentBusy -or [bool](Get-Variable -Name agentBusy -ValueOnly -ErrorAction SilentlyContinue)
+    if ($Preview -and (-not $busy)) {
+        Set-AgentPetWindowVisible $true
+        $script:manualBubbleHidden = $false
+        Set-ActiveBubblePanel "quota"
+        Show-Bubble 5.5
+    }
+}
+
 function Set-AgentPetContextMenuTheme($contextMenu) {
     if (-not $contextMenu) { return }
     $theme = Get-CurrentTheme
@@ -4768,6 +5691,51 @@ function Set-AgentPetContextMenuTheme($contextMenu) {
         $shadowColor = $ColorConv.ConvertFromString([string]$theme.ShadowColor)
         $shadowColor.A = 255
         $contextMenu.Resources['MenuShadowColor'] = $shadowColor
+    }
+}
+
+function Select-WpfMenuChoice($item) {
+    if (-not $item.Parent) { return }
+    foreach ($choice in $item.Parent.Items) {
+        if ($choice -is [System.Windows.Controls.MenuItem] -and $choice.IsCheckable) {
+            $choice.IsChecked = [object]::ReferenceEquals($choice, $item)
+        }
+    }
+}
+
+function Sync-WpfTaskCompleteMenu {
+    if (-not $script:WpfTaskCompleteMenu) { return }
+    $enabled = ($Config.TaskCompleteSoundEnabled -ne $false)
+    $quiet = [bool]$Config.QuietHoursEnabled
+    $start = if ($Config.QuietHoursStart) { [string]$Config.QuietHoursStart } else { "23:00" }
+    $end = if ($Config.QuietHoursEnd) { [string]$Config.QuietHoursEnd } else { "08:00" }
+    $script:WpfTaskSoundMenuItem.IsChecked = $enabled
+    if ($script:WpfAgCompleteMenuItem) {
+        $script:WpfAgCompleteMenuItem.IsChecked = [bool]$Config.AntigravityTranscriptCompleteEnabled
+    }
+    $script:WpfMuteHiddenMenuItem.IsChecked = ($Config.MuteTaskSoundWhenHidden -ne $false)
+    $script:WpfQuietToggleMenuItem.IsChecked = $quiet
+    $script:WpfTaskCompleteMenu.Header = if (-not $enabled) {
+        "任务完成提醒（已关闭）"
+    } elseif ($quiet -and (Test-InQuietHours ([datetime]::Now) $start $end)) {
+        "任务完成提醒（免打扰生效中）"
+    } else {
+        "任务完成提醒（已开启）"
+    }
+    $script:WpfQuietPresetsMenu.Header = "免打扰时段设置 ($start–$end)"
+    foreach ($choice in $script:WpfQuietPresetsMenu.Items) {
+        $choice.IsChecked = ($choice.Tag -eq "$start-$end")
+    }
+}
+
+function Sync-WpfBroadcastMenu($item) {
+    if (-not $item) { return }
+    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $left = [long]$Config.PauseMonitorUntil - $nowMs
+    $item.Header = if ($left -gt 0) {
+        "状态播报（暂停中，剩余 $([int][Math]::Ceiling($left / 60000.0)) 分钟）"
+    } else {
+        "状态播报（播报中）"
     }
 }
 
@@ -4800,15 +5768,7 @@ function Build-ContextMenu {
             Trigger-PetBounce
             Play-ReleaseSound
             Show-TemporaryQuoteBubble $ck 5.5
-            if ($sender.Parent) {
-                foreach ($sub in $sender.Parent.Items) {
-                    if ($sub -is [System.Windows.Controls.MenuItem]) {
-                        $sub.IsChecked = ([object]::ReferenceEquals($sub, $sender))
-                    }
-                }
-            }
             $script:happyUntil = [DateTime]::UtcNow.AddSeconds(2.0)
-            Build-ContextMenu
             Sync-CharacterMenuChecks
         })
         [void]$miCharHeader.Items.Add($item)
@@ -4849,14 +5809,7 @@ function Build-ContextMenu {
             }
             Trigger-PetBounce
             Play-ReleaseSound
-            if ($sender.Parent) {
-                foreach ($sub in $sender.Parent.Items) {
-                    if ($sub -is [System.Windows.Controls.MenuItem]) {
-                        $sub.IsChecked = ([object]::ReferenceEquals($sub, $sender))
-                    }
-                }
-            }
-            Build-ContextMenu
+            Select-WpfMenuChoice $sender
         })
         [void]$miPoseHeader.Items.Add($pItem)
         if ($p.Key -eq "auto") { [void]$miPoseHeader.Items.Add((New-Object System.Windows.Controls.Separator)) }
@@ -4918,7 +5871,7 @@ function Build-ContextMenu {
                 }
                 Show-Bubble 5.5
             }
-            Build-ContextMenu
+            Select-WpfMenuChoice $sender
         })
         [void]$miBubbleDefault.Items.Add($bOptItem)
     }
@@ -4989,12 +5942,10 @@ function Build-ContextMenu {
         $spItem.Tag = [double]$sp
         $spItem.Add_Click({
             param($sender, $e)
-            $Config.Scale = [double]$sender.Tag
+            # The slider's existing handler keeps the header, presets and geometry in sync.
+            $sender.Parent.Items[0].Header.Children[0].Value = [double]$sender.Tag
             Save-Config
-            Update-Scale
-            Update-BubbleScale
-            Update-Facing
-            Build-ContextMenu
+            Select-WpfMenuChoice $sender
         })
         [void]$miScale.Items.Add($spItem)
     }
@@ -5023,7 +5974,8 @@ function Build-ContextMenu {
             Save-Config
             Update-BubbleScale
             Show-ScalePreviewBubble
-            Build-ContextMenu
+            $sender.Parent.Header = "气泡缩放 ($([int][Math]::Round($Config.BubbleScale * 100))%)"
+            Select-WpfMenuChoice $sender
         })
         [void]$miBubbleScale.Items.Add($bItem)
     }
@@ -5052,11 +6004,34 @@ function Build-ContextMenu {
             Save-Config
             Update-FontScale
             Show-ScalePreviewBubble
-            Build-ContextMenu
+            $sender.Parent.Header = "气泡字体大小 ($([int][Math]::Round($Config.FontScale * 100))%)"
+            Select-WpfMenuChoice $sender
         })
         [void]$miFont.Items.Add($fItem)
     }
     [void]$miAppearance.Items.Add($miFont)
+
+    # 5b. Ticket Stamp Style Sub-Menu (精致压纹 / 简笔画压纹)
+    $miStampStyle = New-Object System.Windows.Controls.MenuItem
+    $miStampStyle.Header = "气泡印章风格"
+    $curStampStyle = if ([string]$Config.QuotaStampStyle -eq "lineart") { "lineart" } else { "embossed" }
+    foreach ($stOpt in @(
+        @{ Key = "embossed"; Label = "精致压纹" },
+        @{ Key = "lineart";  Label = "简笔画压纹" }
+    )) {
+        $stItem = New-Object System.Windows.Controls.MenuItem
+        $stItem.Header = $stOpt.Label
+        $stItem.IsCheckable = $true
+        $stItem.IsChecked = ($curStampStyle -eq $stOpt.Key)
+        $stItem.Tag = $stOpt.Key
+        $stItem.Add_Click({
+            param($sender, $e)
+            Set-QuotaStampStyle ([string]$sender.Tag) -Preview
+        })
+        [void]$miStampStyle.Items.Add($stItem)
+    }
+    $script:WpfStampStyleMenu = $miStampStyle
+    [void]$miAppearance.Items.Add($miStampStyle)
 
     # 5. Sound & Volume Slider
     $miSound = New-Object System.Windows.Controls.MenuItem
@@ -5067,10 +6042,11 @@ function Build-ContextMenu {
     $miSoundToggle.IsCheckable = $true
     $miSoundToggle.IsChecked = [bool]$Config.SoundEnabled
     $miSoundToggle.Add_Click({
+        param($sender, $e)
         $Config.SoundEnabled = -not $Config.SoundEnabled
+        $sender.IsChecked = [bool]$Config.SoundEnabled
         Save-Config
         if ($Config.SoundEnabled) { Play-ReleaseSound }
-        Build-ContextMenu
     })
     [void]$miSound.Items.Add($miSoundToggle)
 
@@ -5110,6 +6086,83 @@ function Build-ContextMenu {
     $miVolSliderItem.StaysOpenOnClick = $true
     [void]$miSound.Items.Add($miVolSliderItem)
 
+    [void]$miSound.Items.Add((New-Object System.Windows.Controls.Separator))
+
+    $miTaskCompleteMenu = New-Object System.Windows.Controls.MenuItem
+    $script:WpfTaskCompleteMenu = $miTaskCompleteMenu
+
+    $miTaskCompleteToggle = New-Object System.Windows.Controls.MenuItem
+    $miTaskCompleteToggle.Header = "任务完成声音提醒"
+    $miTaskCompleteToggle.IsCheckable = $true
+    $script:WpfTaskSoundMenuItem = $miTaskCompleteToggle
+    $miTaskCompleteToggle.Add_Click({
+        $Config.TaskCompleteSoundEnabled = -not ($Config.TaskCompleteSoundEnabled -ne $false)
+        Save-Config
+        Sync-WpfTaskCompleteMenu
+    })
+    [void]$miTaskCompleteMenu.Items.Add($miTaskCompleteToggle)
+    [void]$miTaskCompleteMenu.Items.Add((New-Object System.Windows.Controls.Separator))
+
+    $miAgComplete = New-Object System.Windows.Controls.MenuItem
+    $miAgComplete.Header = "Antigravity 完成提示音"
+    $miAgComplete.IsCheckable = $true
+    $script:WpfAgCompleteMenuItem = $miAgComplete
+    $miAgComplete.Add_Click({
+        $Config.AntigravityTranscriptCompleteEnabled = -not [bool]$Config.AntigravityTranscriptCompleteEnabled
+        Save-Config
+        Sync-WpfTaskCompleteMenu
+    })
+    [void]$miTaskCompleteMenu.Items.Add($miAgComplete)
+
+    $miMuteHidden = New-Object System.Windows.Controls.MenuItem
+    $miMuteHidden.Header = "隐藏气泡/桌宠时关闭铃声"
+    $miMuteHidden.IsCheckable = $true
+    $script:WpfMuteHiddenMenuItem = $miMuteHidden
+    $miMuteHidden.Add_Click({
+        $Config.MuteTaskSoundWhenHidden = -not ($Config.MuteTaskSoundWhenHidden -ne $false)
+        Save-Config
+        Sync-WpfTaskCompleteMenu
+    })
+    [void]$miTaskCompleteMenu.Items.Add($miMuteHidden)
+
+    $miQuietToggle = New-Object System.Windows.Controls.MenuItem
+    $miQuietToggle.Header = "启用免打扰时段静音"
+    $miQuietToggle.IsCheckable = $true
+    $script:WpfQuietToggleMenuItem = $miQuietToggle
+    $miQuietToggle.Add_Click({
+        $Config.QuietHoursEnabled = -not [bool]$Config.QuietHoursEnabled
+        Save-Config
+        Sync-WpfTaskCompleteMenu
+    })
+    [void]$miTaskCompleteMenu.Items.Add($miQuietToggle)
+
+    $miQuietPresets = New-Object System.Windows.Controls.MenuItem
+    $script:WpfQuietPresetsMenu = $miQuietPresets
+    foreach ($qp in @(
+        @{ Label = "夜间 (23:00–08:00)"; Tag = "23:00-08:00" },
+        @{ Label = "晚睡 (00:00–09:00)"; Tag = "00:00-09:00" },
+        @{ Label = "早睡 (22:00–07:00)"; Tag = "22:00-07:00" },
+        @{ Label = "午休 (12:30–14:00)"; Tag = "12:30-14:00" }
+    )) {
+        $qpWpf = New-Object System.Windows.Controls.MenuItem
+        $qpWpf.Header = $qp.Label
+        $qpWpf.IsCheckable = $true
+        $qpWpf.Tag = $qp.Tag
+        $qpWpf.Add_Click({
+            param($sender, $e)
+            Set-QuietHoursPreset ([string]$sender.Tag)
+        })
+        [void]$miQuietPresets.Items.Add($qpWpf)
+    }
+    [void]$miTaskCompleteMenu.Items.Add($miQuietPresets)
+    [void]$miTaskCompleteMenu.Items.Add((New-Object System.Windows.Controls.Separator))
+    $miPreviewComplete = New-Object System.Windows.Controls.MenuItem
+    $miPreviewComplete.Header = "试听完成提示音"
+    $miPreviewComplete.Add_Click({ [void](Play-TaskCompleteSound -Preview) })
+    [void]$miTaskCompleteMenu.Items.Add($miPreviewComplete)
+    [void]$miSound.Items.Add($miTaskCompleteMenu)
+    Sync-WpfTaskCompleteMenu
+
     # 6. Auto-Quotes (定时碎碎念)
     $miAutoQuote = New-Object System.Windows.Controls.MenuItem
     $miAutoQuote.Header = "定时碎碎念"
@@ -5131,7 +6184,7 @@ function Build-ContextMenu {
             $Config.AutoQuoteMinutes = [int]$sender.Tag
             Save-Config
             $script:lastAutoQuoteTime = [DateTime]::UtcNow
-            Build-ContextMenu
+            Select-WpfMenuChoice $sender
         })
         [void]$miAutoQuote.Items.Add($aqItem)
     }
@@ -5157,7 +6210,7 @@ function Build-ContextMenu {
             $Config.SleepSeconds = [int]$sender.Tag
             Save-Config
             $script:lastInteractTime = [DateTime]::UtcNow
-            Build-ContextMenu
+            Select-WpfMenuChoice $sender
         })
         [void]$miSleep.Items.Add($sItem)
     }
@@ -5168,18 +6221,16 @@ function Build-ContextMenu {
     [void]$cm.Items.Add((New-Object System.Windows.Controls.Separator))
 
     $miBroadcast = New-Object System.Windows.Controls.MenuItem
-    $nowUtcMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-    $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
-    $remMin = if ($pauseUntil -gt $nowUtcMs) { [int][Math]::Ceiling(($pauseUntil - $nowUtcMs) / 60000.0) } else { 0 }
-    $miBroadcast.Header = if ($remMin -gt 0) { "状态播报（暂停中，剩余 $remMin 分钟）" } else { "状态播报（播报中）" }
+    $miBroadcast.Tag = "BroadcastMenu"
+    Sync-WpfBroadcastMenu $miBroadcast
     $b10 = New-Object System.Windows.Controls.MenuItem; $b10.Header = "暂停播报 10 分钟"
-    $b10.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 600000; Save-Config; Build-ContextMenu })
+    $b10.Add_Click({ param($sender, $e) $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 600000; Reset-TaskCompletionTracker "Paused"; Save-Config; Sync-WpfBroadcastMenu $sender.Parent })
     [void]$miBroadcast.Items.Add($b10)
     $b30 = New-Object System.Windows.Controls.MenuItem; $b30.Header = "暂停播报 30 分钟"
-    $b30.Add_Click({ $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1800000; Save-Config; Build-ContextMenu })
+    $b30.Add_Click({ param($sender, $e) $Config.PauseMonitorUntil = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() + 1800000; Reset-TaskCompletionTracker "Paused"; Save-Config; Sync-WpfBroadcastMenu $sender.Parent })
     [void]$miBroadcast.Items.Add($b30)
     $bResume = New-Object System.Windows.Controls.MenuItem; $bResume.Header = "立即恢复播报"
-    $bResume.Add_Click({ $Config.PauseMonitorUntil = 0; Save-Config; Build-ContextMenu })
+    $bResume.Add_Click({ param($sender, $e) $Config.PauseMonitorUntil = 0; Save-Config; Sync-WpfBroadcastMenu $sender.Parent })
     [void]$miBroadcast.Items.Add($bResume)
     [void]$cm.Items.Add($miBroadcast)
 
@@ -5193,16 +6244,26 @@ function Build-ContextMenu {
         Set-HoverDetailsEnabled (-not [bool]$Config.HoverDetailsEnabled)
     })
     [void]$cm.Items.Add($miHoverDetail)
+    $miViewTaskDetail = New-Object System.Windows.Controls.MenuItem
+    $miViewTaskDetail.Header = "查看任务详情"
+    $miViewTaskDetail.Visibility = 'Collapsed'
+    $script:WpfViewTaskDetailMenuItem = $miViewTaskDetail
+    $miViewTaskDetail.Add_Click({
+        [void]$Window.Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::ContextIdle,
+            [Action]{ Show-TaskDetailFromMenu -Keyboard })
+    })
+    [void]$cm.Items.Add($miViewTaskDetail)
 
     $miTop = New-Object System.Windows.Controls.MenuItem
     $miTop.Header = "窗口置顶"
     $miTop.IsCheckable = $true
     $miTop.IsChecked = [bool]$Config.Topmost
     $miTop.Add_Click({
+        param($sender, $e)
         $Config.Topmost = -not $Config.Topmost
+        $sender.IsChecked = [bool]$Config.Topmost
         Sync-AgentPetTopmost -Force
         Save-Config
-        Build-ContextMenu
     })
     [void]$cm.Items.Add($miTop)
 
@@ -5212,12 +6273,18 @@ function Build-ContextMenu {
         foreach ($item in $sender.Items) {
             if ($item.Tag -eq "BubbleDefaultMenu") {
                 $item.Visibility = if ($script:NotifyIcon) { 'Collapsed' } else { 'Visible' }
-                break
+                foreach ($choice in $item.Items) { $choice.IsChecked = ($choice.Tag -eq $Config.BubbleMode) }
+            } elseif ($item.Tag -eq "BroadcastMenu") {
+                Sync-WpfBroadcastMenu $item
             }
         }
         if ($script:WpfHoverDetailMenuItem) {
             $script:WpfHoverDetailMenuItem.IsChecked = [bool]$Config.HoverDetailsEnabled
         }
+        if ($script:WpfViewTaskDetailMenuItem) {
+            $script:WpfViewTaskDetailMenuItem.Visibility = if (Test-TaskDetailAvailable) { 'Visible' } else { 'Collapsed' }
+        }
+        Sync-WpfTaskCompleteMenu
         Sync-CharacterMenuChecks
     })
     $cm.Add_Closed({ Save-PendingSliderConfig })
@@ -5263,6 +6330,7 @@ function Build-ContextMenu {
         @{ Item = $miSound; Data = 'M 3,7 H 6 L 10,4 V 16 L 6,13 H 3 Z M 13,7 Q 16,10 13,13 M 15,4 Q 20,10 15,16' }
         @{ Item = $miBroadcast; Data = 'M 4,14 H 16 Q 14,12 14,8 A 4,4 0 0 0 6,8 Q 6,12 4,14 Z M 8,17 Q 10,19 12,17' }
         @{ Item = $miHoverDetail; Data = 'M 3,4 H 17 V 16 H 3 Z M 3,8 H 17 M 6,6 H 6.2' }
+        @{ Item = $miViewTaskDetail; Data = 'M 3,4 H 17 V 16 H 3 Z M 6,8 H 14 M 6,12 H 14' }
         @{ Item = $miTop; Data = 'M 8,3 H 14 L 13,9 L 16,12 H 5 L 8,9 Z M 10,12 V 18' }
         @{ Item = $miResetPos; Data = 'M 4,4 L 15,15 M 8,15 H 15 V 8' }
     )
@@ -5307,13 +6375,15 @@ $script:userInspectUntil  = [DateTime]::MinValue
 $script:refreshingUntil   = [DateTime]::MinValue
 $script:isDragging        = $false
 $script:mouseDownScreen   = New-Object System.Windows.Point(0, 0)
-$script:winStartLeft      = 0.0
-$script:winStartTop       = 0.0
+$script:winStartLeft          = 0.0
+$script:winStartTop           = 0.0
+$script:releasingPetMouseUp   = $false
 
 $PetImage.Add_MouseLeftButtonDown({
     param($s, $e)
     $script:lastInteractTime = [DateTime]::UtcNow
     $script:isDragging = $false
+    $script:releasingPetMouseUp = $false
     $source = [System.Windows.PresentationSource]::FromVisual($Window)
     $script:dpiX = if ($source -and $source.CompositionTarget) { $source.CompositionTarget.TransformToDevice.M11 } else { 1.0 }
     $script:dpiY = if ($source -and $source.CompositionTarget) { $source.CompositionTarget.TransformToDevice.M22 } else { 1.0 }
@@ -5321,6 +6391,7 @@ $PetImage.Add_MouseLeftButtonDown({
     $script:winStartLeft = $Window.Left
     $script:winStartTop  = $Window.Top
     [void]$PetImage.CaptureMouse()
+    Start-PetPressSquash
     Play-PressSound
     $e.Handled = $true
 })
@@ -5346,18 +6417,29 @@ $PetImage.Add_MouseMove({
     }
 })
 
-$PetImage.Add_MouseLeftButtonUp({
-    param($s, $e)
-    if ($PetImage.IsMouseCaptured) {
+function Release-PetMouseCapture {
+    if ($PetImage -and $PetImage.IsMouseCaptured) {
         $PetImage.ReleaseMouseCapture()
     }
-    if ($script:isDragging) {
-        $script:isDragging = $false
+}
+
+$PetImage.Add_MouseLeftButtonUp({
+    param($s, $e)
+    $wasDragging = [bool]$script:isDragging
+    $script:isDragging = $false
+    $script:releasingPetMouseUp = $true
+    try {
+        Release-PetMouseCapture
+    } finally {
+        $script:releasingPetMouseUp = $false
+    }
+    if ($wasDragging) {
         Clamp-CharacterWindowPosition
         $Config.Left = [Math]::Round($Window.Left)
         $Config.Top  = [Math]::Round($Window.Top)
         Save-Config
         Update-Facing
+        Trigger-PetBounce
     } else {
         Stop-UserBubbleInspection
         $script:manualBubbleHidden = $false
@@ -5400,9 +6482,22 @@ $PetImage.Add_MouseLeftButtonUp({
     $e.Handled = $true
 })
 
+$PetImage.Add_LostMouseCapture({
+    $script:isDragging = $false
+    if ($script:releasingPetMouseUp) { return }
+    if ($PetScale -and ($PetScale.ScaleY -lt 0.96 -or $PetScale.ScaleX -gt 1.04)) {
+        Trigger-PetBounce
+    }
+})
+
 # Clicking speech bubble blank area cycles: quota -> deepseek -> quote -> quota without modifying $Config.BubbleMode
 $Bubble.Add_MouseLeftButtonUp({
     param($s, $e)
+    # Only background surfaces cycle panels. Text and button templates are separate targets.
+    if ($e.OriginalSource -notin @($Bubble, $BubbleBorder, $WorkBodyArea, $DeepSeekHeaderBanner,
+                                   $DeepSeekBodyHost, $DeepSeekFrostedCard, $Tail, $TailNear)) {
+        return
+    }
     $script:lastInteractTime = [DateTime]::UtcNow
     if ($script:lastAgentState -in @("waiting", "approval")) { $e.Handled = $true; return }
     if ($script:agentBusy -and [DateTime]::UtcNow -ge $script:userInspectUntil) { return }
@@ -5440,18 +6535,18 @@ $Bubble.Add_MouseLeftButtonUp({
 })
 
 # Button click event isolation
+if ($QuoteHintBadge) {
+    $QuoteHintBadge.Add_Click({
+        param($s, $e)
+        $e.Handled = $true
+        Show-TemporaryQuoteBubble $Config.Character 5.5
+    })
+}
 if ($RefreshDeepSeekBtn) {
     $RefreshDeepSeekBtn.Add_Click({
         param($s, $e)
         $e.Handled = $true
         Start-UserBubbleInspection "deepseek"
-    })
-}
-if ($DeepSeekPricingLink) {
-    $DeepSeekPricingLink.Add_MouseLeftButtonUp({
-        param($s, $e)
-        $e.Handled = $true
-        try { [System.Diagnostics.Process]::Start("https://api-docs.deepseek.com/quick_start/pricing/") } catch {}
     })
 }
 if ($RefreshQuotaBtn) {
@@ -5583,10 +6678,530 @@ function Start-AgentMonitor {
     }
 }
 
-function Apply-AgentStatus($stObj) {
+# --- BEGIN TASK COMPLETE TRACKER STATE MACHINE ---
+$script:startupCutoffMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+$script:activeWorkCohort = @{}
+$script:cohortTerminalSeq = 0L
+$script:cohortPollSeq = 0L
+$script:consumedCompletionIds = New-Object System.Collections.Generic.List[string]
+$script:consumedCompletionIdSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+$script:pendingTaskCompleteDueUtc = $null
+$script:pendingCompletionEventIds = @()
+$script:pendingCohortBatchKey = ""
+
+function Test-IsCompletionConsumed([string]$eventId) {
+    if ([string]::IsNullOrWhiteSpace($eventId)) { return $false }
+    return $script:consumedCompletionIdSet.Contains($eventId)
+}
+
+function Register-ConsumedCompletionId([string]$eventId) {
+    if ([string]::IsNullOrWhiteSpace($eventId)) { return }
+    if ($script:consumedCompletionIdSet.Add($eventId)) {
+        [void]$script:consumedCompletionIds.Add($eventId)
+        while ($script:consumedCompletionIds.Count -gt 128) {
+            $evict = $script:consumedCompletionIds[0]
+            $script:consumedCompletionIds.RemoveAt(0)
+            [void]$script:consumedCompletionIdSet.Remove($evict)
+        }
+    }
+}
+
+function Consume-CancelledCohortCandidates([string]$reason = '') {
+    # AC-01: consume all pending / active-cohort completed candidates being discarded so replaying an old snapshot never re-arms
+    foreach ($cid in @($script:pendingCompletionEventIds)) {
+        if ($cid) { Register-ConsumedCompletionId ([string]$cid) }
+    }
+    foreach ($entry in @($script:activeWorkCohort.Values)) {
+        if ($entry -and $entry.Status -eq 'completed' -and $entry.CompletionEventId) {
+            Register-ConsumedCompletionId ([string]$entry.CompletionEventId)
+        }
+    }
+}
+
+function Reset-TaskCompletionTracker([string]$reason = 'Reset') {
+    if ($reason -and $reason -notin @('Settled', 'TestInit', 'ProbeReset')) {
+        Consume-CancelledCohortCandidates $reason
+    }
+    $script:activeWorkCohort.Clear()
+    $script:pendingTaskCompleteDueUtc = $null
+    $script:pendingCompletionEventIds = @()
+    $script:pendingCohortBatchKey = ""
+}
+
+function Test-IsValidTaskCompletionCandidate($comp) {
+    if ($null -eq $comp) { return $false }
+    if ([string]$comp.outcome -ne 'completed') { return $false }
+    if ([bool]$comp.strictTurnEnd) { return $true }
+    if ([bool]$Config.AntigravityTranscriptCompleteEnabled -and [bool]$comp.eligibleForAntigravityFinalReply) {
+        return $true
+    }
+    return $false
+}
+
+function Get-CompletionSettleDelaySeconds($completedEntries) {
+    foreach ($entry in $completedEntries) {
+        if ($entry -and [bool]$entry.EligibleAg) { return 3.5 }
+    }
+    return 2.0
+}
+
+function Get-NormalizedSessionSnapshots($stObj) {
+    $list = New-Object System.Collections.ArrayList
+    if (-not $stObj) { return ,@() }
+    if ($stObj.sessionSnapshots -and @($stObj.sessionSnapshots).Count -gt 0) {
+        foreach ($s in $stObj.sessionSnapshots) {
+            if ($s -and $s.state) { [void]$list.Add($s) }
+        }
+        return ,$list.ToArray()
+    }
+    if ($stObj.agents) {
+        foreach ($propName in @("antigravity", "dsh", "codex")) {
+            $sub = $stObj.agents.$propName
+            if (-not $sub) { continue }
+            if ($sub.sessions -and @($sub.sessions).Count -gt 0) {
+                foreach ($ss in $sub.sessions) {
+                    if ($ss -and $ss.state) { [void]$list.Add($ss) }
+                }
+            } elseif ($sub.state) {
+                [void]$list.Add($sub)
+            }
+        }
+        if ($list.Count -gt 0) { return ,$list.ToArray() }
+    }
+    if ($stObj.state -and [string]$stObj.state -ne "idle") {
+        [void]$list.Add($stObj)
+    }
+    return ,$list.ToArray()
+}
+
+function Test-AreTurnIdsMismatched([string]$activeTurnId, [string]$compTurnId) {
+    if ([string]::IsNullOrWhiteSpace($activeTurnId) -or $activeTurnId -eq 'unknown') { return $false }
+    if ([string]::IsNullOrWhiteSpace($compTurnId) -or $compTurnId -eq 'unknown') { return $false }
+    $aExp = $activeTurnId.StartsWith('id:')
+    $cExp = $compTurnId.StartsWith('id:')
+    if ($aExp -eq $cExp) {
+        return ($activeTurnId -cne $compTurnId)
+    }
+    return $false
+}
+
+function Test-IsStaleOrMismatchedTurnCandidate($oldEntry, [string]$compTurnId, [long]$compTurnStart, [long]$compEventAt, [long]$effCompAt) {
+    # Reject internal timeline inversion on the candidate itself (event before its own turn start)
+    if ($compTurnStart -gt 0 -and $compEventAt -gt 0 -and $compEventAt -lt $compTurnStart) {
+        return $true
+    }
+    if (-not $oldEntry) { return $false }
+
+    $wasObservedActive = ($oldEntry.Status -eq 'active') -or ([bool]$oldEntry.SeenActive)
+    if (-not $wasObservedActive) { return $false }
+
+    $refActiveAt = if ($oldEntry.LastActiveSnapAtMs -and [long]$oldEntry.LastActiveSnapAtMs -gt 0) { [long]$oldEntry.LastActiveSnapAtMs } else { 0L }
+    $refTurnStart = if ($oldEntry.ActiveTurnStartedAtMs -and [long]$oldEntry.ActiveTurnStartedAtMs -gt 0) { [long]$oldEntry.ActiveTurnStartedAtMs } else { 0L }
+
+    # Delayed/replayed older turn always starts before observed active turn; reject even if appended later
+    if ($refTurnStart -gt 0 -and $compTurnStart -gt 0 -and $compTurnStart -lt $refTurnStart) {
+        return $true
+    }
+    if ($refTurnStart -gt 0 -and $effCompAt -gt 0 -and $effCompAt -lt $refTurnStart) {
+        return $true
+    }
+    if ($refActiveAt -gt 0 -and $effCompAt -gt 0 -and $effCompAt -lt $refActiveAt) {
+        return $true
+    }
+
+    # Different turnId: allow only if candidate proves via turnStartedAtMs that it started strictly after the prior turn (rapid A->B between polls)
+    if (Test-AreTurnIdsMismatched ([string]$oldEntry.ActiveTurnId) $compTurnId) {
+        $isNewerRapidTurn = (
+            ($refTurnStart -gt 0 -and $compTurnStart -gt $refTurnStart) -or
+            ($refTurnStart -le 0 -and $refActiveAt -gt 0 -and $compTurnStart -gt $refActiveAt)
+        )
+        if (-not $isNewerRapidTurn) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Test-IsTerminalEntryMoreRecent([long]$candAtMs, [long]$candPollSeq, [long]$refAtMs, [long]$refPollSeq, [switch]$FavorCandidateOnTie) {
+    if ($candAtMs -gt $refAtMs) { return $true }
+    if ($candAtMs -lt $refAtMs) { return $false }
+    if ($candPollSeq -gt $refPollSeq) { return $true }
+    if ($candPollSeq -lt $refPollSeq) { return $false }
+    return [bool]$FavorCandidateOnTie
+}
+
+function Update-TaskCompletionTracker($stObj, [long]$nowMs, [DateTime]$utcNow) {
     if (-not $stObj) { return }
     $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
-    if ($pauseUntil -gt [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()) {
+    if ($pauseUntil -gt $nowMs) {
+        Reset-TaskCompletionTracker "Paused"
+        return
+    }
+
+    $script:cohortPollSeq++
+    $pollSeq = [long]$script:cohortPollSeq
+
+    $snapshots = Get-NormalizedSessionSnapshots $stObj
+    if (-not $snapshots -or $snapshots.Count -eq 0 -or [string]$stObj.state -eq "idle") {
+        if ($snapshots.Count -eq 0) {
+            $hadVanished = $false
+            foreach ($k in @($script:activeWorkCohort.Keys)) {
+                $entry = $script:activeWorkCohort[$k]
+                if ($entry.Status -eq 'active') {
+                    $entry.Status = 'vanished'
+                    $script:cohortTerminalSeq++
+                    $entry.TerminalSeq = $script:cohortTerminalSeq
+                    $entry.TerminalPollSeq = $pollSeq
+                    $entry.CompletionEventAtMs = $nowMs
+                    $hadVanished = $true
+                }
+            }
+            if ($hadVanished) {
+                Reset-TaskCompletionTracker "VanishedToIdle"
+                return
+            }
+            # Preserve an already-armed legitimate completion countdown across normal 8s TERMINAL_HOLD_MS expiry
+            if ($null -eq $script:pendingTaskCompleteDueUtc) {
+                $script:activeWorkCohort.Clear()
+            }
+            return
+        }
+    }
+
+    $activeStateSet = @('working', 'thinking', 'waiting', 'approval', 'stalled', 'calling', 'result')
+    $seenKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::Ordinal)
+
+    foreach ($snap in $snapshots) {
+        if (-not $snap -or -not $snap.state) { continue }
+        $sSrc = if ($snap.source) { [string]$snap.source } else { "Agent" }
+        $sRaw = if ($snap.rawId) { [string]$snap.rawId } elseif ($snap.sessionId) { [string]$snap.sessionId } else { "default" }
+        $key = if ($snap.sessionKey) { [string]$snap.sessionKey } else { "$sSrc|$sRaw" }
+        [void]$seenKeys.Add($key)
+
+        $sState = [string]$snap.state
+        $comp = $snap.completion
+        $compOutcome = if ($comp) { [string]$comp.outcome } else { "" }
+        $compEventId = if ($comp) { [string]$comp.eventId } else { "" }
+        $compTurnId  = if ($comp -and $comp.turnId) { [string]$comp.turnId } else { "" }
+        $compEventAt = if ($comp -and $comp.eventAt) { [long]$comp.eventAt } elseif ($snap.at -and [long]$snap.at -gt 0) { [long]$snap.at } else { 0L }
+        $compTurnStart = if ($comp -and $comp.turnStartedAtMs) { [long]$comp.turnStartedAtMs } else { 0L }
+        $snapTurnId = if ($snap.turnId) { [string]$snap.turnId } else { "" }
+        $snapTurnStart = if ($snap.turnStartedAtMs -and [long]$snap.turnStartedAtMs -gt 0) { [long]$snap.turnStartedAtMs } else { 0L }
+        $snapAtMs = if ($snap.at -and [long]$snap.at -gt 0) { [long]$snap.at } else { $nowMs }
+
+        if ($sState -in $activeStateSet) {
+            $wasKnown = $script:activeWorkCohort.ContainsKey($key)
+            $oldEntry = if ($wasKnown) { $script:activeWorkCohort[$key] } else { $null }
+            # AC-01: consume ONLY this session's superseded completed candidate; preserve peer sessions waiting in cohort
+            if ($oldEntry -and $oldEntry.Status -eq 'completed' -and $oldEntry.CompletionEventId) {
+                Register-ConsumedCompletionId ([string]$oldEntry.CompletionEventId)
+            }
+            $wasAlreadyActive = ($oldEntry -and $oldEntry.Status -eq 'active')
+            $firstAt = if ($wasKnown) { [long]$oldEntry.FirstActiveAtMs } else { $nowMs }
+            $prevActiveSnap = if ($wasAlreadyActive -and $oldEntry.LastActiveSnapAtMs) { [long]$oldEntry.LastActiveSnapAtMs } else { 0L }
+            $nextActiveSnap = if ($wasAlreadyActive) { [Math]::Max($prevActiveSnap, $snapAtMs) } else { $snapAtMs }
+            $prevTurnId = if ($wasAlreadyActive) { [string]$oldEntry.ActiveTurnId } else { "" }
+            $nextTurnId = if ($snapTurnId) { $snapTurnId } else { $prevTurnId }
+            $prevTurnStart = if ($wasAlreadyActive -and $oldEntry.ActiveTurnStartedAtMs) { [long]$oldEntry.ActiveTurnStartedAtMs } else { 0L }
+            $nextTurnStart = if ($snapTurnStart -gt 0) { [Math]::Max($prevTurnStart, $snapTurnStart) } else { $prevTurnStart }
+
+            $script:activeWorkCohort[$key] = [ordered]@{
+                SessionKey            = $key
+                SeenActive            = $true
+                FirstActiveAtMs       = $firstAt
+                LastActiveAtMs        = $nowMs
+                LastActiveSnapAtMs    = $nextActiveSnap
+                ActiveTurnId          = $nextTurnId
+                ActiveTurnStartedAtMs = $nextTurnStart
+                Status                = 'active'
+                LastState             = $sState
+                CompletionEventId     = ''
+                CompletionEventAtMs   = 0L
+                EligibleAg            = $false
+                TerminalSeq           = 0L
+                TerminalPollSeq       = 0L
+            }
+            $script:pendingTaskCompleteDueUtc = $null
+            $script:pendingCompletionEventIds = @()
+            $script:pendingCohortBatchKey = ""
+            continue
+        }
+
+        if (($sState -eq 'error') -or ($compOutcome -in @('aborted', 'failed'))) {
+            if ($compEventId) { Register-ConsumedCompletionId $compEventId }
+            $wasKnownActive = $script:activeWorkCohort.ContainsKey($key)
+            $oldEntry = if ($wasKnownActive) { $script:activeWorkCohort[$key] } else { $null }
+            $effBadAt = if ($compEventAt -gt 0) { $compEventAt } elseif ($snapAtMs -gt 0) { $snapAtMs } else { $nowMs }
+
+            # AC-02: ignore stale/replayed older-turn error/abort while allowing rapid subsequent-turn abort
+            if ($oldEntry -and (Test-IsStaleOrMismatchedTurnCandidate $oldEntry $compTurnId $compTurnStart $compEventAt $effBadAt)) {
+                continue
+            }
+
+            if ($wasKnownActive -or ($effBadAt -gt $script:startupCutoffMs)) {
+                if ($oldEntry -and $oldEntry.Status -eq 'completed' -and $oldEntry.CompletionEventId) {
+                    Register-ConsumedCompletionId ([string]$oldEntry.CompletionEventId)
+                }
+                $prevSeen = if ($wasKnownActive) { [bool]$oldEntry.SeenActive } else { $false }
+                $firstAt = if ($wasKnownActive) { [long]$oldEntry.FirstActiveAtMs } else { $nowMs }
+                $badStatus = if ($compOutcome -eq 'aborted') { 'aborted' } else { 'failed' }
+                $sameBad = ($wasKnownActive -and $oldEntry.Status -eq $badStatus -and $oldEntry.CompletionEventId -eq $compEventId)
+                if (-not $sameBad) { $script:cohortTerminalSeq++ }
+                $seq = if ($sameBad) { [long]$oldEntry.TerminalSeq } else { $script:cohortTerminalSeq }
+                $tPoll = if ($sameBad -and $oldEntry.TerminalPollSeq -gt 0) { [long]$oldEntry.TerminalPollSeq } else { $pollSeq }
+                $script:activeWorkCohort[$key] = [ordered]@{
+                    SessionKey            = $key
+                    SeenActive            = $prevSeen
+                    FirstActiveAtMs       = $firstAt
+                    LastActiveAtMs        = $nowMs
+                    LastActiveSnapAtMs    = 0L
+                    ActiveTurnId          = ''
+                    ActiveTurnStartedAtMs = 0L
+                    Status                = $badStatus
+                    LastState             = $sState
+                    CompletionEventId     = $compEventId
+                    CompletionEventAtMs   = $effBadAt
+                    EligibleAg            = $false
+                    TerminalSeq           = $seq
+                    TerminalPollSeq       = $tPoll
+                }
+                if (-not $sameBad) {
+                    $script:pendingTaskCompleteDueUtc = $null
+                    $script:pendingCompletionEventIds = @()
+                    $script:pendingCohortBatchKey = ""
+                }
+            }
+            continue
+        }
+
+        if (Test-IsValidTaskCompletionCandidate $comp) {
+            $wasKnown = $script:activeWorkCohort.ContainsKey($key)
+            $oldEntry = if ($wasKnown) { $script:activeWorkCohort[$key] } else { $null }
+            $wasObservedActive = $wasKnown -and ([bool]$oldEntry.SeenActive)
+            $effCompAt = if ($compEventAt -gt 0) { $compEventAt } elseif ($snapAtMs -gt 0) { $snapAtMs } else { $nowMs }
+
+            # AC-02: reject stale/replayed older-turn completions while allowing rapid subsequent turns (compTurnStart > prior turnStart)
+            if (Test-IsStaleOrMismatchedTurnCandidate $oldEntry $compTurnId $compTurnStart $compEventAt $effCompAt) {
+                if ($compEventId) { Register-ConsumedCompletionId $compEventId }
+                continue
+            }
+
+            $turnStartedPostStartup = ($compTurnStart -gt $script:startupCutoffMs)
+            $isPostStartup = ($effCompAt -gt $script:startupCutoffMs)
+            $isUnconsumed = (-not (Test-IsCompletionConsumed $compEventId))
+
+            if (($wasObservedActive -or $turnStartedPostStartup) -and $isPostStartup -and $isUnconsumed) {
+                $sameComp = ($wasKnown -and $oldEntry.Status -eq 'completed' -and $oldEntry.CompletionEventId -eq $compEventId)
+                if ($oldEntry -and $oldEntry.Status -eq 'completed' -and $oldEntry.CompletionEventId -and (-not $sameComp)) {
+                    Register-ConsumedCompletionId ([string]$oldEntry.CompletionEventId)
+                }
+                if (-not $sameComp) { $script:cohortTerminalSeq++ }
+                $seq = if ($sameComp) { [long]$oldEntry.TerminalSeq } else { $script:cohortTerminalSeq }
+                $tPoll = if ($sameComp -and $oldEntry.TerminalPollSeq -gt 0) { [long]$oldEntry.TerminalPollSeq } else { $pollSeq }
+                $firstAt = if ($wasKnown) { [long]$oldEntry.FirstActiveAtMs } else { $nowMs }
+                $script:activeWorkCohort[$key] = [ordered]@{
+                    SessionKey            = $key
+                    SeenActive            = $true
+                    FirstActiveAtMs       = $firstAt
+                    LastActiveAtMs        = $nowMs
+                    LastActiveSnapAtMs    = if ($oldEntry) { [long]$oldEntry.LastActiveSnapAtMs } else { 0L }
+                    ActiveTurnId          = if ($compTurnId) { $compTurnId } elseif ($oldEntry) { [string]$oldEntry.ActiveTurnId } else { '' }
+                    ActiveTurnStartedAtMs = if ($compTurnStart -gt 0) { $compTurnStart } elseif ($oldEntry) { [long]$oldEntry.ActiveTurnStartedAtMs } else { 0L }
+                    Status                = 'completed'
+                    LastState             = $sState
+                    CompletionEventId     = $compEventId
+                    CompletionEventAtMs   = $effCompAt
+                    EligibleAg            = ([bool]$comp.eligibleForAntigravityFinalReply -and -not [bool]$comp.strictTurnEnd)
+                    TerminalSeq           = $seq
+                    TerminalPollSeq       = $tPoll
+                }
+            } else {
+                if ($compEventId) { Register-ConsumedCompletionId $compEventId }
+                if ($wasKnown -and $oldEntry.Status -eq 'active') {
+                    $script:cohortTerminalSeq++
+                    $oldEntry.Status = 'step_only'
+                    $oldEntry.LastState = $sState
+                    $oldEntry.CompletionEventAtMs = $effCompAt
+                    $oldEntry.TerminalSeq = $script:cohortTerminalSeq
+                    $oldEntry.TerminalPollSeq = $pollSeq
+                }
+            }
+            continue
+        }
+
+        # Non-strict terminal / step_only state
+        if ($script:activeWorkCohort.ContainsKey($key)) {
+            $entry = $script:activeWorkCohort[$key]
+            if ($entry.Status -ne 'step_only' -and $entry.Status -ne 'completed') {
+                $script:cohortTerminalSeq++
+                $entry.Status = 'step_only'
+                $entry.LastState = $sState
+                $entry.CompletionEventAtMs = $snapAtMs
+                $entry.TerminalSeq = $script:cohortTerminalSeq
+                $entry.TerminalPollSeq = $pollSeq
+            }
+        }
+    }
+
+    foreach ($k in @($script:activeWorkCohort.Keys)) {
+        if (-not $seenKeys.Contains($k)) {
+            $entry = $script:activeWorkCohort[$k]
+            if ($entry.Status -eq 'active') {
+                $script:cohortTerminalSeq++
+                $entry.Status = 'vanished'
+                $entry.CompletionEventAtMs = $nowMs
+                $entry.TerminalSeq = $script:cohortTerminalSeq
+                $entry.TerminalPollSeq = $pollSeq
+                $script:pendingTaskCompleteDueUtc = $null
+                $script:pendingCompletionEventIds = @()
+                $script:pendingCohortBatchKey = ""
+            }
+        }
+    }
+
+    $activeCountInCohort = 0
+    $completedEntries = New-Object System.Collections.ArrayList
+    $badEntries = New-Object System.Collections.ArrayList
+    foreach ($entry in $script:activeWorkCohort.Values) {
+        if ($entry.Status -eq 'active') {
+            $activeCountInCohort++
+        } elseif ($entry.Status -eq 'completed' -and -not (Test-IsCompletionConsumed $entry.CompletionEventId)) {
+            [void]$completedEntries.Add($entry)
+        } elseif ($entry.Status -in @('aborted', 'failed', 'vanished')) {
+            [void]$badEntries.Add($entry)
+        }
+    }
+
+    if ($activeCountInCohort -gt 0) {
+        $script:pendingTaskCompleteDueUtc = $null
+        $script:pendingCompletionEventIds = @()
+        $script:pendingCohortBatchKey = ""
+        return
+    }
+
+    if ($completedEntries.Count -gt 0) {
+        # AC-03: Compare actual termination timestamps (and shared poll seq), completely invariant to snapshot enumeration order; ties conservatively resolve to bad stop
+        $maxGoodAt = -1L
+        $maxGoodPoll = -1L
+        foreach ($ce in $completedEntries) {
+            $cAt = [long]$ce.CompletionEventAtMs
+            $cPoll = [long]$ce.TerminalPollSeq
+            if (Test-IsTerminalEntryMoreRecent $cAt $cPoll $maxGoodAt $maxGoodPoll) {
+                $maxGoodAt = $cAt
+                $maxGoodPoll = $cPoll
+            }
+        }
+        $endedWithBad = $false
+        foreach ($be in $badEntries) {
+            $bAt = [long]$be.CompletionEventAtMs
+            $bPoll = [long]$be.TerminalPollSeq
+            if (Test-IsTerminalEntryMoreRecent $bAt $bPoll $maxGoodAt $maxGoodPoll -FavorCandidateOnTie) {
+                $endedWithBad = $true
+                break
+            }
+        }
+        if ($endedWithBad) {
+            Reset-TaskCompletionTracker "CohortEndedWithAbortOrVanish"
+            return
+        }
+
+        $ids = @($completedEntries | ForEach-Object { [string]$_.CompletionEventId } | Where-Object { $_ } | Sort-Object -Unique)
+        $batchKey = ($ids -join ';')
+        if ($ids.Count -gt 0 -and ($script:pendingCohortBatchKey -ne $batchKey -or $null -eq $script:pendingTaskCompleteDueUtc)) {
+            $delaySec = Get-CompletionSettleDelaySeconds $completedEntries
+            $script:pendingTaskCompleteDueUtc = $utcNow.AddSeconds($delaySec)
+            $script:pendingCompletionEventIds = $ids
+            $script:pendingCohortBatchKey = $batchKey
+        }
+        return
+    }
+
+    if ($badEntries.Count -gt 0) {
+        Reset-TaskCompletionTracker "BadStop"
+        return
+    }
+
+    if ($null -eq $script:pendingTaskCompleteDueUtc) {
+        $script:activeWorkCohort.Clear()
+    }
+}
+
+function Try-SettleTaskCompleteSound([DateTime]$utcNow, [datetime]$localNow) {
+    if ($null -eq $script:pendingTaskCompleteDueUtc) { return $false }
+    if ($utcNow -lt $script:pendingTaskCompleteDueUtc) { return $false }
+
+    $nowMs = ([DateTimeOffset]$utcNow).ToUnixTimeMilliseconds()
+    $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
+    if ($pauseUntil -gt $nowMs) {
+        Reset-TaskCompletionTracker "PausedAtSettle"
+        return $false
+    }
+
+    foreach ($entry in $script:activeWorkCohort.Values) {
+        if ($entry.Status -eq 'active') {
+            $script:pendingTaskCompleteDueUtc = $null
+            $script:pendingCompletionEventIds = @()
+            $script:pendingCohortBatchKey = ""
+            return $false
+        }
+    }
+
+    $idsToConsume = @($script:pendingCompletionEventIds)
+    foreach ($cid in $idsToConsume) {
+        Register-ConsumedCompletionId ([string]$cid)
+    }
+    Reset-TaskCompletionTracker "Settled"
+
+    if (Test-ShouldMuteTaskCompleteSound $localNow) {
+        Write-PetLog "Task completion chime suppressed by mute policy."
+        return $false
+    }
+    return [bool](Play-TaskCompleteSound -LocalNow $localNow)
+}
+
+function Invoke-AgentMonitorTickTail([DateTime]$utcNow, [datetime]$localNow) {
+    $nowMs = ([DateTimeOffset]$utcNow).ToUnixTimeMilliseconds()
+    $stAgeSec = ($nowMs - $script:lastStatusHeartbeatMs) / 1000.0
+    $monitorDead = (-not $script:MonitorProc -or $script:MonitorProc.HasExited)
+    $monitorJustStarted = ($script:monitorStartTime -and (($utcNow - $script:monitorStartTime).TotalSeconds -lt 15.0))
+    $isWaiting = ($script:lastAgentState -eq "waiting" -or $script:lastAgentState -eq "approval")
+    $timeoutLimit = if ($isWaiting) { 60.0 } else { 35.0 }
+
+    if ((-not $monitorJustStarted) -and ($monitorDead -or ($script:agentBusy -and ($stAgeSec -gt $timeoutLimit)))) {
+        Reset-TaskCompletionTracker "Watchdog"
+        if ($script:agentBusy) {
+            Set-WaitingWindowAttention $false
+            $script:agentBusy = $false
+            $script:lastWorkStatusObj = $null
+            $script:LastDetailContentKey = $null
+            $script:LastDetailMetaKey = $null
+            Close-HoverDetailCard
+            $script:lastAgentState = $null
+            $script:waitingLastAlert = $null
+            $script:lastInteractTime = $utcNow
+            Set-PetSprite "idle"
+            if (-not (Test-HasProtectedUserBubble)) {
+                Set-ActiveBubblePanel $Config.BubbleMode
+                Hide-Bubble
+            }
+        }
+    }
+
+    $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
+    if ($pauseUntil -gt $nowMs) {
+        Reset-TaskCompletionTracker "Paused"
+    }
+
+    return [bool](Try-SettleTaskCompleteSound $utcNow $localNow)
+}
+# --- END TASK COMPLETE TRACKER STATE MACHINE ---
+
+function Apply-AgentStatus($stObj, [DateTime]$UtcNow = [DateTime]::UtcNow) {
+    if (-not $stObj) { return }
+    $nowMs = ([DateTimeOffset]$UtcNow).ToUnixTimeMilliseconds()
+    $pauseUntil = if ($null -ne $Config.PauseMonitorUntil) { [long]$Config.PauseMonitorUntil } else { 0 }
+    if ($pauseUntil -gt $nowMs) {
+        Reset-TaskCompletionTracker "Paused"
         Set-WaitingWindowAttention $false
         $script:lastWorkStatusObj = $null
         $script:LastDetailContentKey = $null
@@ -5606,6 +7221,7 @@ function Apply-AgentStatus($stObj) {
     }
     $state = [string]$stObj.state
     if (-not $state -or $state -eq "idle") {
+        Update-TaskCompletionTracker $stObj $nowMs $UtcNow
         Set-WaitingWindowAttention $false
         $script:lastWorkStatusObj = $null
         $script:LastDetailContentKey = $null
@@ -5613,7 +7229,7 @@ function Apply-AgentStatus($stObj) {
         Close-HoverDetailCard
         if ($script:agentBusy) {
             $script:agentBusy = $false
-            $script:lastInteractTime = [DateTime]::UtcNow
+            $script:lastInteractTime = $UtcNow
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
@@ -5627,11 +7243,11 @@ function Apply-AgentStatus($stObj) {
 
     # Freshness check (P0 & Issue 9):
     # Waiting states allow up to 300s without heartbeat update. Active states allow up to 35s.
-    $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
     $atMs = if ($stObj.at) { [double]$stObj.at } else { $nowMs }
     $ageSec = ($nowMs - $atMs) / 1000.0
     $maxAgeSec = if ($state -in @("waiting", "approval", "stalled")) { 300.0 } else { 35.0 }
     if ($ageSec -gt $maxAgeSec) {
+        Reset-TaskCompletionTracker "StaleStatus"
         Set-WaitingWindowAttention $false
         $script:lastWorkStatusObj = $null
         $script:LastDetailContentKey = $null
@@ -5639,7 +7255,7 @@ function Apply-AgentStatus($stObj) {
         Close-HoverDetailCard
         if ($script:agentBusy) {
             $script:agentBusy = $false
-            $script:lastInteractTime = [DateTime]::UtcNow
+            $script:lastInteractTime = $UtcNow
             $script:lastAgentState = $null
             $script:waitingLastAlert = $null
             Set-PetSprite "idle"
@@ -5651,9 +7267,13 @@ function Apply-AgentStatus($stObj) {
         return
     }
 
+    Update-TaskCompletionTracker $stObj $nowMs $UtcNow
     $script:lastWorkStatusObj = $stObj
+    if ($script:detailPinned -and -not (Test-TaskDetailAvailable)) {
+        Close-HoverDetailCard
+    }
     $script:agentBusy = $true
-    $script:lastInteractTime = [DateTime]::UtcNow
+    $script:lastInteractTime = $UtcNow
 
     # 1. Row 1: Short State Header Text & Character/State Visual Style
     $WorkHeader.Text = Get-WorkShortHeaderText $state
@@ -5749,7 +7369,7 @@ function Apply-AgentStatus($stObj) {
     if ($WorkTask.Text -cne $nextTaskText) { $WorkTask.Text = $nextTaskText }
 
     # P1-2: Do not override user inspection of quota panel unless agent enters waiting/approval state
-    $now = [DateTime]::UtcNow
+    $now = $UtcNow
     $isUserInspecting = ($script:userInspectUntil -and $now -lt $script:userInspectUntil)
     $isWaiting = ($state -eq "waiting" -or $state -eq "approval")
     Set-WaitingWindowAttention $isWaiting
@@ -5768,8 +7388,8 @@ function Apply-AgentStatus($stObj) {
             Trigger-PetBounce
             Play-ApproveSound
         }
-        if (-not $script:waitingLastAlert -or ([DateTime]::UtcNow - $script:waitingLastAlert).TotalSeconds -ge 60) {
-            $script:waitingLastAlert = [DateTime]::UtcNow
+        if (-not $script:waitingLastAlert -or ($UtcNow - $script:waitingLastAlert).TotalSeconds -ge 60) {
+            $script:waitingLastAlert = $UtcNow
             Set-ActiveBubblePanel "work"
             Show-Bubble 0 -Force
             if ($prevState -eq $state) { Trigger-PetBounce; Play-ApproveSound }
@@ -5777,7 +7397,7 @@ function Apply-AgentStatus($stObj) {
     } else {
         $script:waitingLastAlert = $null
     }
-    $script:lastStatusHeartbeatMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+    $script:lastStatusHeartbeatMs = $nowMs
 
     if ($script:currentBubblePanel -eq "work") {
         [void](Apply-WorkVisualStyle $state (Get-CurrentTheme))
@@ -5811,7 +7431,12 @@ $script:lastQuotaMtime  = [DateTime]::MinValue
 
 function Poll-AgentMonitor {
     # 0. Watchdog: ensure agent-monitor daemon is running
+    $hadMonitorProc = ($null -ne $script:MonitorProc)
     if (-not $script:MonitorProc -or $script:MonitorProc.HasExited) {
+        if ($hadMonitorProc -and $script:MonitorProc.HasExited) {
+            Reset-TaskCompletionTracker "MonitorExited"
+            $script:startupCutoffMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        }
         Start-AgentMonitor
     }
 
@@ -5824,7 +7449,6 @@ function Poll-AgentMonitor {
                 $q = $raw | ConvertFrom-Json -ErrorAction Stop
                 if ($q) {
                     $script:lastQuotaMtime = $item.LastWriteTimeUtc
-                    $script:refreshingUntil = [DateTime]::MinValue
                     Apply-QuotaObject $q
                 }
             }
@@ -6055,34 +7679,8 @@ $Timer.Add_Tick({
     Poll-AgentMonitor
     Update-TrayTooltip
 
-    # WO-02 & Issue ②: UI-side watchdog fallback (respects 15s monitor startup grace period)
-    if ($script:agentBusy) {
-        $nowMs = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
-        $stAgeSec = ($nowMs - $script:lastStatusHeartbeatMs) / 1000.0
-        $monitorDead = (-not $script:MonitorProc -or $script:MonitorProc.HasExited)
-        $monitorJustStarted = ($script:monitorStartTime -and (($now - $script:monitorStartTime).TotalSeconds -lt 15.0))
-        if (-not $monitorJustStarted) {
-            $isWaiting = ($script:lastAgentState -eq "waiting" -or $script:lastAgentState -eq "approval")
-            $timeoutLimit = if ($isWaiting) { 60.0 } else { 35.0 }
-            # Clear busy state if monitor process died OR if heartbeat timed out (P0: stale waiting cleanup)
-            if ($monitorDead -or ($stAgeSec -gt $timeoutLimit)) {
-                Set-WaitingWindowAttention $false
-                $script:agentBusy = $false
-                $script:lastWorkStatusObj = $null
-                $script:LastDetailContentKey = $null
-                $script:LastDetailMetaKey = $null
-                Close-HoverDetailCard
-                $script:lastAgentState = $null
-                $script:waitingLastAlert = $null
-                $script:lastInteractTime = [DateTime]::UtcNow
-                Set-PetSprite "idle"
-                if (-not (Test-HasProtectedUserBubble)) {
-                    Set-ActiveBubblePanel $Config.BubbleMode
-                    Hide-Bubble
-                }
-            }
-        }
-    }
+    # 1.5 Watchdog fallback, PauseMonitorUntil check, and delayed task-completion chime settlement
+    [void](Invoke-AgentMonitorTickTail $now ([datetime]::Now))
 
     # 2. Keep bubble open while user is hovering over it (never shorten an active hold deadline)
     if ($script:isBubbleOpen -and (-not $script:agentBusy) -and (-not $script:userInspectPanel) -and (-not $script:quoteInspectActive)) {
@@ -6130,19 +7728,10 @@ $Timer.Add_Tick({
     }
 
     # 4. Refresh quota reset countdown labels every ~15 seconds (respecting refresh window P2-2)
-    if ($script:refreshingUntil -ne [DateTime]::MinValue -and $now -ge $script:refreshingUntil) {
-        $script:refreshingUntil = [DateTime]::MinValue
-        if ($script:lastQuotaObject) {
-            Apply-QuotaObject $script:lastQuotaObject
-        } else {
-            $ShortReset.Text = "刷新超时"
-        }
+    if (($script:tickCounter % 60) -eq 0 -and $script:lastQuotaObject -and $script:refreshingUntil -eq [DateTime]::MinValue) {
+        Apply-QuotaObject $script:lastQuotaObject
     }
-    if (($script:tickCounter % 60) -eq 0 -and $script:lastQuotaObject) {
-        if (-not $script:refreshingUntil -or $now -ge $script:refreshingUntil) {
-            Apply-QuotaObject $script:lastQuotaObject
-        }
-    }
+    Update-QuotaRefreshTimeout $now
 
     # P1-2: If agent is busy and user temporary view expired, restore work panel unless manually hidden
     if ($script:agentBusy -and (-not $script:manualBubbleHidden) -and $script:userInspectUntil -gt [DateTime]::MinValue -and $now -ge $script:userInspectUntil) {

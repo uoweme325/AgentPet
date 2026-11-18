@@ -14,7 +14,9 @@ function runWpfLayoutAndDetailSuite() {
   const xamlPath = path.join(repoRoot, 'AgentPet.xaml');
   const assetsSrc = path.join(repoRoot, 'assets');
 
-  let ps1Source = fs.readFileSync(ps1Path, 'utf8').replace(/^\uFEFF/, '');
+  const psBytes = fs.readFileSync(ps1Path);
+  assert.equal(psBytes.subarray(0, 3).toString('hex'), 'efbbbf', 'Windows PowerShell needs the script BOM');
+  let ps1Source = psBytes.subarray(3).toString('utf8');
   assert.ok(ps1Source.includes('"Local\\AgentPet_SingleInstance_Mutex_'), 'expected mutex declaration in AgentPet.ps1');
   assert.ok(ps1Source.includes('function Start-AgentMonitor {'), 'expected Start-AgentMonitor in AgentPet.ps1');
   assert.ok(ps1Source.includes('$Window.Add_Loaded({'), 'expected $Window.Add_Loaded in AgentPet.ps1');
@@ -382,7 +384,19 @@ try {
         $cb = $BubbleBorder.TransformToAncestor($animStage).TransformBounds([System.Windows.Rect]::new(0, 0, [Math]::Max(1, $BubbleBorder.ActualWidth), [Math]::Max(1, $BubbleBorder.ActualHeight)))
         $tb = $Tail.TransformToAncestor($animStage).TransformBounds([System.Windows.Rect]::new(0, 0, [Math]::Max(1, $Tail.ActualWidth), [Math]::Max(1, $Tail.ActualHeight)))
         $nb = $TailNear.TransformToAncestor($animStage).TransformBounds([System.Windows.Rect]::new(0, 0, [Math]::Max(1, $TailNear.ActualWidth), [Math]::Max(1, $TailNear.ActualHeight)))
+        $punched = $false
+        $clip = $BubbleBorder.Clip
+        if ($clip -and $script:currentBubblePanel -eq 'quota') {
+            $line = $Window.FindName('QuotaTearLine')
+            $seamX = $line.TranslatePoint([System.Windows.Point]::new(0, 0), $BubbleBorder).X
+            $height = $BubbleBorder.ActualHeight
+            $punched = (-not $clip.FillContains([System.Windows.Point]::new($seamX, 2))) -and
+                       (-not $clip.FillContains([System.Windows.Point]::new($seamX, $height - 2))) -and
+                       $clip.FillContains([System.Windows.Point]::new($seamX + 6, 2))
+        }
         return [ordered]@{
+            hasTicketClip   = ($null -ne $clip)
+            punchedAtSeam   = $punched
             tag             = $tag
             panel           = [string]$script:currentBubblePanel
             bs              = [double]$Config.BubbleScale
@@ -406,19 +420,27 @@ try {
             chipBg          = [string]$WorkStateChip.Background
             headerColor     = [string]$WorkHeader.Foreground
             dotFill         = [string]$WorkDot.Fill
-            watermarkGlyph  = [string]$WorkBodyWatermark.Text
+            watermarkPath   = [string]$WorkBodyWatermark.Source.UriSource.LocalPath
+            watermarkHit    = [bool]$WorkBodyWatermark.IsHitTestVisible
         }
     }
 
-    # --- Case 8 (CH-01~03): Theme & State matrix (claude/dragon/gemini x working/waiting/error/success + panel reset) ---
+    # --- Case 8 (CH-01~03): Five character themes across work states, then panel reset ---
     $themeMatrix = @()
-    foreach ($ch in @('claude', 'dragon', 'gemini')) {
+    foreach ($ch in @('claude', 'dragon', 'deepseek', 'zcode', 'gemini')) {
         $Config.Character = $ch
         Update-Theme
-        foreach ($st in @('working', 'waiting', 'error', 'success')) {
+        foreach ($st in @('working', 'waiting', 'error', 'success', 'done')) {
             Set-WorkPayload -source 'Codex' -task '多角色配色与状态边框核验' -state $st -workingCount 2 -sources @('Codex', 'Antigravity')
             $snap = Get-BubbleStageSnapshot "$ch/$st"
             $snap.borderBrush = [string]$BubbleBorder.BorderBrush
+            $snap.tailBrush = [string]$Tail.BorderBrush
+            $snap.tailNearBrush = [string]$TailNear.BorderBrush
+            $snap.shadowColor = [string]$BubbleShadow.Color
+            $snap.headerGrad1 = [string]$WorkHeaderGradStop1.Color
+            $snap.headerDivider = [string]$WorkHeaderBanner.BorderBrush
+            $snap.headerText = $WorkHeader.Text
+            $snap.spriteKey = $script:CurrentSpriteKey
             $snap.bannerCornerTL = Safe-Round $WorkHeaderBanner.CornerRadius.TopLeft 1
             $snap.cardCornerTL = Safe-Round $BubbleBorder.CornerRadius.TopLeft 1
             $snap.codexFg = [string](Get-AgentSourceStyle 'codex').Foreground
@@ -427,6 +449,7 @@ try {
             $themeMatrix += $snap
         }
     }
+    Set-WorkPayload -source 'Codex' -task '错误气泡切换余额面板' -state 'error'
     Set-ActiveBubblePanel 'deepseek'
     $dsAfterError = Get-BubbleStageSnapshot 'deepseek-after-work'
     $dsAfterError.borderBrush = [string]$BubbleBorder.BorderBrush
@@ -725,6 +748,90 @@ try {
     $menuCtxIdleMode = [string]$Config.BubbleMode
     $menuCtxIdlePanel = [string]$script:currentBubblePanel
 
+    # Task completion sound tray & WPF menu bidirectional sync checks
+    $tcDefaultOk = ([bool]$DefaultConfig.TaskCompleteSoundEnabled -and [bool]$DefaultConfig.MuteTaskSoundWhenHidden -and (-not [bool]$DefaultConfig.QuietHoursEnabled) -and ([string]$DefaultConfig.QuietHoursStart -eq '23:00') -and ([string]$DefaultConfig.QuietHoursEnd -eq '08:00') -and [bool]$DefaultConfig.AntigravityTranscriptCompleteEnabled)
+    $trayTag.TaskSound.PerformClick()
+    Pump-Wpf
+    $tcTrayOffCfg = [bool]$Config.TaskCompleteSoundEnabled
+    $tcTrayOffWpf = [bool]$script:WpfTaskSoundMenuItem.IsChecked
+    $trayTag.TaskSound.PerformClick()
+    Pump-Wpf
+    $trayTag.AgComplete.PerformClick()
+    Pump-Wpf
+    $tcAgOffCfg = [bool]$Config.AntigravityTranscriptCompleteEnabled
+    $tcAgOffWpf = [bool]$script:WpfAgCompleteMenuItem.IsChecked
+    if ($script:WpfAgCompleteMenuItem) {
+        $script:WpfAgCompleteMenuItem.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        Pump-Wpf
+    }
+    $tcAgOnCfg = [bool]$Config.AntigravityTranscriptCompleteEnabled
+    $trayTag.MuteHidden.PerformClick()
+    Pump-Wpf
+    $tcMuteHiddenOffCfg = [bool]$Config.MuteTaskSoundWhenHidden
+    $tcMuteHiddenOffWpf = [bool]$script:WpfMuteHiddenMenuItem.IsChecked
+    $trayTag.MuteHidden.PerformClick()
+    Pump-Wpf
+    $qp1230 = $null
+    foreach ($qp in $trayTag.QuietPresets.DropDownItems) {
+        if ([string]$qp.Tag -eq '12:30-14:00') { $qp1230 = $qp; break }
+    }
+    if ($qp1230) { $qp1230.PerformClick(); Pump-Wpf }
+    $tcPresetStart = [string]$Config.QuietHoursStart
+    $tcPresetEnd = [string]$Config.QuietHoursEnd
+    $tcPresetQuietOn = [bool]$Config.QuietHoursEnabled
+    $tcPresetWpfQuiet = [bool]$script:WpfQuietToggleMenuItem.IsChecked
+    if ($script:WpfQuietToggleMenuItem) {
+        $script:WpfQuietToggleMenuItem.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+        Pump-Wpf
+    }
+    $tcAfterWpfQuiet = [bool]$Config.QuietHoursEnabled
+    Set-QuietHoursPreset '23:00-08:00'
+    $Config.QuietHoursEnabled = $false
+    Build-ContextMenu
+    Pump-Wpf
+    $tcRootTaskMenus = @($trayMenuStrip.Items | Where-Object { $_ -is [System.Windows.Forms.ToolStripMenuItem] -and [string]$_.Text -like '*任务完成*' })
+    $tcInSingleSubmenu = (
+        $tcRootTaskMenus.Count -eq 1 -and
+        $trayTag.TaskCompleteMenu -eq $tcRootTaskMenus[0] -and
+        $trayTag.TaskCompleteMenu.DropDownItems.Contains($trayTag.TaskSound) -and
+        $trayTag.TaskCompleteMenu.DropDownItems.Contains($trayTag.AgComplete) -and
+        $trayTag.TaskCompleteMenu.DropDownItems.Contains($trayTag.MuteHidden) -and
+        $trayTag.TaskCompleteMenu.DropDownItems.Contains($trayTag.QuietEnable) -and
+        $trayTag.TaskCompleteMenu.DropDownItems.Contains($trayTag.QuietPresets)
+    )
+    $trayAllLabels = New-Object System.Collections.ArrayList
+    $trayWalkQueue = New-Object System.Collections.Queue
+    foreach ($it in $trayMenuStrip.Items) { $trayWalkQueue.Enqueue($it) }
+    while ($trayWalkQueue.Count -gt 0) {
+        $curIt = $trayWalkQueue.Dequeue()
+        if ($curIt -is [System.Windows.Forms.ToolStripMenuItem]) {
+            [void]$trayAllLabels.Add([string]$curIt.Text)
+            foreach ($subIt in $curIt.DropDownItems) { $trayWalkQueue.Enqueue($subIt) }
+        }
+    }
+    $trayHasDisableOption = ($trayAllLabels -contains '启用托盘图标') -or ($null -ne $trayTag.TrayEnabled)
+
+    $taskSoundMenuSync = [ordered]@{
+        defaultsOk      = $tcDefaultOk
+        inSingleSubmenu = $tcInSingleSubmenu
+        noTrayHideOpt   = (-not $trayHasDisableOption)
+        trayOffCfg      = $tcTrayOffCfg
+        trayOffWpf      = $tcTrayOffWpf
+        trayRestoredCfg = [bool]$Config.TaskCompleteSoundEnabled
+        agOffCfg        = $tcAgOffCfg
+        agOffWpf        = $tcAgOffWpf
+        agOnCfg         = $tcAgOnCfg
+        muteHiddenOffCfg = $tcMuteHiddenOffCfg
+        muteHiddenOffWpf = $tcMuteHiddenOffWpf
+        muteRestoredCfg = [bool]$Config.MuteTaskSoundWhenHidden
+        presetStart     = $tcPresetStart
+        presetEnd       = $tcPresetEnd
+        presetQuietOn   = $tcPresetQuietOn
+        presetWpfQuiet  = $tcPresetWpfQuiet
+        afterWpfQuiet   = $tcAfterWpfQuiet
+        hasSoundPlayer  = ($null -ne $script:TaskCompletePlayer -and $null -ne $script:TaskCompletePlayer.Source)
+    }
+
     if ($script:NotifyIcon) {
         $script:NotifyIcon.Visible = $false
         $script:NotifyIcon.Dispose()
@@ -738,6 +845,23 @@ try {
     Set-ActiveBubblePanel 'deepseek'
     Pump-Wpf
     $dsInf = [System.Windows.Size]::new([double]::PositiveInfinity, [double]::PositiveInfinity)
+    function Get-DsRect($el, $ancestor) {
+        if (-not $el -or -not $ancestor -or -not $el.IsVisible) { return $null }
+        if ($el.ActualWidth -le 0.1 -and $el.ActualHeight -le 0.1) { return $null }
+        $tl = $el.TranslatePoint([System.Windows.Point]::new(0, 0), $ancestor)
+        return [ordered]@{
+            Left   = Safe-Round $tl.X 2
+            Top    = Safe-Round $tl.Y 2
+            Right  = Safe-Round ($tl.X + $el.ActualWidth) 2
+            Bottom = Safe-Round ($tl.Y + $el.ActualHeight) 2
+        }
+    }
+    function Test-RectsOverlap($a, $b) {
+        if (-not $a -or -not $b) { return $false }
+        $disjointX = ($a.Right -le ($b.Left + 0.5)) -or ($b.Right -le ($a.Left + 0.5))
+        $disjointY = ($a.Bottom -le ($b.Top + 0.5)) -or ($b.Bottom -le ($a.Top + 0.5))
+        return (-not ($disjointX -or $disjointY))
+    }
     function Measure-DeepSeekState([string]$tag) {
         Pump-Wpf
         $innerH = Safe-Round ($BubbleBorder.ActualHeight - $BubbleBorder.BorderThickness.Top - $BubbleBorder.BorderThickness.Bottom - $BubbleBorder.Padding.Top - $BubbleBorder.Padding.Bottom)
@@ -750,25 +874,98 @@ try {
         }
         $DeepSeekStatusNotice.Measure($dsInf)
         $noticeDesW = Safe-Round $DeepSeekStatusNotice.DesiredSize.Width
+
+        $bdRect    = Get-DsRect $DeepSeekBreakdownText $DeepSeekContentGrid
+        $grantRect = Get-DsRect $DeepSeekGrantLegend $DeepSeekContentGrid
+        $DeepSeekBreakdownText.Measure($dsInf)
+        $bdDesW   = Safe-Round $DeepSeekBreakdownText.DesiredSize.Width
+        $bdActW   = Safe-Round $DeepSeekBreakdownText.ActualWidth
+        $subOverlap = Test-RectsOverlap $bdRect $grantRect
+
+        $msgTitleRect = Get-DsRect $DeepSeekMsgTitle $DeepSeekContentGrid
+        $msgPillRect  = Get-DsRect $DeepSeekMsgStatusPill $DeepSeekContentGrid
+        $msgHdrOverlap = Test-RectsOverlap $msgTitleRect $msgPillRect
+        $msgDetailRect = Get-DsRect $DeepSeekMsgDetail $DeepSeekContentGrid
+        $msgDetailDesW = 0.0
+        if ($DeepSeekMsgPanel.Visibility -eq [System.Windows.Visibility]::Visible) {
+            $DeepSeekMsgDetail.Measure($dsInf)
+            $msgDetailDesW = Safe-Round $DeepSeekMsgDetail.DesiredSize.Width
+        }
+        $availPillRect  = Get-DsRect $DeepSeekAvailPill $DeepSeekContentGrid
+        $availTextRect  = Get-DsRect $DeepSeekAvailPillText $DeepSeekContentGrid
+        $subMetaRect    = Get-DsRect $DeepSeekSubMetaText $DeepSeekContentGrid
+        $ratioRect      = Get-DsRect $DeepSeekRatioTrack $DeepSeekContentGrid
+        $mainRowRect    = Get-DsRect $DeepSeekMainRowGrid $DeepSeekContentGrid
+        $subRowRect     = Get-DsRect $DeepSeekSubRowGrid $DeepSeekContentGrid
+        $totalRect      = Get-DsRect $DeepSeekTotalText $DeepSeekContentGrid
+        $availVsRatio   = Test-RectsOverlap $availPillRect $ratioRect
+        $subMetaVsRatio = Test-RectsOverlap $subMetaRect $ratioRect
+        $mainVsRatio    = Test-RectsOverlap $mainRowRect $ratioRect
+        $ratioVsSub     = Test-RectsOverlap $ratioRect $subRowRect
+        $cardW = $DeepSeekFrostedCard.ActualWidth
+        $cardH = $DeepSeekFrostedCard.ActualHeight
+        $outsideFrosted = @()
+        foreach ($elName in @('DeepSeekTotalText','DeepSeekAvailPill','DeepSeekMsgTitle','DeepSeekMsgStatusPill','DeepSeekMsgDetail','DeepSeekMsgSubHint','DeepSeekMsgRightHint','DeepSeekRatioTrack','DeepSeekSubRowGrid')) {
+            $el = $Window.FindName($elName)
+            if ($el -and $el.IsVisible) {
+                $ep = $el.TranslatePoint([System.Windows.Point]::new(0, 0), $DeepSeekFrostedCard)
+                if ($ep.X -lt -0.5 -or $ep.Y -lt -0.5 -or ($ep.X + $el.ActualWidth) -gt ($cardW + 0.5) -or ($ep.Y + $el.ActualHeight) -gt ($cardH + 0.5)) {
+                    $outsideFrosted += $elName
+                }
+            }
+        }
+        $availMidDiff  = if ($availPillRect -and $subMetaRect) {
+            Safe-Round ([Math]::Abs((($availPillRect.Top + $availPillRect.Bottom) / 2.0) - (($subMetaRect.Top + $subMetaRect.Bottom) / 2.0))) 2
+        } else { 0.0 }
+        $availTextMidDiff = if ($availTextRect -and $subMetaRect) {
+            Safe-Round ([Math]::Abs((($availTextRect.Top + $availTextRect.Bottom) / 2.0) - (($subMetaRect.Top + $subMetaRect.Bottom) / 2.0))) 2
+        } else { 0.0 }
+        $subRowCnt = if ($DeepSeekGrantLegend.Visibility -eq [System.Windows.Visibility]::Visible -and [System.Windows.Controls.Grid]::GetRow($DeepSeekGrantLegend) -eq 1) { 2 } else { 1 }
         return [ordered]@{
-            tag          = $tag
-            fs           = [double]$Config.FontScale
-            panelH       = $panelH
-            innerH       = $innerH
-            noticeRow    = $noticeRow
-            availNoticeW = $availNoticeW
-            noticeDesW   = $noticeDesW
-            hdrFs        = Safe-Round $DeepSeekHeader.FontSize
-            noticeFs     = Safe-Round $DeepSeekStatusNotice.FontSize
-            curFs        = Safe-Round $DeepSeekCurrencyLabel.FontSize
-            totalFs      = Safe-Round $DeepSeekTotalText.FontSize
-            bdFs         = Safe-Round $DeepSeekBreakdownText.FontSize
-            msgDetailFs  = Safe-Round $DeepSeekMsgDetail.FontSize
-            hdrText      = [string]$DeepSeekHeader.Text
-            noticeText   = [string]$DeepSeekStatusNotice.Text
-            okVis        = [string]$DeepSeekOkPanel.Visibility
-            msgVis       = [string]$DeepSeekMsgPanel.Visibility
-            padLeft      = Safe-Round $BubbleBorder.Padding.Left 1
+            tag           = $tag
+            fs            = [double]$Config.FontScale
+            panelH        = $panelH
+            innerH        = $innerH
+            noticeRow     = $noticeRow
+            availNoticeW  = $availNoticeW
+            noticeDesW    = $noticeDesW
+            hdrFs         = Safe-Round $DeepSeekHeader.FontSize
+            noticeFs      = Safe-Round $DeepSeekStatusNotice.FontSize
+            curFs         = Safe-Round $DeepSeekCurrencyLabel.FontSize
+            totalFs       = Safe-Round $DeepSeekTotalText.FontSize
+            bdFs          = Safe-Round $DeepSeekBreakdownText.FontSize
+            msgDetailFs   = Safe-Round $DeepSeekMsgDetail.FontSize
+            hdrText       = [string]$DeepSeekHeader.Text
+            curText       = [string]$DeepSeekCurrencyLabel.Text
+            badgeVis      = [string]$DeepSeekBadge.Visibility
+            noticeText    = [string]$DeepSeekStatusNotice.Text
+            okVis         = [string]$DeepSeekOkPanel.Visibility
+            msgVis        = [string]$DeepSeekMsgPanel.Visibility
+            fillBarVis    = [string]$DeepSeekFillBar.Visibility
+            grantBarVis   = [string]$DeepSeekGrantBar.Visibility
+            bdText        = [string]$DeepSeekBreakdownText.Text
+            grantText     = [string]$DeepSeekGrantText.Text
+            availPillText = [string]$DeepSeekAvailPillText.Text
+            msgTitleText  = [string]$DeepSeekMsgTitle.Text
+            msgStatusText = [string]$DeepSeekMsgStatusText.Text
+            borderPadLeft = Safe-Round $BubbleBorder.Padding.Left 1
+            padLeft       = Safe-Round $DeepSeekBodyHost.Padding.Left 1
+            hasPricing    = ($null -ne $Window.FindName('DeepSeekPricingLink'))
+            subRowCnt     = $subRowCnt
+            subOverlap    = $subOverlap
+            bdDesW        = $bdDesW
+            bdActW        = $bdActW
+            msgHdrOverlap = $msgHdrOverlap
+            availVsRatio  = $availVsRatio
+            subMetaVsRatio = $subMetaVsRatio
+            mainVsRatio   = $mainVsRatio
+            ratioVsSub    = $ratioVsSub
+            outsideFrosted = $outsideFrosted
+            availMidDiff     = $availMidDiff
+            availTextMidDiff = $availTextMidDiff
+            msgDetailH    = if ($msgDetailRect) { Safe-Round ($msgDetailRect.Bottom - $msgDetailRect.Top) } else { 0 }
+            msgDetailMaxH = Safe-Round $DeepSeekMsgDetail.MaxHeight
+            msgDetailDesW = $msgDetailDesW
         }
     }
     $okBal = [PSCustomObject]@{
@@ -781,9 +978,19 @@ try {
         isAvailable = $false
         balances = @([PSCustomObject]@{ currency = 'CNY'; totalBalance = '1234.56'; toppedUpBalance = '1000.00'; grantedBalance = '234.56' })
     }
+    $zeroGrantBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; credentialSource = 'env'; status = 'ok'
+        isAvailable = $true; updatedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        balances = @([PSCustomObject]@{ currency = 'CNY'; totalBalance = '40.41'; toppedUpBalance = '40.41'; grantedBalance = '0.00' })
+    }
+    $pureGrantBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; credentialSource = 'env'; status = 'ok'
+        isAvailable = $true; updatedAt = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()
+        balances = @([PSCustomObject]@{ currency = 'CNY'; totalBalance = '25.00'; toppedUpBalance = '0.00'; grantedBalance = '25.00' })
+    }
     $errBal = [PSCustomObject]@{
-        type = 'balance'; provider = 'deepseek-official'; status = 'timeout'
-        message = '15 秒内未从 DSH 或 DeepSeek 官方 API 获取到余额，可点击右上角 ↻ 手动重试。'
+        type = 'balance'; provider = 'deepseek-official'; status = 'error'; errorCode = 'TIMEOUT'
+        errorMessage = '15 秒内未从 DSH 或 DeepSeek API 获取到余额'
     }
     $unavailBal = [PSCustomObject]@{
         type = 'balance'; provider = 'deepseek-official'; status = 'unavailable'
@@ -791,6 +998,21 @@ try {
     }
     $dshOffBal = [PSCustomObject]@{
         type = 'balance'; provider = 'deepseek-official'; status = 'dsh_not_running'
+    }
+    $noCnyBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; status = 'ok'; isAvailable = $true; balances = @()
+    }
+    $credMissingBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; status = 'error'; errorCode = 'DSH_CREDENTIAL_MISSING'; errorMessage = '未配置有效 API 凭据'
+    }
+    $unsupportedBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; status = 'error'; errorCode = 'DSH_UNSUPPORTED'; errorMessage = '当前服务商不支持余额查询'
+    }
+    $cooldownBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; status = 'error'; errorCode = 'COOLDOWN'; balances = @(); errorMessage = '刷新过于频繁，请稍后再试'
+    }
+    $rateLimitBal = [PSCustomObject]@{
+        type = 'balance'; provider = 'deepseek-official'; status = 'error'; errorCode = 'RATE_LIMITED'; balances = @(); errorMessage = '请求频率超限，请稍后再试'
     }
     $deepSeekScaleCases = @()
     # Order A: FontScale -> State
@@ -810,6 +1032,17 @@ try {
 
         Apply-BalanceObject $errBal
         $deepSeekScaleCases += (Measure-DeepSeekState "fsFirst/$fs/err")
+    }
+    foreach ($fs in @(1.0, 1.15, 1.3, 1.4)) {
+        $Config.FontScale = $fs
+        Update-FontScale
+        Apply-BalanceObject $zeroGrantBal; $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/zeroGrant")
+        Apply-BalanceObject $pureGrantBal; $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/pureGrant")
+        Apply-BalanceObject $noCnyBal;     $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/noCny")
+        Apply-BalanceObject $credMissingBal; $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/credMissing")
+        Apply-BalanceObject $unsupportedBal; $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/unsupported")
+        Apply-BalanceObject $cooldownBal;  $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/cooldown")
+        Apply-BalanceObject $rateLimitBal; $deepSeekScaleCases += (Measure-DeepSeekState "extra/$fs/rateLimited")
     }
     $Config.FontScale = 1.4
     Update-FontScale
@@ -840,10 +1073,10 @@ try {
     # Panel roundtrip padding restore check
     Set-ActiveBubblePanel 'quota'
     Set-ActiveBubblePanel 'deepseek'
-    $dsPadAt14 = Safe-Round $BubbleBorder.Padding.Left 1
+    $dsPadAt14 = Safe-Round $DeepSeekBodyHost.Padding.Left 1
     $Config.FontScale = 1.0
     Update-FontScale
-    $dsPadAt10 = Safe-Round $BubbleBorder.Padding.Left 1
+    $dsPadAt10 = Safe-Round $DeepSeekBodyHost.Padding.Left 1
 
     # --- Case 16: HoverDetailsEnabled 4-way Load-Config + Menu + Bubble fallback + Hover matrix ---
     $hoverConfigCases = @()
@@ -1086,6 +1319,10 @@ try {
         $versionLabel = if ($exitRow) { $exitRow.Template.FindName('VersionLabel', $exitRow) } else { $null }
     } while ((-not $menu.IsOpen -or -not $menu.IsVisible -or -not $menuChrome -or $menuChrome.ActualWidth -le 0 -or -not $exitHitArea -or $exitHitArea.ActualWidth -le 0 -or -not $versionLabel -or $versionLabel.ActualWidth -le 0) -and [DateTime]::UtcNow -lt $menuLayoutDeadline)
     $exitStart = $exitHitArea.TranslatePoint([System.Windows.Point]::new(0, $exitHitArea.ActualHeight / 2), $menuChrome)
+    $exitHeader = $exitRow.Template.FindName('ExitHeaderPresenter', $exitRow)
+    $rootHeader = $visibleMenuRows[0].Template.FindName('HeaderPresenter', $visibleMenuRows[0])
+    $exitLabelX = $exitHeader.TranslatePoint([System.Windows.Point]::new(0,0), $menuChrome).X
+    $rootLabelX = $rootHeader.TranslatePoint([System.Windows.Point]::new(0,0), $menuChrome).X
     $exitEnd = $exitHitArea.TranslatePoint([System.Windows.Point]::new($exitHitArea.ActualWidth, $exitHitArea.ActualHeight / 2), $menuChrome)
     $versionStart = $versionLabel.TranslatePoint([System.Windows.Point]::new(0, $versionLabel.ActualHeight / 2), $menuChrome)
     $versionEnd = $versionLabel.TranslatePoint([System.Windows.Point]::new($versionLabel.ActualWidth, $versionLabel.ActualHeight / 2), $menuChrome)
@@ -1109,6 +1346,7 @@ try {
         exitLabel = [string]$exitRow.Header
         versionText = [string]$versionLabel.Text
         expectedVersion = "AgentPet v$script:AppVersion"
+        labelOffset = Safe-Round ($exitLabelX - $rootLabelX) 2
         menuOpen = [bool]$menu.IsOpen
         menuVisible = [bool]$menu.IsVisible
         exitRowVisible = [bool]$exitRow.IsVisible
@@ -1137,6 +1375,7 @@ try {
         rootRadius = $menuChrome.CornerRadius.TopLeft
         subRadius = $submenuChrome.CornerRadius.TopLeft
         submenuVisible = ($popup.IsOpen -and $submenuChrome.IsVisible)
+        submenuAnimation = [string]$popup.PopupAnimation
         subSurface = [string]$submenuChrome.Background
         labels = @($poseRows | ForEach-Object {[string]$_.Header})
         checks = $checkedRows
@@ -1170,6 +1409,16 @@ try {
     $scaleMenu.IsSubmenuOpen = $false
     $appearanceMenu.IsSubmenuOpen = $false
     $menu.IsOpen = $false
+    $poseBeforeChoice = $poseRows | Where-Object { $_.IsChecked } | Select-Object -First 1
+    $nextPoseChoice = $poseRows | Where-Object { $_ -ne $poseBeforeChoice } | Select-Object -First 1
+    $menuClick = [System.Windows.Controls.MenuItem]::ClickEvent
+    $nextPoseChoice.RaiseEvent([System.Windows.RoutedEventArgs]::new($menuClick))
+    $roundedMenu.poseChangedInPlace = ([object]::ReferenceEquals($Window.ContextMenu, $menu) -and $Config.Pose -eq $nextPoseChoice.Tag -and $nextPoseChoice.IsChecked -and -not $poseBeforeChoice.IsChecked)
+    $poseBeforeChoice.RaiseEvent([System.Windows.RoutedEventArgs]::new($menuClick))
+    $taskSoundBefore = ($Config.TaskCompleteSoundEnabled -ne $false)
+    $script:WpfTaskSoundMenuItem.RaiseEvent([System.Windows.RoutedEventArgs]::new($menuClick))
+    $roundedMenu.taskSoundChangedInPlace = ([object]::ReferenceEquals($Window.ContextMenu, $menu) -and [bool]$script:WpfTaskSoundMenuItem.IsChecked -eq (-not $taskSoundBefore))
+    $script:WpfTaskSoundMenuItem.RaiseEvent([System.Windows.RoutedEventArgs]::new($menuClick))
 
     # WinForms preferred popup width must contain item rows and the custom right-side check.
     $trayMenus = @($script:TrayMenu)
@@ -1188,9 +1437,12 @@ try {
     }
     $roundedMenu.trayMenuCount = $trayMenus.Count
 
-    $trayToggle = $script:TrayMenu.Tag.TrayEnabled
-    $trayToggle.Checked = $true
-    $trayToggle.PerformClick()
+    $roundedMenu.trayToggleRemoved = ($null -eq $script:TrayMenu.Tag.TrayEnabled)
+    if ($script:NotifyIcon) {
+        $script:NotifyIcon.Visible = $false
+        $script:NotifyIcon.Dispose()
+        $script:NotifyIcon = $null
+    }
     $Window.ContextMenu.PlacementTarget = $Window
     $Window.ContextMenu.IsOpen = $true
     Pump-Wpf
@@ -1719,7 +1971,583 @@ try {
         }
         balanceUi = $balanceUiCases
     }
-    # Restore clean idle state and Config values for Case 22's windowExitPersistence check
+
+    # Case 24: the quote action, large text budgets, and rendered refresh targets.
+    $Config.Character = 'claude'
+    $Config.Scale = 1.0
+    $Config.FontScale = 1.0
+    $Config.BubbleScale = 1.0
+    Update-Theme
+    Update-Scale
+    Update-FontScale
+    Update-BubbleScale
+    Set-WorkPayload -source 'Codex' -task 'quote action during work'
+    Show-TemporaryQuoteBubble
+    Pump-Wpf
+    $QuoteText.Text = '用于确认换句后的旧语录'
+    $previousQuote = [string]$QuoteText.Text
+    $previousDeadline = [DateTime]::UtcNow.AddSeconds(0.75)
+    $script:userInspectUntil = $previousDeadline
+    $script:bubbleCloseTime = $previousDeadline
+    $quoteClick = [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
+    $QuoteHintBadge.RaiseEvent($quoteClick)
+    Pump-Wpf
+    $batchOne = [ordered]@{
+        quoteButton = ($QuoteHintBadge -is [System.Windows.Controls.Button])
+        quoteClickHandled = $quoteClick.Handled
+        quoteChanged = (-not [string]::IsNullOrWhiteSpace($QuoteText.Text) -and $QuoteText.Text -cne $previousQuote)
+        quotePanelAfterClick = [string]$script:currentBubblePanel
+        quoteRenewal = ($script:userInspectUntil - $previousDeadline).TotalSeconds
+        closeRenewal = ($script:bubbleCloseTime - $previousDeadline).TotalSeconds
+        liveFontSwitches = @()
+        fontLayouts = @()
+        refreshTargets = @()
+    }
+    # Raise the underlying mouse event from the text so WPF routes LeftButtonUp to ancestors.
+    $quoteTextMouseUp = [System.Windows.Input.MouseButtonEventArgs]::new([System.Windows.Input.Mouse]::PrimaryDevice, 0, [System.Windows.Input.MouseButton]::Left)
+    $quoteTextMouseUp.RoutedEvent = [System.Windows.Input.Mouse]::MouseUpEvent
+    $QuoteText.RaiseEvent($quoteTextMouseUp)
+    Pump-Wpf
+    $batchOne.quotePanelAfterTextClick = [string]$script:currentBubblePanel
+    Set-WorkPayload -source 'Codex' -task 'work update while reading replacement quote'
+    $batchOne.quotePanelAfterWork = [string]$script:currentBubblePanel
+    $blankMouseUp = [System.Windows.Input.MouseButtonEventArgs]::new([System.Windows.Input.Mouse]::PrimaryDevice, 0, [System.Windows.Input.MouseButton]::Left)
+    $blankMouseUp.RoutedEvent = [System.Windows.Input.Mouse]::MouseUpEvent
+    $BubbleBorder.RaiseEvent($blankMouseUp)
+    Pump-Wpf
+    $batchOne.panelAfterBlankClick = [string]$script:currentBubblePanel
+
+    function Get-RenderedBounds($element, $ancestor) {
+        return $element.TransformToAncestor($ancestor).TransformBounds(
+            [System.Windows.Rect]::new(0, 0, $element.ActualWidth, $element.ActualHeight)
+        )
+    }
+    function Test-RefreshTargetAt($button, [System.Windows.Point]$point) {
+        $hit = $Window.InputHitTest($point)
+        while ($hit) {
+            if ($hit -eq $button) { return $true }
+            $hit = if ($hit -is [System.Windows.Media.Visual]) {
+                [System.Windows.Media.VisualTreeHelper]::GetParent($hit)
+            } else {
+                [System.Windows.LogicalTreeHelper]::GetParent($hit)
+            }
+        }
+        return $false
+    }
+    $sceneText = $Window.FindName('SceneText')
+    $longQuote = '先把前因后果摸清楚，省得待会儿耽误我打盹。等看板里的进度都对上了，我就回来继续和你聊今天发生的趣事。'
+    Stop-UserBubbleInspection
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    foreach ($fontPanel in @('quote', 'quota')) {
+        $Config.FontScale = 1.0
+        Update-FontScale
+        Set-ActiveBubblePanel $fontPanel
+        Show-Bubble 0 -Force
+        $originalBottom = [System.Windows.Controls.Canvas]::GetTop($Bubble) + $BubbleBorder.ActualHeight
+        foreach ($fontPreset in @(1.15, 1.3, 1.4, 1.0)) {
+            $Config.FontScale = $fontPreset
+            Update-FontScale
+            Show-ScalePreviewBubble
+            Pump-Wpf
+            $batchOne.liveFontSwitches += [ordered]@{
+                panel = $fontPanel; activePanel = $script:currentBubblePanel; font = $fontPreset
+                padding = $BubbleBorder.Padding.Top
+                moved = ([Math]::Abs([System.Windows.Controls.Canvas]::GetTop($Bubble) + $BubbleBorder.ActualHeight - $originalBottom) -gt 0.8)
+            }
+        }
+    }
+    foreach ($fontScale in @(1.3, 1.4)) {
+        $Config.FontScale = $fontScale
+        Set-ActiveBubblePanel 'quote'
+        Show-Bubble 0 -Force
+        $QuoteText.Text = $longQuote
+        Update-FontScale
+        Pump-Wpf
+        $quoteBounds = Get-RenderedBounds $QuoteText $sceneText
+        $layout = [ordered]@{
+            fontScale = $fontScale
+            quoteLineHeight = [double]$QuoteText.LineHeight
+            quoteHeight = $quoteBounds.Height
+            quoteTop = $quoteBounds.Top
+            quoteBottomGap = ($sceneText.ActualHeight - $quoteBounds.Bottom)
+        }
+        Set-ActiveBubblePanel 'quota'
+        Pump-Wpf
+        $weekBounds = Get-RenderedBounds $WeekTrack $sceneText
+        $layout.weekTrackHeight = $weekBounds.Height
+        $layout.weekTrackBottomGap = $sceneText.ActualHeight - $weekBounds.Bottom
+        $layout.cardHeight = [double]$BubbleBorder.ActualHeight
+        $batchOne.fontLayouts += $layout
+    }
+    foreach ($testBubbleScale in @(0.8, 1.0, 1.3)) {
+        $Config.BubbleScale = $testBubbleScale
+        Update-BubbleScale
+        foreach ($fontScale in @(1.0, 1.4)) {
+            $Config.FontScale = $fontScale
+            Update-FontScale
+            foreach ($mode in @('quota', 'deepseek')) {
+                $button = if ($mode -eq 'quota') { $RefreshQuotaBtn } else { $RefreshDeepSeekBtn }
+                Set-ActiveBubblePanel $mode
+                Show-Bubble 0 -Force
+                Pump-Wpf
+                $bounds = Get-RenderedBounds $button $Window
+                $centerX = ($bounds.Left + $bounds.Right) / 2.0
+                $centerY = ($bounds.Top + $bounds.Bottom) / 2.0
+                $cornersHit = $true
+                foreach ($dx in @(-11.5, 11.5)) {
+                    foreach ($dy in @(-11.5, 11.5)) {
+                        $point = [System.Windows.Point]::new(($centerX + $dx), ($centerY + $dy))
+                        if (-not (Test-RefreshTargetAt $button $point)) { $cornersHit = $false }
+                    }
+                }
+                $batchOne.refreshTargets += [ordered]@{
+                    mode = $mode; bubbleScale = $testBubbleScale; fontScale = $fontScale
+                    width = $bounds.Width; height = $bounds.Height; cornersHit = $cornersHit
+                }
+            }
+        }
+    }
+
+    # Case 25: colors as applied to WPF controls, text equivalents, and quota row geometry.
+    $batchTwoReadability = [ordered]@{ colors = @(); alerts = @(); fullText = @(); stamps = @(); lineartStamps = @(); stampMenuSync = $null; progress = @() }
+    $statusDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 7400
+    function Set-TestQuotaRemaining([int]$shortLeft, [int]$weekLeft) {
+        Apply-QuotaObject ([pscustomobject]@{
+            planLabel = 'Enterprise'
+            observedAt = [DateTimeOffset]::UtcNow.AddHours(-2).ToUnixTimeMilliseconds()
+            windows = @(
+                [pscustomobject]@{ id = 'fiveHour'; remaining = $shortLeft; resetsAt = $statusDeadline }
+                [pscustomobject]@{ id = 'weekly'; remaining = $weekLeft; resetsAt = $statusDeadline }
+            )
+        })
+    }
+    function Measure-AppliedContrast($name, $foregroundColor, $backgroundColor, $baseColor, $threshold) {
+        $batchTwoReadability.colors += [ordered]@{
+            role = $Config.Character
+            name = $name
+            fg = [string]$foregroundColor
+            bg = [string]$backgroundColor
+            base = [string]$baseColor
+            minimum = $threshold
+        }
+    }
+    $Config.BubbleScale = 1.0
+    Update-BubbleScale
+    $Config.FontScale = 1.0
+    Update-FontScale
+    foreach ($testRole in @('claude','dragon','gemini','deepseek','zcode')) {
+        $Config.Character = $testRole
+        Update-Theme
+        Set-ActiveBubblePanel 'quota'
+        Set-TestQuotaRemaining 80 80
+        Pump-Wpf
+        $shortStamp = $Window.FindName('ShortQuotaStamp')
+        $weekStamp = $Window.FindName('WeekQuotaStamp')
+        $batchTwoReadability.stamps += [ordered]@{
+            role = $testRole
+            artwork = [System.IO.Path]::GetFileName($shortStamp.Source.UriSource.LocalPath)
+            shared = [Object]::ReferenceEquals($shortStamp.Source, $weekStamp.Source)
+            visible = $shortStamp.IsVisible -and $weekStamp.IsVisible
+        }
+        $testCardColor = $BubbleBorder.Background.Color
+        foreach ($textItem in @($QuotaHeader,$ShortReset,$WeekReset)) {
+            Measure-AppliedContrast $textItem.Name $textItem.Foreground.Color $testCardColor $testCardColor 4.5
+        }
+        Measure-AppliedContrast 'ShortBar' $ShortBar.Background.Color $ShortTrack.Background.Color $testCardColor 3
+        Measure-AppliedContrast 'WeekBar' $WeekBar.Background.Color $WeekTrack.Background.Color $testCardColor 3
+        Set-ActiveBubblePanel 'quote'
+        Measure-AppliedContrast 'QuoteSpeaker' $QuoteSpeaker.Foreground.Color $testCardColor $testCardColor 4.5
+        Set-ActiveBubblePanel 'deepseek'
+        Apply-BalanceObject $okBal
+        Pump-Wpf
+        foreach ($testGradientStop in @($DeepSeekHeaderGradStop0,$DeepSeekHeaderGradStop1)) {
+            Measure-AppliedContrast 'DeepSeekHeader' $DeepSeekHeader.Foreground.Color $testGradientStop.Color $testCardColor 4.5
+            Measure-AppliedContrast 'DeepSeekStatusNotice' $DeepSeekStatusNotice.Foreground.Color $testGradientStop.Color $testCardColor 4.5
+        }
+        Measure-AppliedContrast 'DeepSeekFillBar' $DeepSeekFillBar.Background.Color $DeepSeekRatioTrack.Background.Color $testCardColor 3
+        Measure-AppliedContrast 'DeepSeekGrantBar' $DeepSeekGrantBar.Background.Color $DeepSeekRatioTrack.Background.Color $testCardColor 3
+    }
+
+    # Case 25b: QuotaStampStyle lineart stamps & Tray <-> WPF 2-option menu sync
+    $Config.TrayEnabled = $true
+    if (-not $script:NotifyIcon) { Initialize-TrayIcon }
+    Build-ContextMenu
+    $Config.QuotaStampStyle = 'embossed'
+    Sync-QuotaStampStyleMenuChecks
+    $script:agentBusy = $false
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    $script:TrayMenu.Tag.StampLineart.PerformClick()
+    Pump-Wpf
+    $syncLineart = [ordered]@{
+        cfg        = [string]$Config.QuotaStampStyle
+        defaultCfg = [string]$DefaultConfig.QuotaStampStyle
+        trayEmb    = [bool]$script:TrayMenu.Tag.StampEmbossed.Checked
+        trayLin    = [bool]$script:TrayMenu.Tag.StampLineart.Checked
+        wpfEmb     = [bool]$script:WpfStampStyleMenu.Items[0].IsChecked
+        wpfLin     = [bool]$script:WpfStampStyleMenu.Items[1].IsChecked
+    }
+    foreach ($testRole in @('claude','dragon','gemini','deepseek','zcode')) {
+        $Config.Character = $testRole
+        Update-Theme
+        Set-ActiveBubblePanel 'quota'
+        Set-TestQuotaRemaining 80 80
+        Pump-Wpf
+        $shortStamp = $Window.FindName('ShortQuotaStamp')
+        $weekStamp = $Window.FindName('WeekQuotaStamp')
+        $srcLocal = $shortStamp.Source.UriSource.LocalPath
+        $batchTwoReadability.lineartStamps += [ordered]@{
+            role    = $testRole
+            folder  = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($srcLocal))
+            artwork = [System.IO.Path]::GetFileName($srcLocal)
+            shared  = [Object]::ReferenceEquals($shortStamp.Source, $weekStamp.Source)
+            visible = $shortStamp.IsVisible -and $weekStamp.IsVisible
+        }
+    }
+    # Select a stamp while a different agent is working; neither choice may steal the work panel.
+    Set-WorkPayload -source 'Codex' -state 'result' -task '正在核对工作气泡的印章'
+    Set-QuotaStampStyle 'embossed'
+    Set-TestQuotaRemaining 10 25
+    $script:TrayMenu.Tag.StampLineart.PerformClick()
+    Pump-Wpf
+    $workStyleCheck = [ordered]@{
+        lineart = [string]$WorkBodyWatermark.Source.UriSource.LocalPath
+        shown = $WorkBodyWatermark.IsVisible -and $WorkBodyWatermark.ActualHeight -gt 0
+        panel = $script:currentBubblePanel
+    }
+    $script:WpfStampStyleMenu.Items[0].RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+    Pump-Wpf
+    $workStyleCheck.embossed = [string]$WorkBodyWatermark.Source.UriSource.LocalPath
+    $workStyleCheck.panelAfter = $script:currentBubblePanel
+    $batchTwoReadability.workStyle = $workStyleCheck
+
+    # Simulate one omitted role in the style pack without modifying any installed assets.
+    $testMap = $script:QuotaStampSets.lineart.Clone()
+    $testMap.Remove('gemini')
+    $fullMap = $script:QuotaStampSets.lineart
+    try {
+        $script:QuotaStampSets.lineart = $testMap
+        $Config.QuotaStampStyle = 'lineart'
+        $Config.Character = 'gemini'
+        Update-Theme
+        $batchTwoReadability.fallback = [string]$WorkBodyWatermark.Source.UriSource.LocalPath
+        $batchTwoReadability.sharedFallback = [object]::ReferenceEquals($WorkBodyWatermark.Source, $ShortQuotaStamp.Source)
+        $Config.Character = 'claude'
+        Update-Theme
+        $batchTwoReadability.unaffected = [string]$WorkBodyWatermark.Source.UriSource.LocalPath
+    } finally {
+        $script:QuotaStampSets.lineart = $fullMap
+        $Config.Character = 'zcode'
+        $Config.QuotaStampStyle = 'embossed'
+        Update-Theme
+    }
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    Set-ActiveBubblePanel 'quota'
+    Show-Bubble 5.5
+    Pump-Wpf
+    $syncRestored = [ordered]@{
+        cfg     = [string]$Config.QuotaStampStyle
+        folder  = [System.IO.Path]::GetFileName([System.IO.Path]::GetDirectoryName($Window.FindName('ShortQuotaStamp').Source.UriSource.LocalPath))
+        trayEmb = [bool]$script:TrayMenu.Tag.StampEmbossed.Checked
+        trayLin = [bool]$script:TrayMenu.Tag.StampLineart.Checked
+        wpfEmb  = [bool]$script:WpfStampStyleMenu.Items[0].IsChecked
+        wpfLin  = [bool]$script:WpfStampStyleMenu.Items[1].IsChecked
+    }
+    $batchTwoReadability.stampMenuSync = [ordered]@{
+        toLineart  = $syncLineart
+        toEmbossed = $syncRestored
+    }
+
+    $Config.Character = 'claude'
+    Update-Theme
+    $testCardColor = $BubbleBorder.Background.Color
+    foreach ($testFontScale in @(1.3, 1.4)) {
+        $Config.FontScale = $testFontScale
+        Update-FontScale
+        Set-ActiveBubblePanel 'quota'
+        foreach ($level in @(@{ short = 26; week = 25 }, @{ short = 25; week = 10 }, @{ short = 10; week = 26 })) {
+            Set-TestQuotaRemaining $level.short $level.week
+            Pump-Wpf
+            $quotaContentBounds = [System.Windows.Rect]::new(0,0,$sceneText.ActualWidth,$sceneText.ActualHeight)
+            $weeklyTrackBounds = Get-RenderedBounds $WeekTrack $sceneText
+            $quotaRowBounds = @(
+                Get-RenderedBounds $ShortReset $sceneText
+                Get-RenderedBounds $WeekReset $sceneText
+            )
+            $quotaRowIndex = 0
+            foreach ($quotaTestRow in @(
+                @{ name = 'fiveHour'; remaining = $level.short; alert = $ShortQuotaAlert; percent = $ShortPercent; track=$ShortTrack; fill=$ShortBar }
+                @{ name = 'weekly'; remaining = $level.week; alert = $WeekQuotaAlert; percent = $WeekPercent; track=$WeekTrack; fill=$WeekBar }
+            )) {
+                $testAlertVisible = $quotaTestRow.alert.IsVisible
+                $testPercentBounds = Get-RenderedBounds $quotaTestRow.percent $sceneText
+                $testResetBounds = $quotaRowBounds[$quotaRowIndex]
+                $quotaRowIndex++
+                $alertFits = $true
+                if ($testAlertVisible) {
+                    $testAlertBounds = Get-RenderedBounds $quotaTestRow.alert $sceneText
+                    $alertFits = ($testAlertBounds.Left -ge $testResetBounds.Right - 0.8) -and ($testAlertBounds.Right -le $testPercentBounds.Left + 0.8)
+                }
+                $batchTwoReadability.alerts += [ordered]@{
+                    scale = $testFontScale
+                    row = $quotaTestRow.name
+                    remaining = $quotaTestRow.remaining
+                    visible = $testAlertVisible
+                    text = [string]$quotaTestRow.alert.Text
+                    percent = [string]$quotaTestRow.percent.Text
+                    automationName = [System.Windows.Automation.AutomationProperties]::GetName($quotaTestRow.percent)
+                    fits = $alertFits -and ($testPercentBounds.Right -le $quotaContentBounds.Right + 0.8) -and ($weeklyTrackBounds.Bottom -le $quotaContentBounds.Bottom + 0.8)
+                }
+                if ($testAlertVisible) {
+                    Measure-AppliedContrast $quotaTestRow.alert.Name $quotaTestRow.alert.Foreground.Color $testCardColor $testCardColor 4.5
+                    Measure-AppliedContrast $quotaTestRow.percent.Name $quotaTestRow.percent.Foreground.Color $testCardColor $testCardColor 4.5
+                    Measure-AppliedContrast $quotaTestRow.fill.Name $quotaTestRow.fill.Background.Color $quotaTestRow.track.Background.Color $testCardColor 3
+                }
+            }
+        }
+    }
+    # Feed a snapshot while hidden, then resize without another refresh. Widths follow the track.
+    $statusDeadline = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() + 86370
+    foreach ($pair in @(@(0,100), @(76,27))) {
+        Set-ActiveBubblePanel 'quote'
+        Set-TestQuotaRemaining $pair[0] $pair[1]
+        Set-ActiveBubblePanel 'quota'
+        foreach ($fs in @(1.0,1.4)) {
+            $Config.FontScale = $fs
+            Update-FontScale
+            Pump-Wpf
+            if ($fs -ge 1.3) {
+                foreach ($reset in @($ShortReset, $WeekReset)) {
+                    $natural = [System.Windows.Controls.TextBlock]::new()
+                    $natural.Text = $reset.Text
+                    $natural.FontFamily = $reset.FontFamily
+                    $natural.FontSize = $reset.FontSize
+                    $natural.Measure([System.Windows.Size]::new(1000, 1000))
+                    if ($natural.DesiredSize.Width -gt $reset.ActualWidth + 1) {
+                        throw "Large-font countdown clipped: $($reset.Text)"
+                    }
+                }
+            }
+            foreach ($measure in @(
+                @{ rem=$pair[0]; fill=$ShortBar; track=$ShortTrack; stamp=$shortStamp; alert=$ShortQuotaAlert },
+                @{ rem=$pair[1]; fill=$WeekBar; track=$WeekTrack; stamp=$weekStamp; alert=$WeekQuotaAlert }
+            )) {
+                $batchTwoReadability.progress += [ordered]@{
+                    remaining=$measure.rem; width=$measure.fill.ActualWidth; track=$measure.track.ActualWidth
+                    stamp=$measure.stamp.IsVisible; alert=$measure.alert.IsVisible
+                }
+            }
+        }
+    }
+    foreach ($textItem in @($ShortReset,$WeekReset)) {
+        $batchTwoReadability.fullText += [ordered]@{ name = $textItem.Name; text = [string]$textItem.Text; hint = [string]$textItem.ToolTip }
+    }
+    Set-ActiveBubblePanel 'deepseek'
+    Apply-BalanceObject $okBal
+    Pump-Wpf
+    foreach ($textItem in @($DeepSeekCurrencyLabel,$DeepSeekBreakdownText,$DeepSeekGrantText)) {
+        $batchTwoReadability.fullText += [ordered]@{ name = $textItem.Name; text = [string]$textItem.Text; hint = [string]$textItem.ToolTip }
+    }
+    Set-TestQuotaRemaining 80 80
+
+    # Case 26: manual detail entry and real hover continuity across the arrow.
+    $Config.FontScale = 1.4
+    Update-FontScale
+    Set-HoverDetailsEnabled $false
+    $longManualDetail = ((1..25 | ForEach-Object { "任务详情第 $_ 行，需要滚动查看后续信息。" }) -join [Environment]::NewLine)
+    Set-WorkPayload -source 'Codex' -task '查看完整详情' -taskDetail $longManualDetail
+    Show-Bubble 0 -Force
+    Pump-Wpf
+    $detailButton = $Window.FindName('WorkDetailButton')
+    $batchTwoDetail = [ordered]@{
+        buttonVisible = ($detailButton -is [System.Windows.Controls.Button] -and $detailButton.IsVisible)
+        disabledHoverOpen = (Invoke-DeterministicHoverCheck $WorkHeader $false).visible
+        arrows = @()
+    }
+    $script:MockCursorScreenPt = [System.Windows.Point]::new(-9000, -9000)
+    function Invoke-TestDetailButton {
+        $click = [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
+        $detailButton.RaiseEvent($click)
+        Pump-Wpf
+        return $click.Handled
+    }
+    $batchTwoDetail.buttonHandlesClick = Invoke-TestDetailButton
+    $batchTwoDetail.manualPinned = [bool]$script:detailPinned
+    $batchTwoDetail.mouseActivation = [bool]($script:DetailWindow.ShowActivated -or $script:DetailWindow.Focusable)
+    $script:detailLeaveAt = [DateTime]::UtcNow.AddSeconds(-1)
+    Update-DetailHoverState
+    $batchTwoDetail.manualSurvivesPointerLeave = [bool]$script:DetailWindow.IsVisible
+    [void](Invoke-TestDetailButton)
+    $batchTwoDetail.secondClickCloses = -not $script:DetailWindow.IsVisible -and -not $script:detailPinned
+
+    [void](Invoke-TestDetailButton)
+    Set-ActiveBubblePanel 'quota'
+    Pump-Wpf
+    $batchTwoDetail.panelChangeCloses = -not $script:DetailWindow.IsVisible -and -not $script:detailPinned -and -not $detailButton.IsVisible
+
+    Set-WorkPayload -source 'Codex' -task '查看完整详情' -taskDetail $longManualDetail
+    Show-Bubble 0 -Force
+    [void](Invoke-TestDetailButton)
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    Pump-Wpf
+    $batchTwoDetail.idleCloses = -not $script:DetailWindow.IsVisible -and -not $script:detailPinned
+
+    Set-HoverDetailsEnabled $true
+    $savedWindowTop = $Window.Top
+    $savedWindowLeft = $Window.Left
+    $detailWorkArea = [System.Windows.SystemParameters]::WorkArea
+    $Window.Left = $detailWorkArea.Left + 30
+    foreach ($testPlacement in @('below','above')) {
+        Close-HoverDetailCard
+        $Window.Top = if ($testPlacement -eq 'below') { $detailWorkArea.Top + 5 } else { $detailWorkArea.Bottom - 210 }
+        Set-WorkPayload -source 'Codex' -task '详情箭头命中' -taskDetail $longManualDetail
+        Show-Bubble 0 -Force
+        Pump-Wpf
+        Open-HoverDetailCard
+        Pump-Wpf
+        $testedArrow = if ($testPlacement -eq 'below') { $script:DetailArrowTop } else { $script:DetailArrowBottom }
+        $probeArrowVisible = [bool]$testedArrow.IsVisible
+        $probeArrowHit = $false
+        $probeBodyHit = $true
+        $probeOtherTrigger = $true
+        if ($probeArrowVisible) {
+            $script:MockCursorScreenPt = Get-VisualElementCenterScreenPt $testedArrow
+            $probeArrowHit = Test-ElementHit $testedArrow $script:MockCursorScreenPt
+            $probeBodyHit = Test-ElementHit $script:DetailCardBorder $script:MockCursorScreenPt
+            $probeOtherTrigger = (Test-ElementHit $WorkHeaderBanner $script:MockCursorScreenPt) -or (Test-ElementHit $WorkTask $script:MockCursorScreenPt)
+            $script:detailLeaveAt = [DateTime]::UtcNow.AddSeconds(-1)
+            Update-DetailHoverState
+        }
+        $batchTwoDetail.arrows += [ordered]@{
+            placement = $testPlacement
+            visible = $probeArrowVisible
+            arrowHit = $probeArrowHit
+            otherHit = $probeBodyHit -or $probeOtherTrigger
+            remainsOpen = ($script:DetailWindow.IsVisible -and $script:detailLeaveAt -eq [DateTime]::MinValue)
+        }
+    }
+    $Window.Top = $savedWindowTop
+    $Window.Left = $savedWindowLeft
+    Close-HoverDetailCard
+    Set-HoverDetailsEnabled $false
+    Set-WorkPayload -source 'Codex' -task '查看完整详情' -taskDetail $longManualDetail
+    Show-Bubble 0 -Force
+    Build-ContextMenu
+    Pump-Wpf
+    $Window.ContextMenu.IsOpen = $true
+    Pump-Wpf
+    $taskDetailMenuItem = $script:WpfViewTaskDetailMenuItem
+    $batchTwoDetail.menuVisible = ($taskDetailMenuItem -and $taskDetailMenuItem.Visibility -eq [System.Windows.Visibility]::Visible -and $taskDetailMenuItem.IsEnabled)
+    $Window.ContextMenu.IsOpen = $false
+    Pump-Wpf
+    $taskDetailMenuItem.RaiseEvent([System.Windows.RoutedEventArgs]::new([System.Windows.Controls.MenuItem]::ClickEvent))
+    Pump-Wpf
+    $batchTwoDetail.menuOpens = [bool]$script:DetailWindow.IsVisible
+    $viewer = $script:DetailScrollViewer
+    $batchTwoDetail.menuEnablesKeyboard = [bool]($script:DetailWindow.Focusable -and $viewer.Focusable)
+    $batchTwoDetail.scrollable = [double]$viewer.ScrollableHeight
+    $beforeScroll = [double]$viewer.VerticalOffset
+    function Send-TestDetailKey($target, [System.Windows.Input.Key]$key) {
+        $source = [System.Windows.PresentationSource]::FromVisual($target)
+        $keyEvent = [System.Windows.Input.KeyEventArgs]::new([System.Windows.Input.Keyboard]::PrimaryDevice, $source, 0, $key)
+        $keyEvent.RoutedEvent = [System.Windows.Input.Keyboard]::PreviewKeyDownEvent
+        $target.RaiseEvent($keyEvent)
+        if (-not $keyEvent.Handled) {
+            $keyEvent.RoutedEvent = [System.Windows.Input.Keyboard]::KeyDownEvent
+            $target.RaiseEvent($keyEvent)
+        }
+        Pump-Wpf
+    }
+    Send-TestDetailKey $viewer ([System.Windows.Input.Key]::Down)
+    $batchTwoDetail.keyboardScrolls = ([double]$viewer.VerticalOffset -gt $beforeScroll)
+    Send-TestDetailKey $viewer ([System.Windows.Input.Key]::Escape)
+    $batchTwoDetail.escapeCloses = -not $script:DetailWindow.IsVisible -and -not $script:detailPinned
+    Set-HoverDetailsEnabled $false
+
+    # Case 27: real refresh button routes and request lifecycles use isolated flag files.
+    $quotaRequestAst = $repositoryAst.Find({param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Request-QuotaRefresh'
+    }, $true)
+    Set-Item Function:global:Request-QuotaRefresh -Value $quotaRequestAst.Body.GetScriptBlock()
+    Set-Item Function:global:Request-BalanceRefresh -Value $realBalanceRefresh.Body.GetScriptBlock()
+    $Config.FontScale = 1.4
+    $Config.BubbleScale = 0.8
+    Update-FontScale
+    Update-BubbleScale
+    Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
+    $script:refreshingUntil = [DateTime]::MinValue
+    $script:balanceRequestTimeout = $null
+    $script:balanceRequestStartedMs = [long]0
+    $script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
+    $existingQuotaPath = $RefreshFlagPath
+    $existingBalancePath = $RefreshBalanceFlagPath
+    try {
+        $RefreshFlagPath = Join-Path $BaseDir 'case27-quota.flag'
+        $RefreshBalanceFlagPath = Join-Path $BaseDir 'case27-balance.flag'
+        foreach ($refreshRow in @(
+            @{ mode = 'quota'; button = $RefreshQuotaBtn; flag = $RefreshFlagPath }
+            @{ mode = 'deepseek'; button = $RefreshDeepSeekBtn; flag = $RefreshBalanceFlagPath }
+        )) {
+            Set-ActiveBubblePanel $refreshRow.mode
+            Show-Bubble 0 -Force
+            Pump-Wpf
+            $refreshControl = $refreshRow.button
+            $idleBounds = Get-RenderedBounds $refreshControl $Window
+            $firstClick = [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
+            $refreshControl.RaiseEvent($firstClick)
+            Pump-Wpf
+            $pendingPath = $refreshControl.Template.FindName('PendingGlyph', $refreshControl)
+            $pendingBounds = Get-RenderedBounds $refreshControl $Window
+            if (-not $firstClick.Handled -or -not $pendingPath.IsVisible -or
+                [System.Windows.Automation.AutomationProperties]::GetItemStatus($refreshControl) -ne '刷新中，请稍候' -or
+                -not (Test-Path -LiteralPath $refreshRow.flag)) { throw ('Case 27: missing busy feedback: ' + $refreshRow.mode) }
+            if ($pendingBounds.Width -ne $idleBounds.Width -or $pendingBounds.Height -ne $idleBounds.Height -or
+                $pendingBounds.Width -lt 24 -or $pendingBounds.Height -lt 24) { throw ('Case 27: busy hot area shrank: ' + $refreshRow.mode) }
+            $corner = [System.Windows.Point]::new(($pendingBounds.Left + 0.5), ($pendingBounds.Top + 0.5))
+            if (-not (Test-RefreshTargetAt $refreshControl $corner)) { throw 'Case 27: busy corner no longer hit-tests to the refresh button' }
+            $deadline = if ($refreshRow.mode -eq 'quota') { $script:refreshingUntil } else { $script:balanceRequestTimeout }
+            $sentinel = 'case27-duplicate-must-not-overwrite'
+            [IO.File]::WriteAllText($refreshRow.flag, $sentinel)
+            if ($refreshRow.mode -eq 'deepseek') { $script:lastBalanceRefreshRequestTime = [DateTime]::UtcNow.AddSeconds(-11) }
+            $duplicateClick = [System.Windows.RoutedEventArgs]::new([System.Windows.Controls.Primitives.ButtonBase]::ClickEvent)
+            $refreshControl.RaiseEvent($duplicateClick)
+            if (-not $duplicateClick.Handled -or $script:currentBubblePanel -ne $refreshRow.mode -or
+                [IO.File]::ReadAllText($refreshRow.flag) -ne $sentinel) { throw ('Case 27: pending click repeated or bubbled: ' + $refreshRow.mode) }
+            if ($refreshRow.mode -eq 'quota') {
+                if ($script:refreshingUntil -ne $deadline) { throw 'Case 27: quota duplicate extended timeout' }
+                Apply-QuotaObject ([pscustomobject]@{ok = $true; windows = @()})
+                if ($refreshControl.Tag -or $script:refreshingUntil -ne [DateTime]::MinValue) { throw 'Case 27: quota result did not restore button' }
+                Request-QuotaRefresh
+                Update-QuotaRefreshTimeout ($script:refreshingUntil.AddMilliseconds(1))
+            } else {
+                if ($script:balanceRequestTimeout -ne $deadline) { throw 'Case 27: balance duplicate extended timeout' }
+                $requestMs = $script:balanceRequestStartedMs
+                Receive-BalanceSnapshot ([pscustomobject]@{status = 'loading'; lastAttemptAt = $requestMs})
+                if ($refreshControl.Tag -ne 'Refreshing') { throw 'Case 27: loading cleared the active balance indicator' }
+                Receive-BalanceSnapshot ([pscustomobject]@{status = 'error'; lastAttemptAt = $requestMs; errorCode = 'DSH_HTTP_500'})
+                if ($refreshControl.Tag -or $script:balanceRequestTimeout) { throw 'Case 27: owned error did not restore balance button' }
+                Request-BalanceRefresh
+                Update-BalanceRefreshTimeout ($script:balanceRequestTimeout.AddMilliseconds(1))
+            }
+            Pump-Wpf
+            if ($refreshControl.Tag -or $pendingPath.IsVisible -or
+                -not [string]::IsNullOrEmpty([System.Windows.Automation.AutomationProperties]::GetItemStatus($refreshControl))) {
+                throw ('Case 27: timeout did not restore the original icon: ' + $refreshRow.mode)
+            }
+        }
+        $RefreshFlagPath = $BaseDir
+        $RefreshBalanceFlagPath = $BaseDir
+        $script:lastBalanceRefreshRequestTime = [DateTime]::MinValue
+        Request-QuotaRefresh
+        Request-BalanceRefresh
+        if ($RefreshQuotaBtn.Tag -or $RefreshDeepSeekBtn.Tag -or
+            $ShortReset.Text -ne '请求失败' -or $DeepSeekStatusNotice.Text -ne '请求失败') { throw 'Case 27: file write error kept a button busy' }
+        Write-Output 'PASS: Case 27 refresh buttons preserve their busy hot areas and recover on result, timeout, or failed request write'
+    } finally {
+        $RefreshFlagPath = $existingQuotaPath
+        $RefreshBalanceFlagPath = $existingBalancePath
+    }
+
+    # Restore clean idle state and Config values, then verify Case 28 drag-release & LostMouseCapture isolation
     $Config.Character = 'claude'
     $Config.BubbleScale = 1.0
     $Config.FontScale = 1.0
@@ -1729,6 +2557,95 @@ try {
     Apply-AgentStatus ([pscustomobject]@{ state = 'idle' })
     $script:manualBubbleHidden = $false
     Stop-UserBubbleInspection
+
+    $dragTestCheck = [ordered]@{
+        dragBounceCount = 0
+        lostBounceCount = 0
+        syncLostFired   = $false
+        dragBubbleOpen  = $true
+        dragQuotaFlag   = $true
+        savedLeft       = 0
+        savedTop        = 0
+        lostIsDragging  = $true
+    }
+    Hide-Bubble
+    Pump-Wpf
+    $origSaveCfgFn        = (Get-Item function:Save-Config).ScriptBlock
+    $origBounceFn         = (Get-Item function:Trigger-PetBounce).ScriptBlock
+    $origReleaseCaptureFn = (Get-Item function:Release-PetMouseCapture).ScriptBlock
+    $origRefreshQPath = $RefreshFlagPath
+    $dragQuotaProbeFlag = Join-Path $BaseDir 'drag-probe-quota.flag'
+    $RefreshFlagPath = $dragQuotaProbeFlag
+    if (Test-Path -LiteralPath $dragQuotaProbeFlag) { Remove-Item -LiteralPath $dragQuotaProbeFlag -Force }
+    $script:testBounceCalls = 0
+    $script:case28SyncLost = $false
+    $case28MouseDev = [System.Windows.Input.Mouse]::PrimaryDevice
+    $case28LostSpy = [System.Windows.Input.MouseEventHandler]{
+        param($ls, $le)
+        if ($script:releasingPetMouseUp) {
+            $script:case28SyncLost = $true
+        }
+    }
+    $PetImage.Add_LostMouseCapture($case28LostSpy)
+    function global:Save-Config {
+        $json = $Config | ConvertTo-Json -Depth 4
+        [System.IO.File]::WriteAllText($ConfigPath, $json, [System.Text.Encoding]::UTF8)
+    }
+    function global:Trigger-PetBounce {
+        $script:testBounceCalls++
+        & $origBounceFn
+    }
+    function global:Release-PetMouseCapture {
+        $hadNativeCapture = [bool]($PetImage -and $PetImage.IsMouseCaptured)
+        & $origReleaseCaptureFn
+        if (-not $hadNativeCapture -and $PetImage) {
+            $syncLostArgs = [System.Windows.Input.MouseEventArgs]::new([System.Windows.Input.Mouse]::PrimaryDevice, 0)
+            $syncLostArgs.RoutedEvent = [System.Windows.UIElement]::LostMouseCaptureEvent
+            $PetImage.RaiseEvent($syncLostArgs)
+        }
+    }
+    try {
+        $prevL = $Window.Left; $prevT = $Window.Top
+        [void]$PetImage.CaptureMouse()
+        Start-PetPressSquash
+        for ($pf = 0; $pf -lt 15 -and (-not ($PetScale.ScaleY -lt 0.96 -and $PetScale.ScaleX -gt 1.04)); $pf++) { Pump-Wpf 15 }
+        $script:isDragging = $true
+        $Window.Left = 220
+        $Window.Top = 310
+        $upArgs = [System.Windows.Input.MouseButtonEventArgs]::new($case28MouseDev, 0, [System.Windows.Input.MouseButton]::Left)
+        $upArgs.RoutedEvent = [System.Windows.UIElement]::MouseLeftButtonUpEvent
+        $PetImage.RaiseEvent($upArgs)
+        Pump-Wpf
+        $dragTestCheck.syncLostFired   = [bool]$script:case28SyncLost
+        $dragTestCheck.dragBounceCount = $script:testBounceCalls
+        $dragTestCheck.dragBubbleOpen  = [bool]$script:isBubbleOpen
+        $dragTestCheck.dragQuotaFlag   = (Test-Path -LiteralPath $dragQuotaProbeFlag)
+        $savedCfgAfterDrag = Get-Content -LiteralPath $ConfigPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        $dragTestCheck.savedLeft = [double]$savedCfgAfterDrag.Left
+        $dragTestCheck.savedTop  = [double]$savedCfgAfterDrag.Top
+
+        # Let bounce finish, then test unexpected LostMouseCapture during pressed state (without MouseLeftButtonUp)
+        for ($pf = 0; $pf -lt 22; $pf++) { Pump-Wpf 20 }
+        $script:testBounceCalls = 0
+        $script:isDragging = $true
+        Start-PetPressSquash
+        for ($pf = 0; $pf -lt 15 -and (-not ($PetScale.ScaleY -lt 0.96 -or $PetScale.ScaleX -gt 1.04)); $pf++) { Pump-Wpf 15 }
+        $lostArgs = [System.Windows.Input.MouseEventArgs]::new($case28MouseDev, 0)
+        $lostArgs.RoutedEvent = [System.Windows.UIElement]::LostMouseCaptureEvent
+        $PetImage.RaiseEvent($lostArgs)
+        Pump-Wpf
+        $dragTestCheck.lostBounceCount = $script:testBounceCalls
+        $dragTestCheck.lostIsDragging  = [bool]$script:isDragging
+
+        $Window.Left = $prevL; $Window.Top = $prevT
+    } finally {
+        $PetImage.Remove_LostMouseCapture($case28LostSpy)
+        $RefreshFlagPath = $origRefreshQPath
+        Set-Item -Path function:global:Save-Config -Value $origSaveCfgFn
+        Set-Item -Path function:global:Trigger-PetBounce -Value $origBounceFn
+        Set-Item -Path function:global:Release-PetMouseCapture -Value $origReleaseCaptureFn
+    }
+
     Build-ContextMenu
 
     # The main harness omits startup/exit handlers. Register the production exit hook
@@ -1799,6 +2716,7 @@ try {
             ctxIdleMode     = $menuCtxIdleMode
             ctxIdlePanel    = $menuCtxIdlePanel
             closureCount    = $closureMatchCount
+            taskSoundSync   = $taskSoundMenuSync
         }
         deepSeekScaleCases  = $deepSeekScaleCases
         dsPadAt14           = $dsPadAt14
@@ -1815,6 +2733,10 @@ try {
         checksAt115         = $checksAt115
         checksAt110         = $checksAt110
         case23Regression    = $case23Regression
+        batchTwoReadability = $batchTwoReadability
+        batchTwoDetail = $batchTwoDetail
+        batchOne            = $batchOne
+        dragReleaseCase     = $dragTestCheck
     }
     Write-Output ('RESULT_JSON:' + ($out | ConvertTo-Json -Depth 6 -Compress))
 } finally {
@@ -1938,10 +2860,16 @@ try {
     );
 
     // Assertions: Scheme 3 & Option B
-    assert.equal(data.themeMatrix.length, 12, 'must cover 3 characters x 4 work states');
-    const expectedBgMap = { claude: '#FFFFF6EC', dragon: '#FFF4F3FB', gemini: '#FFF5F1FF' };
+    assert.equal(data.themeMatrix.length, 25, 'must cover 5 characters x 5 work states');
+    const expectedBgMap = {
+      claude: '#FFFFFCFA', dragon: '#FFF4F3FB', deepseek: '#FFF0F7FF', zcode: '#FFF1F4FC', gemini: '#FFF5F1FF'
+    };
+    const themesByTag = new Map(data.themeMatrix.map(item => [item.tag, item]));
     for (const item of data.themeMatrix) {
       const [ch, st] = item.tag.split('/');
+      assert.equal(path.basename(item.watermarkPath), ch + '.png', item.tag + ': status watermark must follow the pet');
+      assert.equal(path.basename(path.dirname(item.watermarkPath)), 'embossed');
+      assert.equal(item.watermarkHit, false, item.tag + ': decoration must not intercept input');
       assert.equal(item.cardCornerTL, 18, `${item.tag} card corner must be 18`);
       assert.equal(item.bubbleBg, expectedBgMap[ch], `${item.tag} bubble background must use character pastel tint`);
       assert.equal(item.codexFg, '#FF0F766E', 'codex pill foreground must use high-contrast teal');
@@ -1957,15 +2885,18 @@ try {
       } else if (st === 'error') {
         assert.equal(item.borderThick, 1.8, `${item.tag} error border thickness`);
         assert.equal(item.borderBrush, '#FFEF4444', `${item.tag} error red border`);
-      } else if (st === 'success') {
-        assert.equal(item.borderThick, 1.5, `${item.tag} success border thickness`);
-        assert.equal(item.borderBrush, '#CC10B981', `${item.tag} success mint border`);
+      } else if (st === 'success' || st === 'done') {
+        const working = themesByTag.get(`${ch}/working`);
+        assert.equal(item.headerText, '任务完成', `${item.tag} completion status must remain visible`);
+        assert.equal(item.spriteKey, `${ch}-happy`, `${item.tag} completion must use the character's happy sprite`);
+        for (const key of ['borderBrush', 'tailBrush', 'tailNearBrush', 'shadowColor', 'headerGrad0', 'headerGrad1', 'headerDivider', 'headerColor', 'dotFill']) {
+          assert.equal(item[key], working[key], `${item.tag} ${key} must keep the character theme`);
+        }
       } else {
         assert.equal(item.borderThick, 2.2, `${item.tag} working Option B solid border thickness`);
         assert.equal(item.chipBg, '#00FFFFFF', `${item.tag} working transparent chip`);
         if (ch === 'dragon') {
           assert.equal(item.borderBrush, '#FF6D67A2');
-          assert.equal(item.watermarkGlyph, '❖');
         }
       }
       assert.ok(Math.abs((item.cardCornerTL - item.borderThick) - item.bannerCornerTL) <= 0.2, `${item.tag} banner inner corner radius = 18 - thick`);
@@ -1978,8 +2909,14 @@ try {
     assert.equal(data.geomTransitions.length, 30, '2 facings x 3 scales x 5 panels');
     for (const g of data.geomTransitions) {
       const isWork = g.panel === 'work';
-      const expW = isWork ? 254 : 264;
-      const expBaseLeft = isWork ? 30 : 26;
+      const isTicket = g.panel === 'quota';
+      const expW = isWork || isTicket ? 254 : 264;
+      const expBaseLeft = isWork ? 30 : isTicket ? 31 : 26;
+      assert.equal(g.hasTicketClip, isTicket, g.tag + ' punches are quota-only');
+      if (isTicket) {
+        assert.equal(g.punchedAtSeam, true, g.tag + ' both holes must follow the printed seam on either facing');
+        assert.ok(Math.abs(g.borderH - 104) <= 1, g.tag + ' default ticket height');
+      }
       const expLeft = Math.round((expBaseLeft + (g.bs - 1.0) * 55.0) * 100) / 100;
       assert.equal(g.declaredW, expW, `${g.tag} Bubble.Width`);
       assert.equal(g.borderDeclaredW, expW, `${g.tag} BubbleBorder.Width`);
@@ -2061,13 +2998,46 @@ try {
     assert.equal(data.menuScope.ctxIdleMode, 'quota', 'context menu click while idle must persist Config.BubbleMode');
     assert.equal(data.menuScope.ctxIdlePanel, 'quota', 'context menu click while idle must switch active panel');
     assert.equal(data.menuScope.closureCount, 1, 'AgentPet.ps1 must only use GetNewClosure in Hide-Bubble');
+    assert.equal(data.menuScope.taskSoundSync.defaultsOk, true, '$DefaultConfig task completion defaults must match spec');
+    assert.equal(data.menuScope.taskSoundSync.inSingleSubmenu, true, 'task sound toggle and mute/quiet items must live inside ONE submenu');
+    assert.equal(data.menuScope.taskSoundSync.noTrayHideOpt, true, 'tray menu must not expose hide/disable tray icon toggle');
+    assert.equal(data.menuScope.taskSoundSync.trayOffCfg, false, 'tray task sound toggle must flip TaskCompleteSoundEnabled to false');
+    assert.equal(data.menuScope.taskSoundSync.trayOffWpf, false, 'tray task sound toggle must sync WPF menu item');
+    assert.equal(data.menuScope.taskSoundSync.trayRestoredCfg, true, 'tray task sound second click must restore true');
+    assert.equal(data.menuScope.taskSoundSync.agOffCfg, false, 'tray Antigravity complete toggle must flip AntigravityTranscriptCompleteEnabled to false');
+    assert.equal(data.menuScope.taskSoundSync.agOffWpf, false, 'tray Antigravity complete toggle must sync WPF menu item');
+    assert.equal(data.menuScope.taskSoundSync.agOnCfg, true, 'WPF Antigravity complete toggle must restore AntigravityTranscriptCompleteEnabled to true');
+    assert.equal(data.menuScope.taskSoundSync.muteHiddenOffCfg, false, 'tray secondary mute-when-hidden toggle must flip false');
+    assert.equal(data.menuScope.taskSoundSync.muteHiddenOffWpf, false, 'tray secondary mute-when-hidden toggle must sync WPF menu item');
+    assert.equal(data.menuScope.taskSoundSync.muteRestoredCfg, true, 'tray mute-when-hidden second click must restore true');
+    assert.equal(data.menuScope.taskSoundSync.presetStart, '12:30', 'preset click must set QuietHoursStart=12:30');
+    assert.equal(data.menuScope.taskSoundSync.presetEnd, '14:00', 'preset click must set QuietHoursEnd=14:00');
+    assert.equal(data.menuScope.taskSoundSync.presetQuietOn, true, 'preset click must enable QuietHoursEnabled');
+    assert.equal(data.menuScope.taskSoundSync.presetWpfQuiet, true, 'preset click must check WPF quiet hours toggle');
+    assert.equal(data.menuScope.taskSoundSync.afterWpfQuiet, false, 'WPF quiet hours toggle click must turn off QuietHoursEnabled');
+    assert.equal(data.menuScope.taskSoundSync.hasSoundPlayer, true, 'TaskCompletePlayer must load assets/task_complete.wav');
+    assert.equal(exampleCfg.TaskCompleteSoundEnabled, true, 'config.example.json TaskCompleteSoundEnabled');
+    assert.equal(exampleCfg.MuteTaskSoundWhenHidden, true, 'config.example.json MuteTaskSoundWhenHidden');
+    assert.equal(exampleCfg.QuietHoursEnabled, false, 'config.example.json QuietHoursEnabled');
+    assert.equal(exampleCfg.QuietHoursStart, '23:00', 'config.example.json QuietHoursStart');
+    assert.equal(exampleCfg.QuietHoursEnd, '08:00', 'config.example.json QuietHoursEnd');
 
-    // Assertions: Case 15 DeepSeekPanel FontScale (0.8 / 1.0 / 1.15 / 1.3 / 1.4) x states & both update orders
-    assert.equal(data.deepSeekScaleCases.length, 27, 'must cover 5x4 fsFirst + 2 error states + 5 stateFirst cases');
+    // Assertions: Case 15 DeepSeekPanel FontScale (0.8 / 1.0 / 1.15 / 1.3 / 1.4) x states & internal boundary checks
+    assert.equal(data.deepSeekScaleCases.length, 55, 'must cover 5x4 fsFirst + 7x4 extra P2 matrix + 2 error states + 5 stateFirst cases');
     const dsByTag = Object.fromEntries(data.deepSeekScaleCases.map((c) => [c.tag, c]));
     for (const c of data.deepSeekScaleCases) {
       assert.ok(c.panelH <= c.innerH + 0.5, `${c.tag} DeepSeekPanel overflow (${c.panelH} > ${c.innerH})`);
       assert.ok(c.noticeDesW <= c.availNoticeW + 0.5, `${c.tag} DeepSeekStatusNotice clipped (${c.noticeDesW} > ${c.availNoticeW} at row ${c.noticeRow})`);
+      assert.equal(c.subOverlap, false, `${c.tag} P2-01 legend overlap between Recharge & Grant (rows=${c.subRowCnt})`);
+      assert.equal(c.availVsRatio, false, `${c.tag} AC-04 DeepSeekAvailPill overlaps DeepSeekRatioTrack`);
+      assert.equal(c.subMetaVsRatio, false, `${c.tag} AC-04 DeepSeekSubMetaText overlaps DeepSeekRatioTrack`);
+      assert.equal(c.mainVsRatio, false, `${c.tag} AC-04 DeepSeekMainRowGrid overlaps DeepSeekRatioTrack`);
+      assert.equal(c.ratioVsSub, false, `${c.tag} AC-04 DeepSeekRatioTrack overlaps DeepSeekSubRowGrid`);
+      assert.deepEqual(c.outsideFrosted, [], `${c.tag} AC-04 controls spilled outside DeepSeekFrostedCard`);
+      if (c.okVis === 'Visible') {
+        assert.ok(c.bdDesW <= c.bdActW + 0.5, `${c.tag} P2-01 recharge breakdown clipped (${c.bdDesW} > ${c.bdActW})`);
+      }
+      assert.equal(c.msgHdrOverlap, false, `${c.tag} P2-02 msg title & status pill overlap (${c.msgTitleText} vs ${c.msgStatusText})`);
     }
     const dsScales = ['0.8', '1', '1.15', '1.3', '1.4'];
     for (let i = 1; i < dsScales.length; i++) {
@@ -2081,14 +3051,14 @@ try {
       assert.ok(prev.bdFs < curr.bdFs, `DeepSeekBreakdownText.FontSize must increase ${dsScales[i - 1]} -> ${dsScales[i]} (${prev.bdFs} vs ${curr.bdFs})`);
       assert.ok(prevErr.msgDetailFs < currErr.msgDetailFs, `DeepSeekMsgDetail.FontSize must increase ${dsScales[i - 1]} -> ${dsScales[i]} (${prevErr.msgDetailFs} vs ${currErr.msgDetailFs})`);
     }
-    assert.ok(
-      dsByTag['fsFirst/0.8/ok'].totalFs < dsByTag['fsFirst/1/ok'].totalFs &&
-      dsByTag['fsFirst/1/ok'].totalFs < dsByTag['fsFirst/1.15/ok'].totalFs &&
-      dsByTag['fsFirst/1.15/ok'].totalFs < dsByTag['fsFirst/1.3/ok'].totalFs &&
-      dsByTag['fsFirst/1.3/ok'].totalFs === 22.5 &&
-      dsByTag['fsFirst/1.4/ok'].totalFs === 22.5,
-      'DeepSeekTotalText.FontSize must follow min(1.25, FontScale) cap cleanly'
-    );
+      assert.ok(
+        dsByTag['fsFirst/0.8/ok'].totalFs < dsByTag['fsFirst/1/ok'].totalFs &&
+        dsByTag['fsFirst/1/ok'].totalFs < dsByTag['fsFirst/1.15/ok'].totalFs &&
+        dsByTag['fsFirst/1.15/ok'].totalFs < dsByTag['fsFirst/1.3/ok'].totalFs &&
+        dsByTag['fsFirst/1.3/ok'].totalFs === 25.62 &&
+        dsByTag['fsFirst/1.4/ok'].totalFs === 25.62,
+        `DeepSeekTotalText.FontSize must follow min(1.25, FontScale) cap cleanly (got ${dsByTag['fsFirst/1.3/ok'].totalFs})`
+      );
     for (const targetFs of ['1.15', '1.3', '1.4']) {
       assert.equal(dsByTag[`stateFirst/ok->${targetFs}`].hdrFs, dsByTag[`fsFirst/${targetFs}/ok`].hdrFs, `ok->${targetFs} hdrFs order must match`);
       assert.equal(dsByTag[`stateFirst/ok->${targetFs}`].curFs, dsByTag[`fsFirst/${targetFs}/ok`].curFs, `ok->${targetFs} curFs order must match`);
@@ -2097,8 +3067,32 @@ try {
     }
     assert.equal(dsByTag['stateFirst/to->1.4'].hdrText, 'DeepSeek 余额', 'timeout compact title must survive FontScale toggle');
     assert.equal(dsByTag['stateFirst/to->1.4'].hdrFs, dsByTag['fsFirst/1.4/to'].hdrFs, 'to update order must match');
-    assert.equal(data.dsPadAt14, 8, 'DeepSeek BubbleBorder left padding at 1.4x must compact to 8');
-    assert.equal(data.dsPadAt10, 12, 'DeepSeek BubbleBorder left padding at 1.0x must restore to 12');
+    assert.equal(dsByTag['fsFirst/1/ok'].hdrText, 'DeepSeek 余额', 'v1.6.4 header must omit 官方 wording');
+    assert.equal(dsByTag['fsFirst/1/ok'].curText, '人民币 CNY · DSH', 'currency label must remove 宿主 wording');
+    assert.ok(dsByTag['fsFirst/1/ok'].availMidDiff <= 1.0, `可用 pill and 预警线 must align vertically (diff=${dsByTag['fsFirst/1/ok'].availMidDiff})`);
+    assert.ok(dsByTag['fsFirst/1/ok'].availTextMidDiff <= 1.0, `可用 text and 预警线 text must align vertically (diff=${dsByTag['fsFirst/1/ok'].availTextMidDiff})`);
+    assert.ok(dsByTag['fsFirst/1.4/ok'].availTextMidDiff <= 1.0, `可用 text and 预警线 text must align at 1.4x (diff=${dsByTag['fsFirst/1.4/ok'].availTextMidDiff})`);
+    assert.equal(dsByTag['fsFirst/1/ok'].badgeVis, 'Collapsed', 'v1.6.4 header badge 官方 must stay collapsed');
+    assert.equal(dsByTag['fsFirst/1/ok'].hasPricing, false, 'v1.6.4 must remove DeepSeekPricingLink');
+    assert.equal(dsByTag['fsFirst/1/ok'].borderPadLeft, 0, 'v1.6.4 DeepSeek BubbleBorder padding must stay 0 for full-bleed header banner');
+    assert.equal(dsByTag['fsFirst/1/ok'].fillBarVis, 'Visible', 'v1.6.4 ok balance must show recharge segment');
+    assert.equal(dsByTag['fsFirst/1/ok'].grantBarVis, 'Visible', 'v1.6.4 granted > 0 must show dual-tone grant segment');
+    assert.equal(dsByTag['fsFirst/1/ok'].bdText, '充值 ¥80.00 (90%)');
+    assert.equal(dsByTag['fsFirst/1/ok'].grantText, '赠金 ¥8.88 (10%)');
+    assert.equal(dsByTag['fsFirst/1/unk'].availPillText, '不可用', 'isAvailable=false must show rose pill');
+    assert.equal(dsByTag['fsFirst/1.4/dshOff'].msgStatusText, '宿主离线', 'dsh_not_running must show 宿主离线 pill');
+    assert.equal(dsByTag['extra/1.4/zeroGrant'].fillBarVis, 'Visible');
+    assert.equal(dsByTag['extra/1.4/zeroGrant'].grantBarVis, 'Collapsed');
+    assert.equal(dsByTag['extra/1.4/pureGrant'].fillBarVis, 'Collapsed');
+    assert.equal(dsByTag['extra/1.4/pureGrant'].grantBarVis, 'Visible');
+    assert.equal(dsByTag['extra/1.4/noCny'].msgTitleText, '未返回人民币余额');
+    assert.ok(dsByTag['extra/1.4/noCny'].msgDetailH >= 24, `extra/1.4/noCny must provide 2-line room for MsgDetail (got ${dsByTag['extra/1.4/noCny'].msgDetailH})`);
+    assert.equal(dsByTag['extra/1.4/credMissing'].msgStatusText, '缺少凭据');
+    assert.equal(dsByTag['extra/1.4/unsupported'].msgStatusText, '不适用');
+    assert.equal(dsByTag['extra/1.4/cooldown'].msgStatusText, '冷却保护');
+    assert.equal(dsByTag['extra/1.4/rateLimited'].msgStatusText, '频率受限');
+    assert.equal(data.dsPadAt14, 6.5, 'DeepSeekBodyHost left padding at 1.4x must compact to 6.5');
+    assert.equal(data.dsPadAt10, 8.5, 'DeepSeekBodyHost left padding at 1.0x must restore to 8.5');
 
     // Assertions: Case 16 HoverDetailsEnabled 4-way config inputs + menu init + fallback + actual hover
     assert.equal(data.hoverConfigCases.length, 4, 'must test no_file, missing_field, explicit_true, explicit_false');
@@ -2143,7 +3137,7 @@ try {
     assert.equal(data.roleQuotesCheck.workSwitch.gemini.speakerText, 'Gemini娘（双子）');
     assert.equal(data.roleQuotesCheck.workSwitch.dragon.speakerText, '白龙娘（GPT娘）');
     assert.equal(data.roleQuotesCheck.workSwitch.deepseek.speakerText, 'DeepSeek娘（大肥鱼）');
-    assert.equal(data.roleQuotesCheck.workSwitch.zcode.speakerText, '智谱娘（ZCode）');
+    assert.equal(data.roleQuotesCheck.workSwitch.zcode.speakerText, '智谱娘（GLM 娘）');
     assert.equal(data.roleQuotesCheck.workSwitch.deepseek.bubbleBg, '#FFF0F7FF');
     assert.equal(data.roleQuotesCheck.workSwitch.zcode.bubbleBg, '#FFF1F4FC');
     const wakeQuotesSeen = new Set();
@@ -2208,14 +3202,19 @@ try {
     assert.ok(rm.trayMenuCount > 1);
     assert.deepEqual(rm.rootLabels, [
       '切换角色', '动作形态', '查看并刷新 Codex 额度', '查看并刷新 DeepSeek 余额', '随机台词', '外观',
-      '打盹时间', '定时碎碎念', '音效与音量', '状态播报（播报中）', '悬停详情', '窗口置顶', '重置位置到右下角'
+      '打盹时间', '定时碎碎念', '音效与音量', '状态播报（播报中）', '悬停详情', '查看任务详情', '窗口置顶', '重置位置到右下角'
     ]);
     assert.equal(rm.rootRowHeight, 32);
-    assert.deepEqual(rm.appearanceLabels.map(label => label.split(' (')[0]), ['立绘缩放比例', '气泡缩放', '气泡字体大小']);
+    assert.deepEqual(rm.appearanceLabels.map(label => label.split(' (')[0]), ['立绘缩放比例', '气泡缩放', '气泡字体大小', '气泡印章风格']);
+    assert.equal(rm.trayToggleRemoved, true, 'TrayEnabled toggle must be removed from tray menu tag');
     assert.equal(rm.bubbleDefaultWithoutTray, 'Visible', '气泡默认偏好 needs a desktop menu entry when the tray is disabled');
     assert.equal(rm.footer.exitLabel, '退出 AgentPet');
     assert.equal(rm.footer.versionText, rm.footer.expectedVersion);
     assert.equal(rm.footer.aligned, true, `exit and version aligned (${JSON.stringify(rm.footer)})`);
+    assert.ok(Math.abs(rm.footer.labelOffset) <= 1, `exit label starts at the same column as root labels (${rm.footer.labelOffset})`);
+    assert.equal(rm.submenuAnimation, 'Fade', 'submenu uses AgentPet fade');
+    assert.equal(rm.poseChangedInPlace, true, 'pose choice should update existing menu rows');
+    assert.equal(rm.taskSoundChangedInPlace, true, 'task-completion sound toggle should keep and update the existing menu');
     assert.deepEqual(rm.footer.hits, [true, true, true, true], `exit footer hit-test failed: ${JSON.stringify(rm.footer)}`);
     assert.equal(rm.sliderVisible, true);
     assert.equal(rm.sliderStaysOpen, true);
@@ -2329,6 +3328,137 @@ try {
     assert.equal(c23.balanceUi.emptyRateNotice, '频率限制');
     assert.equal(c23.balanceUi.emptyRateTitle, '请求频率受限');
     assert.ok(c23.balanceUi.emptyRateDetail.includes('12 秒'));
+
+    const batchOne = data.batchOne;
+    assert.ok(batchOne.quoteButton, 'Case 24: 换一句 must be a WPF button');
+    assert.ok(batchOne.quoteClickHandled, 'Case 24: 换一句 must handle its click');
+    assert.ok(batchOne.quoteChanged, 'Case 24: 换一句 must update the quote text');
+    assert.equal(batchOne.quotePanelAfterClick, 'quote', 'Case 24: 换一句 must remain in the same panel');
+    assert.ok(batchOne.quoteRenewal > 3.5 && batchOne.closeRenewal > 3.5, 'Case 24: 换一句 must restart the quote reading window');
+    assert.equal(batchOne.quotePanelAfterTextClick, 'quote', 'Case 24: clicking the quote text must not cycle');
+    assert.equal(batchOne.quotePanelAfterWork, 'quote', 'Case 24: a working update must preserve the replacement quote');
+    assert.equal(batchOne.panelAfterBlankClick, 'quota', 'Case 24: clicking the bubble background must still cycle');
+    assert.equal(batchOne.liveFontSwitches.length, 8);
+    for (const c of batchOne.liveFontSwitches) {
+      const padding = c.panel === 'quota' ? 0 : c.font >= 1.3 ? 4 : 8;
+      assert.equal(c.padding, padding, `Case 24: same-panel padding must sync at once (${JSON.stringify(c)})`);
+      assert.equal(c.activePanel, c.panel, 'Case 24: font preview must stay on the current panel');
+      assert.equal(c.moved, false, 'Case 24: font preview must keep the same anchor');
+    }
+    assert.deepEqual(batchOne.fontLayouts.map((c) => c.fontScale), [1.3, 1.4]);
+    for (const c of batchOne.fontLayouts) {
+      assert.ok(Math.abs(c.quoteHeight - 3 * c.quoteLineHeight) <= 0.8, `Case 24 ${c.fontScale}: quote needs three lines (${JSON.stringify(c)})`);
+      assert.ok(c.quoteTop >= -0.8 && c.quoteBottomGap >= -0.8, `Case 24 ${c.fontScale}: 3-line quote must fit the visible card body (${JSON.stringify(c)})`);
+      assert.ok(c.weekTrackHeight >= 3.5 && c.weekTrackBottomGap >= -0.8, `Case 24 ${c.fontScale}: weekly progress track must fit (${JSON.stringify(c)})`);
+      assert.ok(Math.abs(c.cardHeight - (c.fontScale === 1.3 ? 122 : 128)) <= 0.8, 'Case 24: quota ticket must allocate height for scaled text');
+    }
+    assert.equal(batchOne.refreshTargets.length, 12);
+    for (const c of batchOne.refreshTargets) {
+      assert.ok(c.width >= 24 - 0.01 && c.height >= 24 - 0.01, `Case 24: refresh needs 24 × 24 rendered DIPs (${JSON.stringify(c)})`);
+      assert.ok(c.cornersHit, `Case 24: refresh transparent corners must be clickable (${JSON.stringify(c)})`);
+    }
+
+    // Cases 25 and 26 check the applied WPF brushes and user interaction paths.
+    function parseWpfColor(value) {
+      assert.match(value, /^#[0-9a-f]{8}$/i, 'WPF color must be ARGB');
+      return (value.slice(1).match(/../g) || []).map((channel) => parseInt(channel, 16) / 255);
+    }
+    function paintWpfColor(value, underlying) {
+      const [alpha, ...rgb] = parseWpfColor(value);
+      return rgb.map((channel, i) => alpha * channel + (1 - alpha) * underlying[i]);
+    }
+    function relativeLuminance(rgb) {
+      const linear = rgb.map((ch) => ch <= 0.04045 ? ch / 12.92 : ((ch + 0.055) / 1.055) ** 2.4);
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    }
+    const readability = data.batchTwoReadability;
+    assert.deepEqual([...new Set(readability.colors.map((row) => row.role))], ['claude', 'dragon', 'gemini', 'deepseek', 'zcode']);
+    assert.ok(readability.colors.length >= 60);
+    for (const row of readability.colors) {
+      const underlying = paintWpfColor(row.base, [1, 1, 1]);
+      const background = paintWpfColor(row.bg, underlying);
+      const foreground = paintWpfColor(row.fg, background);
+      const lum = [relativeLuminance(foreground), relativeLuminance(background)].sort((a, b) => b - a);
+      const ratio = (lum[0] + 0.05) / (lum[1] + 0.05);
+      assert.ok(ratio >= row.minimum, `Case 25 ${row.role}/${row.name}: contrast ${ratio.toFixed(2)} below ${row.minimum} (${JSON.stringify(row)})`);
+    }
+    assert.deepEqual(readability.stamps.map(s => s.role), ['claude','dragon','gemini','deepseek','zcode']);
+    for (const s of readability.stamps) {
+      assert.equal(s.artwork, s.role + '.png');
+      assert.ok(s.shared && s.visible, s.role + ' requires the same printed artwork on both rows');
+    }
+    assert.deepEqual(readability.lineartStamps.map(s => s.role), ['claude','dragon','gemini','deepseek','zcode']);
+    for (const s of readability.lineartStamps) {
+      assert.equal(s.folder, 'lineart', s.role + ': lineart stamp must come from quota-stamps/lineart');
+      assert.equal(s.artwork, s.role + '.png');
+      assert.ok(s.shared && s.visible, s.role + ': lineart stamp must share source and be visible');
+    }
+    const workStamp = readability.workStyle;
+    assert.equal(path.basename(path.dirname(workStamp.lineart)), 'lineart');
+    assert.equal(path.basename(path.dirname(workStamp.embossed)), 'embossed');
+    assert.equal(path.basename(workStamp.lineart), 'zcode.png');
+    assert.ok(workStamp.shown && workStamp.panel === 'work' && workStamp.panelAfter === 'work', 'both menus must restyle the visible work bubble in place');
+    assert.equal(path.basename(path.dirname(readability.fallback)), 'embossed');
+    assert.equal(path.basename(readability.fallback), 'gemini.png');
+    assert.equal(readability.sharedFallback, true);
+    assert.equal(path.basename(path.dirname(readability.unaffected)), 'lineart');
+    const sms = readability.stampMenuSync;
+    assert.equal(sms.toLineart.defaultCfg, 'embossed', 'Default QuotaStampStyle must remain embossed');
+    assert.equal(sms.toLineart.cfg, 'lineart', 'Tray click must switch QuotaStampStyle to lineart');
+    assert.equal(sms.toLineart.trayEmb, false);
+    assert.equal(sms.toLineart.trayLin, true);
+    assert.equal(sms.toLineart.wpfEmb, false);
+    assert.equal(sms.toLineart.wpfLin, true);
+    assert.equal(sms.toEmbossed.cfg, 'embossed', 'WPF click must restore QuotaStampStyle to embossed');
+    assert.equal(sms.toEmbossed.folder, 'embossed');
+    assert.equal(sms.toEmbossed.trayEmb, true);
+    assert.equal(sms.toEmbossed.trayLin, false);
+    assert.equal(sms.toEmbossed.wpfEmb, true);
+    assert.equal(sms.toEmbossed.wpfLin, false);
+    assert.equal(readability.progress.length, 8);
+    for (const row of readability.progress) {
+      assert.ok(row.track > 0 && Math.abs(row.width - row.track * row.remaining / 100) <= 1, 'hidden snapshot or resized track: ' + JSON.stringify(row));
+      assert.equal(row.stamp, row.remaining > 25);
+      assert.equal(row.alert, row.remaining <= 25);
+    }
+    assert.equal(readability.alerts.length, 12);
+    for (const row of readability.alerts) {
+      const state = row.remaining <= 10 ? '紧张' : row.remaining <= 25 ? '偏低' : '';
+      const context = `Case 25 ${row.scale}/${row.row}/${row.remaining}%`;
+      assert.equal(row.visible, Boolean(state), context);
+      assert.equal(row.percent, `${row.remaining}%`, context);
+      if (state) {
+        assert.ok(row.text.includes(state), `${context}: warning must have a visible text equivalent`);
+        assert.ok(row.automationName.includes(state) && row.automationName.includes(row.percent), `${context}: accessible text must announce state and remaining quota`);
+      }
+      assert.ok(row.fits, `${context}: warning and percent must fit the fixed card, including the weekly track`);
+    }
+    for (const row of readability.fullText) {
+      assert.ok(row.text && row.hint === row.text, `Case 25 ${row.name}: tooltip must preserve current full text`);
+    }
+    const detailEntry = data.batchTwoDetail;
+    assert.equal(detailEntry.disabledHoverOpen, false, 'Case 26: turning off automatic hover should not auto-open task detail');
+    assert.equal(detailEntry.mouseActivation, false, 'Case 26: clicking the bubble details affordance must preserve focus');
+    for (const check of ['buttonVisible', 'buttonHandlesClick', 'manualPinned', 'manualSurvivesPointerLeave', 'secondClickCloses', 'panelChangeCloses', 'idleCloses', 'menuVisible', 'menuOpens', 'menuEnablesKeyboard', 'keyboardScrolls', 'escapeCloses']) {
+      assert.equal(detailEntry[check], true, `Case 26 failed: ${check}`);
+    }
+    assert.ok(detailEntry.scrollable > 0, 'Case 26: long details must contain real scrollable content');
+    assert.equal(detailEntry.arrows.length, 2);
+    for (const row of detailEntry.arrows) {
+      assert.ok(row.visible && row.arrowHit && !row.otherHit, `Case 26 ${row.placement}: hover probe must be exclusively on the visible arrow (${JSON.stringify(row)})`);
+      assert.ok(row.remainsOpen, `Case 26 ${row.placement}: hovering the connecting arrow must keep the details open`);
+    }
+
+    const drc = data.dragReleaseCase;
+    assert.ok(drc, 'Case 28: dragReleaseCase output must exist');
+    assert.equal(drc.syncLostFired, true, 'Case 28: synchronous LostMouseCapture must fire during MouseLeftButtonUp release');
+    assert.equal(drc.dragBounceCount, 1, 'Case 28: drag-release must bounce exactly once despite synchronous LostMouseCapture');
+    assert.equal(drc.dragBubbleOpen, false, 'Case 28: drag-release must not enter single-click branch or open bubble');
+    assert.equal(drc.dragQuotaFlag, false, 'Case 28: drag-release must not trigger quota refresh');
+    assert.equal(drc.savedLeft, 220, 'Case 28: drag-release must persist updated Window.Left');
+    assert.equal(drc.savedTop, 310, 'Case 28: drag-release must persist updated Window.Top');
+    assert.equal(drc.lostBounceCount, 1, 'Case 28: unexpected LostMouseCapture must recover pressed pose once');
+    assert.equal(drc.lostIsDragging, false, 'Case 28: unexpected LostMouseCapture must clear isDragging');
 
     console.log('PASS: ui-layout-detail (Option B themes/split, fade closure, menu scope, DeepSeek FontScale & DetailWindow HWND sync)');
   } finally {

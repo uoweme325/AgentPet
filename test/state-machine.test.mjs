@@ -1223,7 +1223,7 @@ Write-Output "WO36_VERIFIED_OK"
       "& $pollFn",
       "if ($DeepSeekTotalText.Text -ne '¥ 25.00') { throw ('Late valid result after timeout must update amount, got ' + $DeepSeekTotalText.Text) }",
       "if ($DeepSeekStatusNotice.Text -ne ($expectedLateTimeStr + ' 更新')) { throw ('Late valid result must update time notice, got ' + $DeepSeekStatusNotice.Text) }",
-      "if ($DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH 宿主') { throw 'Late valid result must restore normal currency label' }",
+      "if ($DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH') { throw 'Late valid result must restore normal currency label' }",
       "if ($null -ne $DeepSeekStatusNotice.ToolTip) { throw 'Late valid result must clear timeout tooltip' }",
       "if ($script:balanceRequestStartedMs -ne 0) { throw 'balanceRequestStartedMs must be cleared after owned result arrives' }",
       "# (3) 期限内得到本次结果：及时显示，经过原截止时间也不被超时提示覆盖",
@@ -1307,7 +1307,7 @@ Write-Output "WO36_VERIFIED_OK"
       "    balances = @(@{ currency = 'CNY'; totalBalance = '42.00'; toppedUpBalance = '40.00'; grantedBalance = '2.00' })",
       "} ([DateTime]::UtcNow.AddSeconds(12))",
       "& $pollFn",
-      "if ($DeepSeekTotalText.Text -ne '¥ 42.00' -or $DeepSeekStatusNotice.Text -ne ($expectedBgTimeStr + ' 更新') -or $DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH 宿主') { throw 'Background balance update without manual request must work normally' }",
+      "if ($DeepSeekTotalText.Text -ne '¥ 42.00' -or $DeepSeekStatusNotice.Text -ne ($expectedBgTimeStr + ' 更新') -or $DeepSeekCurrencyLabel.Text -ne '人民币 CNY · DSH') { throw 'Background balance update without manual request must work normally' }",
       "Write-Output 'AP05_VERIFIED_OK'"
     ];
     fs.writeFileSync(runnerAp05, '\uFEFF' + ap05PsLines.join('\r\n'), 'utf8');

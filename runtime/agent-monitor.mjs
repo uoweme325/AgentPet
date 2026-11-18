@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
+import zlib from 'node:zlib';
 import crypto from 'node:crypto';
 import { spawn, execSync, execFile } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -1023,12 +1024,210 @@ function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
   });
 }
 
+function makeCompletion({
+  source,
+  rawId = '',
+  turnId = '',
+  kind = '',
+  outcome = 'step_only',
+  strictTurnEnd = false,
+  eventAt = 0,
+  turnStartedAtMs = 0,
+  eligibleForAntigravityFinalReply = false
+}) {
+  const normRaw = String(rawId || 'default');
+  const normTurn = String(turnId || 'unknown');
+  const ts = (Number.isFinite(Number(eventAt)) && Number(eventAt) > 0) ? Number(eventAt) : 0;
+  const startTs = (Number.isFinite(Number(turnStartedAtMs)) && Number(turnStartedAtMs) > 0) ? Number(turnStartedAtMs) : 0;
+  return {
+    strictTurnEnd: Boolean(strictTurnEnd),
+    outcome,
+    kind,
+    source,
+    sessionKey: `${source}|${normRaw}`,
+    turnId: normTurn,
+    eventId: `${source}|${normRaw}|${normTurn}|${outcome}`,
+    eventAt: ts,
+    ...(startTs > 0 ? { turnStartedAtMs: startTs } : {}),
+    ...(eligibleForAntigravityFinalReply ? { eligibleForAntigravityFinalReply: true } : {})
+  };
+}
+
+function finalizeSessionCompletion(state, source, rawId) {
+  if (!state || !state.completion) return state;
+  const compSource = state.completion.source || source || state.source || '';
+  const compRaw = rawId || state.rawId || state.sessionId || 'default';
+  const normTurn = String(state.completion.turnId || 'unknown');
+  const outcome = state.completion.outcome || 'step_only';
+  return {
+    ...state,
+    completion: {
+      ...state.completion,
+      source: compSource,
+      sessionKey: `${compSource}|${compRaw}`,
+      eventId: `${compSource}|${compRaw}|${normTurn}|${outcome}`
+    }
+  };
+}
+
+function resolveCodexTurnAnchor(lines, endIndex, fallbackTs) {
+  const parseTs = (obj) => {
+    const t = obj && obj.timestamp ? Date.parse(obj.timestamp) : NaN;
+    return (Number.isFinite(t) && t > 0) ? t : 0;
+  };
+  let turnStartedAtMs = 0;
+  let endEntry = null;
+  try { endEntry = JSON.parse(lines[endIndex]); } catch {}
+  const endPayload = endEntry?.payload || {};
+  const endExplicitTurnId = String(endPayload.turn_id || endPayload.task_id || endEntry?.turn_id || '').trim();
+  let explicitTurnId = endExplicitTurnId;
+  const endTs = parseTs(endEntry);
+
+  let turnStartIdx = 0;
+  for (let j = endIndex - 1; j >= 0; j--) {
+    let e;
+    try { e = JSON.parse(lines[j]); } catch { continue; }
+    if (e.type === 'event_msg') {
+      const k = String(e.payload?.type || '').toLowerCase();
+      const sid = String(e.payload?.turn_id || e.payload?.task_id || e.turn_id || '').trim();
+      const ts = parseTs(e);
+      if (k === 'task_started' || k === 'turn_started') {
+        if (endExplicitTurnId) {
+          if (sid && sid !== endExplicitTurnId) continue;
+          if (!sid && endTs > 0 && ts > endTs) continue;
+        } else {
+          if (endTs > 0 && ts > endTs) continue;
+          if (sid) explicitTurnId = sid;
+        }
+        if (ts > 0) turnStartedAtMs = ts;
+        turnStartIdx = j;
+        break;
+      }
+      if (k === 'task_complete' || k === 'turn_complete' || k === 'turn_aborted') {
+        if (endExplicitTurnId) {
+          if (sid && sid !== endExplicitTurnId) continue;
+          // Same-turn duplicate boundary (e.g. replayed task_complete): keep searching back for its task_started.
+          if (sid === endExplicitTurnId) continue;
+        }
+        if (endTs > 0 && ts > endTs) continue;
+        turnStartIdx = Math.min(endIndex, j + 1);
+        break;
+      }
+    }
+  }
+
+  if (!turnStartedAtMs) {
+    for (let j = turnStartIdx; j <= endIndex; j++) {
+      try {
+        const obj = JSON.parse(lines[j]);
+        const oSid = String(obj?.payload?.turn_id || obj?.payload?.task_id || obj?.turn_id || '').trim();
+        if (endExplicitTurnId && oSid && oSid !== endExplicitTurnId) continue;
+        const ts = parseTs(obj);
+        if (ts > 0 && (endTs <= 0 || ts <= endTs)) {
+          turnStartedAtMs = ts;
+          break;
+        }
+      } catch {}
+    }
+  }
+  if (!turnStartedAtMs && endTs > 0) {
+    turnStartedAtMs = endTs;
+  }
+  if (!turnStartedAtMs && Number.isFinite(Number(fallbackTs)) && Number(fallbackTs) > 0) {
+    turnStartedAtMs = Number(fallbackTs);
+  }
+  if (endTs > 0 && turnStartedAtMs > endTs) {
+    turnStartedAtMs = endTs;
+  }
+
+  let turnOrdinal = 0;
+  for (let j = 0; j < turnStartIdx; j++) {
+    const raw = lines[j];
+    if (!raw || (!raw.includes('task_complete') && !raw.includes('turn_complete') && !raw.includes('turn_aborted'))) continue;
+    try {
+      const e = JSON.parse(raw);
+      if (e.type === 'event_msg') {
+        const k = String(e.payload?.type || '').toLowerCase();
+        if (k === 'task_complete' || k === 'turn_complete' || k === 'turn_aborted') turnOrdinal += 1;
+      }
+    } catch {}
+  }
+
+  if (explicitTurnId) {
+    return { turnId: `id:${explicitTurnId}`, explicitTurnId, turnStartedAtMs };
+  }
+  const anchorHash = crypto.createHash('sha1').update(String(lines[turnStartIdx] || '')).digest('hex').slice(0, 12);
+  return { turnId: `t:${turnOrdinal}:${anchorHash}`, explicitTurnId: '', turnStartedAtMs };
+}
+
+function inspectCodexTurnLifecycle(lines) {
+  const turns = [];
+  for (let j = 0; j < lines.length; j++) {
+    const raw = lines[j];
+    if (!raw || (!raw.includes('task_started') && !raw.includes('turn_started') &&
+        !raw.includes('task_complete') && !raw.includes('turn_complete') && !raw.includes('turn_aborted'))) {
+      continue;
+    }
+    let e;
+    try { e = JSON.parse(raw); } catch { continue; }
+    if (e.type !== 'event_msg') continue;
+    const k = String(e.payload?.type || '').toLowerCase();
+    const tid = String(e.payload?.turn_id || e.payload?.task_id || e.turn_id || '').trim();
+    const parsedTs = e.timestamp ? Date.parse(e.timestamp) : NaN;
+    const evTs = (Number.isFinite(parsedTs) && parsedTs > 0) ? parsedTs : 0;
+
+    if (k === 'task_started' || k === 'turn_started') {
+      turns.push({ idx: j, turnId: tid, ts: evTs, closed: false });
+    } else if (k === 'task_complete' || k === 'turn_complete' || k === 'turn_aborted') {
+      if (tid) {
+        for (let t = turns.length - 1; t >= 0; t--) {
+          if (!turns[t].closed && turns[t].turnId === tid) {
+            turns[t].closed = true;
+            break;
+          }
+        }
+      } else {
+        for (let t = turns.length - 1; t >= 0; t--) {
+          if (!turns[t].closed && (turns[t].ts <= 0 || evTs <= 0 || turns[t].ts <= evTs)) {
+            turns[t].closed = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  const latestOpenTurn = [...turns].reverse().find(t => !t.closed) || null;
+  let fallbackOpenTurnId = '';
+  if (latestOpenTurn && !latestOpenTurn.turnId) {
+    let ordinal = 0;
+    for (let j = 0; j < latestOpenTurn.idx; j++) {
+      const raw = lines[j];
+      if (!raw || (!raw.includes('task_complete') && !raw.includes('turn_complete') && !raw.includes('turn_aborted'))) continue;
+      try {
+        const e = JSON.parse(raw);
+        if (e.type === 'event_msg') {
+          const k = String(e.payload?.type || '').toLowerCase();
+          if (k === 'task_complete' || k === 'turn_complete' || k === 'turn_aborted') ordinal += 1;
+        }
+      } catch {}
+    }
+    const anchorHash = crypto.createHash('sha1').update(String(lines[latestOpenTurn.idx] || '')).digest('hex').slice(0, 12);
+    fallbackOpenTurnId = `t:${ordinal}:${anchorHash}`;
+  }
+  return {
+    latestOpenTurn,
+    activeTurnId: latestOpenTurn ? (latestOpenTurn.turnId ? `id:${latestOpenTurn.turnId}` : fallbackOpenTurnId) : '',
+    activeTurnStartedAtMs: latestOpenTurn?.ts || 0
+  };
+}
+
 function isStateFresh(state, now) {
   if (!state || !state.state) return false;
   const age = now - (state.at || 0);
   if (state.kind === 'handoff') return age < HANDOFF_MAX_AGE_MS;
   if (isHeldState(state)) return age < WAITING_MAX_AGE_MS;
-  if (state.state === 'success' || state.state === 'result' || state.state === 'error') {
+  if (state.state === 'success' || state.state === 'result' || state.state === 'error' || state.state === 'idle') {
     return age < TERMINAL_HOLD_MS;
   }
   return age < ACTIVE_MAX_AGE_MS;
@@ -1040,6 +1239,7 @@ function refreshDynamicState(state, now, stallEnabled, stallMs) {
     if (state.nextState && now - (state.at || 0) >= TERMINAL_HOLD_MS) {
       const next = { ...state, ...state.nextState, at: state.at, inFlight: false };
       delete next.nextState;
+      delete next.completion;
       return isStateFresh(next, now) ? next : null;
     }
     return isStateFresh(state, now) ? state : null;
@@ -1161,6 +1361,7 @@ class AgentMonitor {
     this.antigravityDbCache = new Map();
     this.antigravityTranscriptCache = new Map();
     this.dshStateCache = new Map();
+    this.dshLogDirCache = new Map();
     this.isProbe = options.isProbe || false;
 
     // Caching layer to avoid heavy 500ms disk parsing (Issue 12)
@@ -2139,11 +2340,27 @@ class AgentMonitor {
       if (!a || !isStateFresh(a, now)) return null;
       const rawId = a.rawId || a.sessionId || null;
       const taskDetail = finalizeTaskDetail(a.taskDetail ?? null);
-      return {
+      const src = a.source || '';
+      const normSessions = Array.isArray(a.sessions)
+        ? a.sessions.map(s => {
+            const sRaw = s.rawId || s.sessionId || rawId || 'default';
+            const sSrc = s.source || src;
+            const withComp = finalizeSessionCompletion(s, sSrc, sRaw);
+            return {
+              ...withComp,
+              source: sSrc,
+              rawId: sRaw,
+              sessionKey: withComp.sessionKey || `${sSrc}|${sRaw}`
+            };
+          })
+        : null;
+      const finalized = finalizeSessionCompletion({
         ...a,
         ...(rawId ? { rawId } : {}),
+        ...(normSessions ? { sessions: normSessions } : {}),
         taskDetail
-      };
+      }, src, rawId);
+      return finalized;
     };
 
     // 1. Check Google Antigravity
@@ -2169,23 +2386,70 @@ class AgentMonitor {
       a => Boolean(a && a.state && ACTIVE_WORK_STATES.has(a.state))
     ).length;
 
+    const snapshotMap = new Map();
+    for (const agItem of [allAgents.antigravity, allAgents.dsh, allAgents.codex]) {
+      if (!agItem) continue;
+      const list = (Array.isArray(agItem.sessions) && agItem.sessions.length > 0)
+        ? agItem.sessions
+        : [agItem];
+      for (const s of list) {
+        if (!s || !s.state) continue;
+        const sSource = s.source || agItem.source || '';
+        const sRawId = s.rawId || s.sessionId || agItem.rawId || 'default';
+        const sessionKey = s.sessionKey || `${sSource}|${sRawId}`;
+        const snap = {
+          source: sSource,
+          rawId: sRawId,
+          sessionKey,
+          state: s.state,
+          at: s.at || agItem.at || now,
+          ...(s.turnId ? { turnId: s.turnId } : {}),
+          ...(s.turnStartedAtMs > 0 ? { turnStartedAtMs: s.turnStartedAtMs } : {}),
+          ...(s.completion ? { completion: s.completion } : {})
+        };
+        const existing = snapshotMap.get(sessionKey);
+        if (!existing || this.selectBest(existing, snap, now) === snap) {
+          snapshotMap.set(sessionKey, snap);
+        }
+      }
+    }
+    const sessionSnapshots = Array.from(snapshotMap.values());
+    const totalActiveSessions = sessionSnapshots.filter(s => ACTIVE_WORK_STATES.has(s.state)).length;
+
+    const sessionDigest = (s) => [
+      s.sessionKey || `${s.source || ''}|${s.rawId || s.sessionId || ''}`,
+      s.state || '',
+      s.turnId || '',
+      s.completion?.eventId || '',
+      s.completion?.outcome || '',
+      Boolean(s.completion?.strictTurnEnd),
+      Boolean(s.completion?.eligibleForAntigravityFinalReply)
+    ];
+
     const agentSnapshot = (a) => a ? [
       a.source || '',
       a.rawId || a.sessionId || '',
       a.state || '',
+      a.turnId || '',
       a.task || '',
       a.taskDetail ?? null,
-      a.sessionCount || 0
+      a.sessionCount || 0,
+      a.completion?.eventId || '',
+      a.completion?.outcome || '',
+      Boolean(a.completion?.strictTurnEnd),
+      Array.isArray(a.sessions) ? a.sessions.map(sessionDigest) : []
     ] : null;
 
-    const key = best ? JSON.stringify({
-      source: best.source || '',
-      rawId: best.rawId || best.sessionId || '',
-      state: best.state || '',
-      task: best.task || '',
-      taskDetail: best.taskDetail ?? null,
-      sessionCount: best.sessionCount || 0,
+    const key = (best || sessionSnapshots.length > 0) ? JSON.stringify({
+      source: best?.source || '',
+      rawId: best?.rawId || best?.sessionId || '',
+      state: best?.state || '',
+      task: best?.task || '',
+      taskDetail: best?.taskDetail ?? null,
+      sessionCount: best?.sessionCount || 0,
       activeCount,
+      totalActiveSessions,
+      completionEventId: best?.completion?.eventId || '',
       agents: {
         antigravity: agentSnapshot(allAgents.antigravity),
         dsh: agentSnapshot(allAgents.dsh),
@@ -2226,7 +2490,10 @@ class AgentMonitor {
         taskDetail: best?.taskDetail ?? null,
         at: nowMs,
         agents: allAgents,
-        activeCount: activeCount
+        activeCount: activeCount,
+        totalActiveSessions,
+        completion: best?.completion || null,
+        sessionSnapshots
       });
       if (isNewKey && ((best?.source === 'Codex' && best?.state === 'success') || (prevSource === 'Codex' && !best))) {
         this.pollQuota(false);
@@ -2257,7 +2524,7 @@ class AgentMonitor {
     }
 
     // 4. Tie-breaker when both are within 3 seconds of each other: priority hierarchy
-    const prio = { waiting: 7, approval: 7, error: 6, stalled: 5, working: 4, thinking: 3, result: 2, success: 1 };
+    const prio = { waiting: 7, approval: 7, error: 6, stalled: 5, working: 4, thinking: 3, result: 2, success: 1, idle: 0 };
     const p1 = prio[current.state] || 0;
     const p2 = prio[candidate.state] || 0;
     if (p2 > p1) return candidate;
@@ -2271,15 +2538,89 @@ class AgentMonitor {
     const db = this.checkAntigravityDb(now) || null;
     const txIdx = Number.isFinite(tx?.stepIdx) ? tx.stepIdx : -1;
     const dbIdx = Number.isFinite(db?.stepIdx) ? db.stepIdx : -1;
-    const normDbId = String(db?.rawId || '').replace(/\.db$/i, '');
-    const normTxId = String(tx?.rawId || '').replace(/\.db$/i, '');
+    const normAgId = (id) => String(id || '').replace(/\.db$/i, '');
+    const normDbId = normAgId(db?.rawId);
+    const normTxId = normAgId(tx?.rawId);
     const sameConversation = Boolean(normDbId && normTxId && normDbId === normTxId);
-    if (tx && (tx.state === 'waiting' || tx.state === 'approval')) return tx;
-    if (db && (db.state === 'waiting' || db.state === 'approval')) return db;
-    if (tx && tx.inFlight && !db) return tx;
-    if (tx && tx.inFlight && sameConversation && txIdx >= dbIdx - 1) return tx;
-    if (sameConversation) return db || tx;
-    return this.selectBest(db, tx, now);
+
+    const pickAgWinner = (d, t, isSame) => {
+      if (t && (t.state === 'waiting' || t.state === 'approval')) return t;
+      if (d && (d.state === 'waiting' || d.state === 'approval')) return d;
+      const dIdx = Number.isFinite(d?.stepIdx) ? d.stepIdx : -1;
+      const tIdx = Number.isFinite(t?.stepIdx) ? t.stepIdx : -1;
+      if (t && t.inFlight && !d) return t;
+      if (t && t.inFlight && isSame && tIdx >= dIdx - 1) return t;
+      if (isSame) return d || t;
+      return this.selectBest(d, t, now);
+    };
+
+    const primary = pickAgWinner(db, tx, sameConversation);
+    if (!primary) return null;
+
+    // Merge sessions across DB and Transcript per normalized conversation ID so parallel AG sessions & DB-lag checks stay accurate
+    const dbByConv = new Map();
+    for (const s of (Array.isArray(db?.sessions) ? db.sessions : (db ? [db] : []))) {
+      const k = normAgId(s.rawId || s.sessionId);
+      if (k) dbByConv.set(k, s);
+    }
+    const txByConv = new Map();
+    for (const s of (Array.isArray(tx?.sessions) ? tx.sessions : (tx ? [tx] : []))) {
+      const k = normAgId(s.rawId || s.sessionId);
+      if (k) txByConv.set(k, s);
+    }
+
+    const mergedKeys = new Set([...dbByConv.keys(), ...txByConv.keys()]);
+    const mergedSessions = [];
+    for (const k of mergedKeys) {
+      const dSess = dbByConv.get(k) || null;
+      let tSess = txByConv.get(k) || null;
+      if (tSess && dSess && tSess.completion?.eligibleForAntigravityFinalReply) {
+        const dIdx = Number.isFinite(dSess.stepIdx) ? dSess.stepIdx : -1;
+        const tIdx = Number.isFinite(tSess.stepIdx) ? tSess.stepIdx : -1;
+        const dbStillAheadOrBusy = Boolean(dSess.inFlight) || (dIdx > tIdx + 1) || ['working', 'thinking', 'waiting', 'approval', 'stalled'].includes(dSess.state);
+        if (dbStillAheadOrBusy) {
+          tSess = {
+            ...tSess,
+            completion: makeCompletion({
+              source: 'Antigravity',
+              rawId: tSess.rawId || k,
+              turnId: tSess.completion.turnId,
+              kind: 'ag_transcript_db_active_downgrade',
+              outcome: 'step_only',
+              strictTurnEnd: false,
+              eventAt: tSess.completion.eventAt || tSess.at || 0
+            })
+          };
+        }
+      }
+      const winner = pickAgWinner(dSess, tSess, Boolean(dSess && tSess));
+      if (winner) {
+        // Carry validated transcript final-reply completion metadata even when same-conversation DB step_15 is selected as display winner
+        let mergedCompletion = winner.completion || null;
+        if (dSess && tSess && winner === dSess && tSess.completion?.eligibleForAntigravityFinalReply) {
+          mergedCompletion = tSess.completion;
+        }
+        const sessRaw = winner.rawId || k;
+        mergedSessions.push(finalizeSessionCompletion({
+          sessionId: winner.sessionId || sessRaw,
+          rawId: sessRaw,
+          sessionKey: `Antigravity|${sessRaw}`,
+          source: 'Antigravity',
+          state: winner.state,
+          task: winner.task,
+          at: winner.at,
+          ...(mergedCompletion ? { completion: mergedCompletion } : {})
+        }, 'Antigravity', sessRaw));
+      }
+    }
+
+    const pKey = normAgId(primary.rawId || primary.sessionId);
+    const primaryMerged = mergedSessions.find(s => normAgId(s.rawId) === pKey);
+    return {
+      ...primary,
+      ...(primaryMerged?.completion ? { completion: primaryMerged.completion } : (primary.completion ? { completion: primary.completion } : {})),
+      ...(mergedSessions.length > 0 ? { sessions: mergedSessions, sessionCount: mergedSessions.length } : {})
+    };
   }
 
   checkAntigravityDb(now) {
@@ -2318,7 +2659,7 @@ class AgentMonitor {
       const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
         const rawId = path.basename(candidate.file);
-        sessions.push({ ...state, sessionId: rawId, rawId });
+        sessions.push(finalizeSessionCompletion({ ...state, sessionId: rawId, rawId }, 'Antigravity', rawId));
       }
     }
     if (this.antigravityDbCache.size > 64) this.antigravityDbCache.clear();
@@ -2327,12 +2668,18 @@ class AgentMonitor {
     for (const session of sessions) best = this.selectBest(best, session, now);
     if (!best) return null;
     best.rawId = best.rawId || best.sessionId;
+    best = finalizeSessionCompletion(best, 'Antigravity', best.rawId);
     best.sessions = sessions.map(s => ({
       sessionId: truncate(s.task || s.sessionId, 36) || s.sessionId,
-      rawId: s.sessionId,
+      rawId: s.rawId || s.sessionId,
+      sessionKey: `Antigravity|${s.rawId || s.sessionId}`,
+      source: 'Antigravity',
       state: s.state,
       task: s.task,
-      at: s.at
+      at: s.at,
+      ...(s.inFlight ? { inFlight: true } : {}),
+      ...(Number.isFinite(s.stepIdx) ? { stepIdx: s.stepIdx } : {}),
+      ...(s.completion ? { completion: s.completion } : {})
     }));
     best.sessionCount = sessions.length;
     return best;
@@ -2375,6 +2722,7 @@ class AgentMonitor {
       if (!row) return null;
 
       const p = parseAntigravityStep(row);
+      const rawId = path.basename(latestDb);
 
       const terminal = new Set([3, 5, 6, 7]);
       const inFlight = !terminal.has(Number(row.status));
@@ -2382,24 +2730,54 @@ class AgentMonitor {
         const baseTask = cleanSummary(p.toolSummary || p.toolName || '正在执行工具');
         const nextTask = p.toolSummary ? `推进中 (${p.toolSummary})` : '正在分析结果并构思下一步…';
         const stepDetail = p.toolDetail || null;
-        if (inFlight) return { source: 'Antigravity', state: 'working', task: baseTask, baseTask, taskDetail: stepDetail, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
+        if (inFlight) return { source: 'Antigravity', rawId, state: 'working', task: baseTask, baseTask, taskDetail: stepDetail, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
         if (now - latestMtime < TERMINAL_HOLD_MS) {
           return {
             source: 'Antigravity',
+            rawId,
             state: 'result',
             task: p.toolSummary ? `已完成: ${p.toolSummary}` : '步骤执行完毕',
             taskDetail: stepDetail,
             nextState: { state: 'thinking', task: nextTask, taskDetail: p.toolSummary ? stepDetail : null },
             at: latestMtime,
             stepIdx: row.idx,
-            inFlight: false
+            inFlight: false,
+            completion: makeCompletion({
+              source: 'Antigravity',
+              rawId,
+              turnId: `db-step:${row.idx}`,
+              kind: 'ag_db_step_132',
+              outcome: 'step_only',
+              strictTurnEnd: false,
+              eventAt: latestMtime
+            })
           };
         }
-        return { source: 'Antigravity', state: 'thinking', task: nextTask, taskDetail: p.toolSummary ? stepDetail : null, at: latestMtime, stepIdx: row.idx, inFlight: false };
+        return { source: 'Antigravity', rawId, state: 'thinking', task: nextTask, taskDetail: p.toolSummary ? stepDetail : null, at: latestMtime, stepIdx: row.idx, inFlight: false };
       }
       if (row.step_type === 15) {
-        if (inFlight) return { source: 'Antigravity', state: 'thinking', task: '正在深度思考与规划…', baseTask: '正在深度思考与规划…', taskDetail: null, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
-        if (now - latestMtime < TERMINAL_HOLD_MS) return { source: 'Antigravity', state: 'success', task: '回答生成完成', taskDetail: null, at: latestMtime, stepIdx: row.idx, inFlight: false };
+        if (inFlight) return { source: 'Antigravity', rawId, state: 'thinking', task: '正在深度思考与规划…', baseTask: '正在深度思考与规划…', taskDetail: null, at: latestMtime, startedAt: latestMtime, stepIdx: row.idx, inFlight: true };
+        if (now - latestMtime < TERMINAL_HOLD_MS) {
+          return {
+            source: 'Antigravity',
+            rawId,
+            state: 'success',
+            task: '回答生成完成',
+            taskDetail: null,
+            at: latestMtime,
+            stepIdx: row.idx,
+            inFlight: false,
+            completion: makeCompletion({
+              source: 'Antigravity',
+              rawId,
+              turnId: `db-step:${row.idx}`,
+              kind: 'ag_db_step_15',
+              outcome: 'step_only',
+              strictTurnEnd: false,
+              eventAt: latestMtime
+            })
+          };
+        }
         return null;
       }
 
@@ -2452,11 +2830,14 @@ class AgentMonitor {
         this.antigravityTranscriptCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
       }
       const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
-      if (state && isStateFresh(state, now)) sessions.push({
-        ...state,
-        sessionId: path.basename(path.dirname(path.dirname(path.dirname(candidate.file)))),
-        rawId: path.basename(path.dirname(path.dirname(path.dirname(candidate.file))))
-      });
+      if (state && isStateFresh(state, now)) {
+        const convId = path.basename(path.dirname(path.dirname(path.dirname(candidate.file))));
+        sessions.push(finalizeSessionCompletion({
+          ...state,
+          sessionId: convId,
+          rawId: convId
+        }, 'Antigravity', convId));
+      }
     }
     if (this.antigravityTranscriptCache.size > 128) this.antigravityTranscriptCache.clear();
     if (!sessions.length) return null;
@@ -2464,12 +2845,18 @@ class AgentMonitor {
     for (const session of sessions) best = this.selectBest(best, session, now);
     if (!best) return null;
     best.rawId = best.rawId || best.sessionId;
+    best = finalizeSessionCompletion(best, 'Antigravity', best.rawId);
     best.sessions = sessions.map(s => ({
       sessionId: truncate(s.task || s.sessionId, 36) || s.sessionId,
-      rawId: s.sessionId,
+      rawId: s.rawId || s.sessionId,
+      sessionKey: `Antigravity|${s.rawId || s.sessionId}`,
+      source: 'Antigravity',
       state: s.state,
       task: s.task,
-      at: s.at
+      at: s.at,
+      ...(s.inFlight ? { inFlight: true } : {}),
+      ...(Number.isFinite(s.stepIdx) ? { stepIdx: s.stepIdx } : {}),
+      ...(s.completion ? { completion: s.completion } : {})
     }));
     best.sessionCount = sessions.length;
     return best;
@@ -2580,12 +2967,47 @@ class AgentMonitor {
 
           if (status === 'DONE') {
             if (now - latestMtime < TERMINAL_HOLD_MS) {
+              const entryTs = (entry.timestamp && Date.parse(entry.timestamp)) || latestMtime;
+              let turnAnchor = String(entry.step_index ?? i);
+              let turnStartedAtMs = 0;
+              for (let k = i; k >= 0; k--) {
+                try {
+                  const pe = JSON.parse(lines[k]);
+                  if (pe.type === 'USER_INPUT') {
+                    const pTs = pe.created_at ? Date.parse(pe.created_at) : (pe.timestamp ? Date.parse(pe.timestamp) : NaN);
+                    if (Number.isFinite(pTs) && pTs > 0) turnStartedAtMs = pTs;
+                    turnAnchor = `${pe.step_index ?? k}:${turnStartedAtMs || pe.step_index || k}`;
+                    break;
+                  }
+                } catch {}
+              }
+              const hasTools = toolCalls.length > 0;
               res = {
                 source: 'Antigravity',
                 state: 'success',
                 task: '回答生成完成',
                 taskDetail: null,
-                at: latestMtime
+                at: latestMtime,
+                ...(Number.isFinite(entry.step_index) ? { stepIdx: entry.step_index } : {}),
+                completion: hasTools
+                  ? makeCompletion({
+                      source: 'Antigravity',
+                      turnId: `tx-step:${entry.step_index ?? i}`,
+                      kind: 'ag_transcript_tool_step',
+                      outcome: 'step_only',
+                      strictTurnEnd: false,
+                      eventAt: entryTs
+                    })
+                  : makeCompletion({
+                      source: 'Antigravity',
+                      turnId: `tx-turn:${turnAnchor}`,
+                      kind: 'ag_transcript_final_text',
+                      outcome: 'completed',
+                      strictTurnEnd: false,
+                      eligibleForAntigravityFinalReply: true,
+                      eventAt: entryTs,
+                      turnStartedAtMs
+                    })
               };
             }
             break;
@@ -2602,12 +3024,21 @@ class AgentMonitor {
 
         if (type === 'ERROR_MESSAGE') {
           if (now - latestMtime < TERMINAL_HOLD_MS) {
+            const errTs = (entry.timestamp && Date.parse(entry.timestamp)) || latestMtime;
             res = {
               source: 'Antigravity',
               state: 'error',
               task: truncate(entry.content || '执行遇到了问题'),
               taskDetail: finalizeTaskDetail(entry.content),
-              at: latestMtime
+              at: latestMtime,
+              completion: makeCompletion({
+                source: 'Antigravity',
+                turnId: `tx-err:${entry.step_index ?? i}`,
+                kind: 'ag_transcript_error',
+                outcome: 'failed',
+                strictTurnEnd: true,
+                eventAt: errTs
+              })
             };
           }
           break;
@@ -2692,14 +3123,15 @@ class AgentMonitor {
         : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
       if (now - candidate.mtime >= ageLimit) continue;
       let rawState = cachedState;
-      if (!cached || cached.mtime !== candidate.mtime) {
+      const needsLogRecheck = this.isPendingDshStepBoundary(cachedState, candidate.mtime, now);
+      if (!cached || cached.mtime !== candidate.mtime || needsLogRecheck) {
         rawState = this.checkDshSingle(now, candidate.file, candidate.mtime);
         this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
       }
       const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
         const rawId = path.basename(candidate.file);
-        sessions.push({ ...state, sessionId: rawId, rawId });
+        sessions.push(finalizeSessionCompletion({ ...state, sessionId: rawId, rawId }, 'DSH', rawId));
       }
     }
     if (this.dshStateCache.size > 128) this.dshStateCache.clear();
@@ -2708,15 +3140,152 @@ class AgentMonitor {
     for (const session of sessions) best = this.selectBest(best, session, now);
     if (!best) return null;
     best.rawId = best.rawId || best.sessionId;
+    best = finalizeSessionCompletion(best, 'DSH', best.rawId);
     best.sessions = sessions.map(s => ({
       sessionId: truncate(s.task || s.sessionId, 36) || s.sessionId,
-      rawId: s.sessionId,
+      rawId: s.rawId || s.sessionId,
+      sessionKey: `DSH|${s.rawId || s.sessionId}`,
+      source: 'DSH',
       state: s.state,
       task: s.task,
-      at: s.at
+      at: s.at,
+      ...(s.turnId ? { turnId: s.turnId } : {}),
+      ...(s.turnStartedAtMs > 0 ? { turnStartedAtMs: s.turnStartedAtMs } : {}),
+      ...(s.completion ? { completion: s.completion } : {})
     }));
     best.sessionCount = sessions.length;
     return best;
+  }
+
+  isPendingDshStepBoundary(state, refMtime, now) {
+    return Boolean(
+      state
+      && state.completion?.outcome === 'step_only'
+      && !state.completion?.strictTurnEnd
+      && (now - refMtime < TERMINAL_HOLD_MS)
+    );
+  }
+
+  resolveDshSessionLog(projSessionFile) {
+    if (!projSessionFile) return null;
+    const sessDir = path.dirname(projSessionFile);
+    const projCacheDir = path.dirname(sessDir);
+    const storagesDir = path.dirname(projCacheDir);
+    if (
+      path.basename(sessDir) !== 'sessions'
+      || path.basename(projCacheDir) !== 'session_projcache'
+      || path.basename(storagesDir) !== 'storages'
+    ) {
+      return null;
+    }
+    const sessionsRoot = path.join(path.dirname(storagesDir), 'sessions');
+    const sessionId = path.basename(projSessionFile, '.json');
+    if (!sessionId || !fs.existsSync(sessionsRoot)) return null;
+
+    let targetDir = this.dshLogDirCache.get(projSessionFile);
+    if (!targetDir || !fs.existsSync(targetDir)) {
+      targetDir = null;
+      try {
+        for (const wsName of fs.readdirSync(sessionsRoot)) {
+          const candidateDir = path.join(sessionsRoot, wsName, sessionId);
+          try {
+            if (fs.statSync(candidateDir).isDirectory()) {
+              targetDir = candidateDir;
+              break;
+            }
+          } catch {}
+        }
+      } catch {
+        return null;
+      }
+      if (!targetDir) return null;
+      if (this.dshLogDirCache.size > 256) this.dshLogDirCache.clear();
+      this.dshLogDirCache.set(projSessionFile, targetDir);
+    }
+
+    let bestFile = null;
+    let bestVer = -1;
+    let bestMtime = -1;
+    let bestRaw = false;
+    try {
+      for (const fn of fs.readdirSync(targetDir)) {
+        const m = /^session(?:\.v(\d+))?\.jsonl(\.zstd)?$/i.exec(fn);
+        if (!m) continue;
+        const ver = m[1] ? parseInt(m[1], 10) : 0;
+        const isRaw = !m[2];
+        const fp = path.join(targetDir, fn);
+        let mtimeMs = 0;
+        try { mtimeMs = fs.statSync(fp).mtimeMs; } catch { continue; }
+        if (
+          ver > bestVer
+          || (ver === bestVer && (mtimeMs > bestMtime || (mtimeMs === bestMtime && isRaw && !bestRaw)))
+        ) {
+          bestVer = ver;
+          bestMtime = mtimeMs;
+          bestRaw = isRaw;
+          bestFile = { file: fp, compressed: !isRaw };
+        }
+      }
+    } catch {
+      return null;
+    }
+    return bestFile;
+  }
+
+  readDshTurnOutcome(projSessionFile, expectedLastTurn = 0) {
+    const resolved = this.resolveDshSessionLog(projSessionFile);
+    if (!resolved) return null;
+    let text = '';
+    try {
+      if (resolved.compressed) {
+        if (typeof zlib.zstdDecompressSync !== 'function') return null;
+        text = zlib.zstdDecompressSync(fs.readFileSync(resolved.file)).toString('utf8');
+      } else {
+        text = fs.readFileSync(resolved.file, 'utf8');
+      }
+    } catch {
+      return null;
+    }
+    const lines = text.trim().split(/\r?\n/);
+    const targetTurn = Number.isFinite(Number(expectedLastTurn)) && Number(expectedLastTurn) > 0
+      ? Number(expectedLastTurn)
+      : null;
+    let endEntry = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      let e;
+      try { e = JSON.parse(lines[i]); } catch { continue; }
+      if (!e || typeof e !== 'object') continue;
+      if (e.type === 'turn/start' || e.type === 'step/start') {
+        if (!endEntry) return null; // Log shows an open turn/step newer than any turn/end
+        if (e.type === 'turn/start' && e.data?.turn === endEntry.data?.turn) {
+          return {
+            turnNum: Number(endEntry.data?.turn ?? targetTurn ?? 0),
+            startSeq: e.seq ?? endEntry.seq,
+            turnStartedAtMs: Number(e.time) || 0,
+            endSeq: endEntry.seq,
+            endTimeMs: Number(endEntry.time) || 0,
+            reasonKind: String(endEntry.data?.reason?.kind || '').toLowerCase(),
+            errorMessage: endEntry.data?.reason?.error?.message ? String(endEntry.data.reason.error.message) : ''
+          };
+        }
+        continue;
+      }
+      if (!endEntry && e.type === 'turn/end') {
+        const eTurn = Number(e.data?.turn ?? 0);
+        if (targetTurn !== null && eTurn !== targetTurn) return null;
+        endEntry = e;
+      }
+    }
+    if (!endEntry) return null;
+    return {
+      turnNum: Number(endEntry.data?.turn ?? targetTurn ?? 0),
+      startSeq: endEntry.seq,
+      turnStartedAtMs: 0,
+      endSeq: endEntry.seq,
+      endTimeMs: Number(endEntry.time) || 0,
+      reasonKind: String(endEntry.data?.reason?.kind || '').toLowerCase(),
+      errorMessage: endEntry.data?.reason?.error?.message ? String(endEntry.data.reason.error.message) : ''
+    };
   }
 
   checkDshSingle(now, forcedFile = null, forcedMtime = 0) {
@@ -2763,7 +3332,12 @@ class AgentMonitor {
     }
 
     // Fast mtime cache with freshness check (Diagnostics Fix 1)
-    if (!forcedFile && this.cachedDsh.file === latestFile && this.cachedDsh.mtime === latestMtime) {
+    if (
+      !forcedFile
+      && this.cachedDsh.file === latestFile
+      && this.cachedDsh.mtime === latestMtime
+      && !this.isPendingDshStepBoundary(this.cachedDsh.state, latestMtime, now)
+    ) {
       return refreshDynamicState(this.cachedDsh.state, now, this.stallEnabled, this.stallMs);
     }
 
@@ -2781,6 +3355,10 @@ class AgentMonitor {
       let defaultTask = truncate(rawTitle);
       let rawTurnPrompt = '';
       const turns = rows.turnOutline?.val?.turns;
+      const dshLastTurn = Number.isFinite(Number(turnBoundary?.lastTurn)) && Number(turnBoundary.lastTurn) > 0
+        ? Number(turnBoundary.lastTurn)
+        : 0;
+      const dshTurnId = dshLastTurn > 0 ? `dsh-turn:${dshLastTurn}` : '';
       if (Array.isArray(turns) && turns.length > 0) {
         rawTurnPrompt = String(turns[turns.length - 1].prompt || '').trim();
         if (!defaultTask) defaultTask = truncate(rawTurnPrompt);
@@ -2875,7 +3453,8 @@ class AgentMonitor {
           taskDetail: buildDshContextDetail(callLines),
           at: latestMtime,
           startedAt,
-          inFlight: true
+          inFlight: true,
+          ...(dshTurnId ? { turnId: dshTurnId } : {})
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
         return res;
@@ -2889,7 +3468,8 @@ class AgentMonitor {
             state: isGenerating ? 'working' : 'thinking',
             task: finalTask || (isGenerating ? '正在生成回复…' : '正在思考梳理…'),
             taskDetail: buildDshContextDetail(),
-            at: latestMtime
+            at: latestMtime,
+            ...(dshTurnId ? { turnId: dshTurnId } : {})
           };
           this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
           return res;
@@ -2899,7 +3479,8 @@ class AgentMonitor {
           state: 'thinking',
           task: finalTask || '正在整理思路…',
           taskDetail: buildDshContextDetail(),
-          at: latestMtime
+          at: latestMtime,
+          ...(dshTurnId ? { turnId: dshTurnId } : {})
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
         return res;
@@ -2907,12 +3488,65 @@ class AgentMonitor {
 
       if (turnBoundary?.lastStepBoundary?.kind === 'end') {
         if (now - latestMtime < TERMINAL_HOLD_MS) {
+          const dshTurnCount = Array.isArray(turns) ? turns.length : 0;
+          const targetTurn = dshLastTurn || dshTurnCount;
+          const logOutcome = this.readDshTurnOutcome(latestFile, targetTurn);
+          if (logOutcome) {
+            const turnNum = logOutcome.turnNum || targetTurn;
+            const resolvedTurnId = turnNum > 0
+              ? `dsh-turn:${turnNum}`
+              : `dsh-turn:s${logOutcome.startSeq ?? logOutcome.endSeq ?? latestMtime}`;
+            const eventAt = Math.max(Number(logOutcome.endTimeMs) || 0, latestMtime);
+            const turnStartedAtMs = logOutcome.turnStartedAtMs || 0;
+            const outcomeMap = {
+              completed: { state: 'success', task: finalTask || '会话已执行完成', outcome: 'completed', kind: 'dsh_turn_end', detailExtra: [] },
+              interrupted: { state: 'idle', task: finalTask || '会话已中断', outcome: 'aborted', kind: 'dsh_turn_aborted', detailExtra: [] },
+              error: {
+                state: 'error',
+                task: truncate(cleanSummary(logOutcome.errorMessage || finalTask || '执行遇到了问题') || '执行遇到了问题'),
+                outcome: 'failed',
+                kind: 'dsh_turn_error',
+                detailExtra: logOutcome.errorMessage ? [logOutcome.errorMessage] : []
+              }
+            };
+            const mapped = outcomeMap[logOutcome.reasonKind];
+            if (mapped) {
+              const res = {
+                source: 'DSH',
+                state: mapped.state,
+                task: mapped.task,
+                taskDetail: buildDshContextDetail(mapped.detailExtra),
+                at: latestMtime,
+                ...(turnNum > 0 ? { turnId: resolvedTurnId } : {}),
+                ...(turnStartedAtMs > 0 ? { turnStartedAtMs } : {}),
+                completion: makeCompletion({
+                  source: 'DSH',
+                  turnId: resolvedTurnId,
+                  kind: mapped.kind,
+                  outcome: mapped.outcome,
+                  strictTurnEnd: true,
+                  eventAt,
+                  turnStartedAtMs
+                })
+              };
+              this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
+              return res;
+            }
+          }
           const res = {
             source: 'DSH',
             state: 'success',
             task: finalTask || '会话已执行完成',
             taskDetail: buildDshContextDetail(),
-            at: latestMtime
+            at: latestMtime,
+            completion: makeCompletion({
+              source: 'DSH',
+              turnId: `dsh-step:${dshTurnCount}:${latestMtime}`,
+              kind: 'dsh_step_boundary',
+              outcome: 'step_only',
+              strictTurnEnd: false,
+              eventAt: latestMtime
+            })
           };
           this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
           return res;
@@ -3376,6 +4010,24 @@ class AgentMonitor {
         return pendingQuestion;
       }
       const lines = this.readTailLines(latestFile, 131072);
+      const turnLifecycle = inspectCodexTurnLifecycle(lines);
+      const isSupersededTerminal = (lineIdx, entryTs, anchor) => {
+        if (anchor.turnStartedAtMs > 0 && entryTs > 0 && entryTs < anchor.turnStartedAtMs) {
+          return true;
+        }
+        const openTurn = turnLifecycle.latestOpenTurn;
+        if (!openTurn) return false;
+        if (anchor.explicitTurnId && openTurn.turnId && anchor.explicitTurnId !== openTurn.turnId) {
+          return true;
+        }
+        if (openTurn.ts > 0 && entryTs > 0 && entryTs < openTurn.ts) {
+          return true;
+        }
+        if (openTurn.idx > lineIdx) {
+          return true;
+        }
+        return false;
+      };
       let res = null;
       const closedCallIds = new Set();
 
@@ -3388,12 +4040,34 @@ class AgentMonitor {
         if (type === 'event_msg') {
           const kind = String(payload.type || '').toLowerCase();
           if (kind === 'task_complete' || kind === 'turn_complete' || kind === 'turn_aborted') {
+            const parsedEntryTs = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+            const entryTs = (Number.isFinite(parsedEntryTs) && parsedEntryTs > 0) ? parsedEntryTs : latestMtime;
+            const anchor = resolveCodexTurnAnchor(lines, i, latestMtime);
+            if (isSupersededTerminal(i, entryTs, anchor)) {
+              continue;
+            }
             if (now - latestMtime < TERMINAL_HOLD_MS) {
+              const { turnId, turnStartedAtMs } = anchor;
+              const pStatus = String(payload.status ?? payload.outcome ?? payload.result ?? '').trim().toLowerCase();
+              const isAborted = kind === 'turn_aborted'
+                || Boolean(payload.aborted || payload.cancelled || payload.canceled)
+                || ['aborted', 'cancelled', 'canceled', 'interrupted'].includes(pStatus);
+              const isFailed = !isAborted && (Boolean(payload.error || payload.is_error) || ['failed', 'error'].includes(pStatus));
+              const outcome = isAborted ? 'aborted' : (isFailed ? 'failed' : 'completed');
               res = {
                 source: 'Codex',
-                state: 'success',
-                task: '任务已完成',
-                at: latestMtime
+                state: isAborted ? 'idle' : (isFailed ? 'error' : 'success'),
+                task: isAborted ? '任务已中止' : (isFailed ? '任务执行失败' : '任务已完成'),
+                at: latestMtime,
+                completion: makeCompletion({
+                  source: 'Codex',
+                  turnId,
+                  kind,
+                  outcome,
+                  strictTurnEnd: true,
+                  eventAt: entryTs,
+                  turnStartedAtMs
+                })
               };
             }
             break;
@@ -3432,8 +4106,30 @@ class AgentMonitor {
             if (iType === 'agentmessage') {
               const phase = String(item.phase ?? '').trim().toLowerCase();
               if (phase === 'final_answer') {
+                const parsedEntryTs = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+                const entryTs = (Number.isFinite(parsedEntryTs) && parsedEntryTs > 0) ? parsedEntryTs : latestMtime;
+                const anchor = resolveCodexTurnAnchor(lines, i, latestMtime);
+                if (isSupersededTerminal(i, entryTs, anchor)) {
+                  continue;
+                }
                 if (now - latestMtime < TERMINAL_HOLD_MS) {
-                  res = { source: 'Codex', state: 'success', task: '回复已生成完毕', taskDetail: null, at: latestMtime };
+                  const { turnId, turnStartedAtMs } = anchor;
+                  res = {
+                    source: 'Codex',
+                    state: 'success',
+                    task: '回复已生成完毕',
+                    taskDetail: null,
+                    at: latestMtime,
+                    completion: makeCompletion({
+                      source: 'Codex',
+                      turnId,
+                      kind: 'final_answer',
+                      outcome: 'step_only',
+                      strictTurnEnd: false,
+                      eventAt: entryTs,
+                      turnStartedAtMs
+                    })
+                  };
                 }
               } else {
                 res = { source: 'Codex', state: 'thinking', task: '正在汇报进度并继续推进…', taskDetail: null, at: latestMtime };
@@ -3558,13 +4254,29 @@ class AgentMonitor {
               // commentary 进度消息、缺少或无法确认 phase/status 的消息都按普通活动处理，
               // 回合是否结束交给明确的 task_complete / turn_complete 等结束事件判断。
               if (msgPhase === 'final_answer' && msgStatus === 'completed') {
+                const parsedEntryTs = entry.timestamp ? Date.parse(entry.timestamp) : NaN;
+                const entryTs = (Number.isFinite(parsedEntryTs) && parsedEntryTs > 0) ? parsedEntryTs : latestMtime;
+                const anchor = resolveCodexTurnAnchor(lines, i, latestMtime);
+                if (isSupersededTerminal(i, entryTs, anchor)) {
+                  continue;
+                }
                 if (now - latestMtime < TERMINAL_HOLD_MS) {
+                  const { turnId, turnStartedAtMs } = anchor;
                   res = {
                     source: 'Codex',
                     state: 'success',
                     task: '回复已生成完毕',
                     taskDetail: null,
-                    at: latestMtime
+                    at: latestMtime,
+                    completion: makeCompletion({
+                      source: 'Codex',
+                      turnId,
+                      kind: 'final_answer',
+                      outcome: 'step_only',
+                      strictTurnEnd: false,
+                      eventAt: entryTs,
+                      turnStartedAtMs
+                    })
                   };
                 }
                 break;
@@ -3591,6 +4303,10 @@ class AgentMonitor {
           }
         }
       }
+      if (res && !res.completion && turnLifecycle.latestOpenTurn) {
+        if (turnLifecycle.activeTurnId) res.turnId = turnLifecycle.activeTurnId;
+        if (turnLifecycle.activeTurnStartedAtMs > 0) res.turnStartedAtMs = turnLifecycle.activeTurnStartedAtMs;
+      }
       this.codexStateCache.set(latestFile, { mtime: latestMtime, size: latestSize, state: res });
       return refreshDynamicState(res, now, this.stallEnabled, this.stallMs);
     } catch {}
@@ -3608,11 +4324,11 @@ class AgentMonitor {
       const state = this.parseCodexFile(candidate, now);
       if (state && isStateFresh(state, now)) {
         const rawId = path.basename(candidate.file);
-        sessions.push({
+        sessions.push(finalizeSessionCompletion({
           ...state,
           sessionId: rawId,
           rawId
-        });
+        }, 'Codex', rawId));
       }
     }
     if (!sessions.length) return null;
@@ -3624,14 +4340,20 @@ class AgentMonitor {
     if (!best) return null;
 
     best.rawId = best.rawId || best.sessionId;
+    best = finalizeSessionCompletion(best, 'Codex', best.rawId);
     // Keep the selected session as the primary Codex state while exposing
     // every active Codex session for diagnostics and future UI expansion.
     best.sessions = sessions.map(s => ({
       sessionId: truncate(s.task || s.sessionId, 36) || s.sessionId,
       rawId: s.rawId || s.sessionId,
+      sessionKey: `Codex|${s.rawId || s.sessionId}`,
+      source: 'Codex',
       state: s.state,
       task: s.task,
-      at: s.at
+      at: s.at,
+      ...(s.turnId ? { turnId: s.turnId } : {}),
+      ...(s.turnStartedAtMs > 0 ? { turnStartedAtMs: s.turnStartedAtMs } : {}),
+      ...(s.completion ? { completion: s.completion } : {})
     }));
     best.sessionCount = sessions.length;
     return best;
@@ -3746,4 +4468,4 @@ if (isMain) {
   });
 }
 
-export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState, finalizeTaskDetail, redactDetailSecrets, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX };
+export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState, finalizeTaskDetail, redactDetailSecrets, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX, makeCompletion, finalizeSessionCompletion };
