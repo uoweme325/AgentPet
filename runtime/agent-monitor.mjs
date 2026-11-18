@@ -715,7 +715,7 @@ function getRandomText(list) {
 function formatPlanLabel(rawPlan) {
   if (!rawPlan) return null;
   const s = String(rawPlan).trim().toLowerCase();
-  const map = { plus: 'Plus', pro: 'Pro', team: 'Team', enterprise: 'Enterprise', edu: 'Edu', free: 'Free' };
+  const map = { plus: 'Plus', pro: 'Pro', prolite: 'Pro Lite', 'pro lite': 'Pro Lite', promax: 'Pro Max', 'pro max': 'Pro Max', team: 'Team', enterprise: 'Enterprise', edu: 'Edu', free: 'Free' };
   if (map[s]) return map[s];
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
@@ -915,6 +915,57 @@ function resolveCodexCli() {
   return candidates.length > 0 ? candidates[0].file : null;
 }
 
+function parseQuotaWindows(limit, planLabel) {
+  const windows = [];
+  const seenIds = new Set();
+  const entries = Object.entries(limit).filter(([, w]) =>
+    typeof w?.usedPercent === 'number' || typeof w?.used_percent === 'number');
+  const loneProWindow = ['Pro', 'Pro Lite', 'Pro Max'].includes(planLabel) && entries.length === 1;
+  for (const [k, w] of entries) {
+    const duration = typeof w.windowDurationMins === 'number' ? w.windowDurationMins : (typeof w.window_minutes === 'number' ? w.window_minutes : null);
+    const used = typeof w.usedPercent === 'number' ? w.usedPercent : (typeof w.used_percent === 'number' ? w.used_percent : null);
+    const unknownCycle = loneProWindow && k === 'primary' && duration === null;
+    const is5h = duration === 300 || (k === 'primary' && duration === null && !unknownCycle);
+    const isWeek = (duration === 10080 || (k === 'secondary' && duration === null));
+    const id = unknownCycle ? 'unspecified' : is5h ? 'fiveHour' : (isWeek ? 'weekly' : (duration ? `w_${duration}` : `win_${k}`));
+    if (seenIds.has(id)) continue;
+    seenIds.add(id);
+    const label = unknownCycle ? '当前额度' : is5h ? '5h' : (isWeek ? 'Weekly' : (duration ? (duration >= 60 ? `${Math.round(duration / 60)}h` : `${duration}m`) : String(k)));
+    const resetsAt = typeof w.resetsAt === 'number' ? w.resetsAt : (typeof w.resets_at === 'number' ? w.resets_at : null);
+    windows.push({
+      id,
+      label,
+      key: k,
+      minutes: duration,
+      used,
+      usedPercent: used,
+      remaining: Math.max(0, 100 - used),
+      remainingPercent: Math.max(0, 100 - used),
+      resetsAt
+    });
+  }
+  return windows;
+}
+
+function parseCodexRateLimits(r, planType) {
+  const buckets = r?.rateLimitsByLimitId;
+  const single = r?.rateLimits;
+  const legacyCodex = single?.limitId === 'codex' || (!single?.limitId && !Object.keys(buckets ?? {}).length);
+  const limit = buckets?.codex ?? (legacyCodex ? single : null);
+  if (!limit) return null;
+
+  const planLabel = formatPlanLabel(limit.planType || planType);
+  const windows = parseQuotaWindows(limit, planLabel);
+  const count = r.rateLimitResetCredits?.availableCount;
+  return {
+    ok: windows.length > 0,
+    planLabel,
+    resetCardCount: Number.isSafeInteger(count) && count >= 0 ? count : null,
+    observedAt: Date.now(),
+    windows
+  };
+}
+
 function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
   return new Promise(resolve => {
     if (!cliPath || !fs.existsSync(cliPath)) {
@@ -974,45 +1025,7 @@ function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
         send({ id: 3, method: 'account/rateLimits/read', params: {} });
       } else if (m.id === 3) {
         if (m.error) return done(null);
-        const r = m.result;
-        const limit = (r && Object.hasOwn(r, 'rateLimitsByLimitId') && r.rateLimitsByLimitId)
-          ? r.rateLimitsByLimitId.codex
-          : r?.rateLimits;
-        if (!limit) return done(null);
-
-        const windows = [];
-        const seenIds = new Set();
-        for (const [k, w] of Object.entries(limit)) {
-          if (k === 'planType' || !w || typeof w !== 'object') continue;
-          const duration = typeof w.windowDurationMins === 'number' ? w.windowDurationMins : (typeof w.window_minutes === 'number' ? w.window_minutes : null);
-          const used = typeof w.usedPercent === 'number' ? w.usedPercent : (typeof w.used_percent === 'number' ? w.used_percent : null);
-          if (used === null) continue;
-          const is5h = (duration === 300 || (k === 'primary' && duration === null));
-          const isWeek = (duration === 10080 || (k === 'secondary' && duration === null));
-          const id = is5h ? 'fiveHour' : (isWeek ? 'weekly' : (duration ? `w_${duration}` : `win_${k}`));
-          if (seenIds.has(id)) continue;
-          seenIds.add(id);
-          const label = is5h ? '5h' : (isWeek ? 'Weekly' : (duration ? (duration >= 60 ? `${Math.round(duration / 60)}h` : `${duration}m`) : String(k)));
-          const resetsAt = typeof w.resetsAt === 'number' ? w.resetsAt : (typeof w.resets_at === 'number' ? w.resets_at : null);
-          windows.push({
-            id,
-            label,
-            key: k,
-            minutes: duration,
-            used,
-            usedPercent: used,
-            remaining: Math.max(0, 100 - used),
-            remainingPercent: Math.max(0, 100 - used),
-            resetsAt
-          });
-        }
-        const rawPlan = limit.planType || planType || null;
-        done({
-          ok: windows.length > 0,
-          planLabel: formatPlanLabel(rawPlan),
-          observedAt: Date.now(),
-          windows
-        });
+        done(parseCodexRateLimits(m.result, planType));
       }
     });
 
@@ -1349,7 +1362,7 @@ class AgentMonitor {
     const rawStall = options.stallSeconds != null ? Number(options.stallSeconds) : 45;
     this.stallEnabled = Number.isFinite(rawStall) && rawStall > 0;
     this.stallMs = (Number.isFinite(rawStall) && rawStall >= 0 ? rawStall : 45) * 1000;
-    this.lastLivePlanLabel = null;
+    this.lastLiveQuotaAt = 0;
     this.lastDshScanTime = 0;
     this.dshLatestFile = null;
     this.dshSessionCandidates = null;
@@ -2238,14 +2251,8 @@ class AgentMonitor {
       const cli = resolveCodexCli();
       const live = await queryCodexRateLimits(cli);
       if (live && live.ok) {
-        if (live.planLabel) this.lastLivePlanLabel = live.planLabel;
-        this.onChange({
-          type: 'quota',
-          ok: true,
-          planLabel: live.planLabel,
-          observedAt: Math.round(Number(live.observedAt) || Date.now()),
-          windows: live.windows
-        });
+        this.lastLiveQuotaAt = live.observedAt;
+        this.onChange({ type: 'quota', ...live });
         return;
       }
       this.emitFallbackQuota();
@@ -2265,38 +2272,19 @@ class AgentMonitor {
             const e = JSON.parse(lines[i]);
             if (e.payload?.type === 'token_count' && e.payload?.rate_limits) {
               const rl = e.payload.rate_limits;
-              const windows = [];
-              const seenFallbackIds = new Set();
-              for (const [k, w] of Object.entries(rl)) {
-                if (!w || typeof w !== 'object') continue;
-                const duration = typeof w.window_minutes === 'number' ? w.window_minutes : (typeof w.windowDurationMins === 'number' ? w.windowDurationMins : null);
-                const used = typeof w.used_percent === 'number' ? w.used_percent : (typeof w.usedPercent === 'number' ? w.usedPercent : null);
-                if (used === null) continue;
-                const is5h = (duration === 300 || (k === 'primary' && duration === null));
-                const isWeek = (duration === 10080 || (k === 'secondary' && duration === null));
-                const id = is5h ? 'fiveHour' : (isWeek ? 'weekly' : (duration ? `w_${duration}` : `win_${k}`));
-                if (seenFallbackIds.has(id)) continue;
-                seenFallbackIds.add(id);
-                const label = is5h ? '5h' : (isWeek ? 'Weekly' : (duration ? (duration >= 60 ? `${Math.round(duration / 60)}h` : `${duration}m`) : String(k)));
-                const resetsAt = typeof w.resets_at === 'number' ? w.resets_at : (typeof w.resetsAt === 'number' ? w.resetsAt : null);
-                windows.push({
-                  id,
-                  label,
-                  key: k,
-                  minutes: duration,
-                  used,
-                  usedPercent: used,
-                  remaining: Math.max(0, 100 - used),
-                  remainingPercent: Math.max(0, 100 - used),
-                  resetsAt
-                });
-              }
+              const planLabel = formatPlanLabel(rl.plan_type || rl.planType) || '离线快照';
+              const windows = parseQuotaWindows(rl, planLabel);
               if (windows.length > 0) {
+                // File mtime may advance when unrelated events are appended after an account switch.
+                const eventTime = Date.parse(e.timestamp);
+                if (this.lastLiveQuotaAt && (!Number.isFinite(eventTime) || eventTime <= this.lastLiveQuotaAt)) return;
                 this.onChange({
                   type: 'quota',
                   ok: true,
-                  planLabel: (this.lastLivePlanLabel || '离线快照'),
-                  observedAt: Math.round(Number(latest.mtime) || Date.now()),
+                  source: 'offline',
+                  planLabel,
+                  resetCardCount: null,
+                  observedAt: Number.isFinite(eventTime) ? eventTime : Math.round(Number(latest.mtime) || Date.now()),
                   windows
                 });
                 return;
@@ -4468,4 +4456,4 @@ if (isMain) {
   });
 }
 
-export { AgentMonitor, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState, finalizeTaskDetail, redactDetailSecrets, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX, makeCompletion, finalizeSessionCompletion };
+export { AgentMonitor, parseCodexRateLimits, atomicWriteJson, writeJsonWithRetry, flushPendingWrites, dispatchRuntimeWrite, pendingWrites, isStateFresh, refreshDynamicState, isHeldState, finalizeTaskDetail, redactDetailSecrets, DETAIL_MAX_CODE_POINTS, DETAIL_TRUNCATE_SUFFIX, makeCompletion, finalizeSessionCompletion };

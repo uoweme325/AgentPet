@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.4"
+$script:AppVersion = "1.6.5"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -749,6 +749,12 @@ $QuotaPlanBadge   = $Window.FindName("QuotaPlanBadge")
 $QuotaPlanText    = $Window.FindName("QuotaPlanText")
 $QuotaResetNotice = $Window.FindName("QuotaResetNotice")
 $RefreshQuotaBtn  = $Window.FindName("RefreshQuotaBtn")
+$QuotaShortCaption = $Window.FindName("QuotaShortCaption")
+$ShortStubValueColumn = $Window.FindName("ShortStubValueColumn")
+$WeekStubValueColumn = $Window.FindName("WeekStubValueColumn")
+$QuotaResetClock = $Window.FindName("QuotaResetClock")
+$QuotaClockDay = $Window.FindName("QuotaClockDay")
+$QuotaClockTime = $Window.FindName("QuotaClockTime")
 $ShortLabel       = $Window.FindName("ShortLabel")
 $ShortReset       = $Window.FindName("ShortReset")
 $ShortQuotaAlert  = $Window.FindName("ShortQuotaAlert")
@@ -985,6 +991,10 @@ $Themes = @{
         PercentText    = "#FFE6732C"
         TrackBg        = "#FFFFF6EF"
         BarBrush       = "#FFDF6D26"
+        GrantPaper     = "#FFE4D2"
+        GrantInk       = "#C56736"
+        QuotaLow        = "#B55300"
+        QuotaCritical   = "#CF3628"
         BadgeBg        = "#FFFFF5EC"
         BadgeFg        = "#FFDE5B08"
         HoverBg        = "#FFFFEDE0"
@@ -1008,6 +1018,10 @@ $Themes = @{
         PercentText    = "#FF484178"
         TrackBg        = "#FFE8E6F4"
         BarBrush       = "#FF746CB0"
+        GrantPaper     = "#E4DFF1"
+        GrantInk       = "#75679B"
+        QuotaLow        = "#845578"
+        QuotaCritical   = "#8E2F54"
         BadgeBg        = "#FFEEEDF8"
         BadgeFg        = "#FF4E4685"
         HoverBg        = "#FFE6E4F6"
@@ -1031,6 +1045,10 @@ $Themes = @{
         PercentText    = "#FF4B38BF"
         TrackBg        = "#FFEAE6FA"
         BarBrush       = "#FF7462F0"
+        GrantPaper     = "#E8DCFF"
+        GrantInk       = "#875FC8"
+        QuotaLow        = "#8F4C9C"
+        QuotaCritical   = "#A12462"
         BadgeBg        = "#FFEDE9FE"
         BadgeFg        = "#FF5340C9"
         HoverBg        = "#FFEAE2FF"
@@ -1054,6 +1072,10 @@ $Themes = @{
         PercentText    = "#FF1A5294"
         TrackBg        = "#FFDCEBFA"
         BarBrush       = "#FF327AD1"
+        GrantPaper     = "#D6E9FC"
+        GrantInk       = "#4981B8"
+        QuotaLow        = "#74518D"
+        QuotaCritical   = "#9D2448"
         BadgeBg        = "#FFE3EFFC"
         BadgeFg        = "#FF1D5FA7"
         HoverBg        = "#FFDCEBFE"
@@ -1077,6 +1099,10 @@ $Themes = @{
         PercentText    = "#FF253D7D"
         TrackBg        = "#FFDFE5F5"
         BarBrush       = "#FF3F5EB5"
+        GrantPaper     = "#DCE5F9"
+        GrantInk       = "#586EAA"
+        QuotaLow        = "#6C508F"
+        QuotaCritical   = "#86274D"
         BadgeBg        = "#FFE6EBF8"
         BadgeFg        = "#FF2C478E"
         HoverBg        = "#FFDCE3F7"
@@ -1294,7 +1320,8 @@ function Set-DeepSeekThemeColors($t, $accentBrush, $subBrush, $mutedBrush, $body
         } catch {}
     }
     if ($DeepSeekBreakdownText)   { $DeepSeekBreakdownText.Foreground   = $subBrush }
-    if ($DeepSeekGrantText)       { $DeepSeekGrantText.Foreground       = $mutedBrush }
+    $Window.Resources["GrantPaperBrush"] = $BrushConv.ConvertFromString($t.GrantPaper)
+    $Window.Resources["GrantInkBrush"]   = $BrushConv.ConvertFromString($t.GrantInk)
     if ($DeepSeekMsgTitle)        { $DeepSeekMsgTitle.Foreground        = $hdrAccentBrush }
     if ($DeepSeekMsgDetail)       { $DeepSeekMsgDetail.Foreground       = $bodyBrush }
     if ($DeepSeekDivStop0 -and $DeepSeekDivStop1 -and $t.HeaderDivider) {
@@ -1870,6 +1897,8 @@ function Update-FontScale {
     $WorkTask.LineHeight       = [Math]::Ceiling(18.0 * $fs)
     $QuotaHeader.FontSize      = [Math]::Round(12.5 * $fs, 1)
     $QuotaPlanText.FontSize    = [Math]::Round(10.0 * $fs, 1)
+    $QuotaPlanText.MaxWidth    = [Math]::Ceiling(48 * $fs)
+    $QuotaPlanBadge.Margin     = if ($fs -ge 1.15) { [System.Windows.Thickness]::new(0,0,0,2) } else { [System.Windows.Thickness]::new(0) }
     $QuotaResetNotice.FontSize = [Math]::Round(10.0 * $fs, 1)
     $ShortLabel.FontSize       = [Math]::Round(11.5 * $fs, 1)
     $ShortReset.FontSize       = [Math]::Round(10.5 * $fs, 1)
@@ -1882,6 +1911,12 @@ function Update-FontScale {
     if ($WeekQuotaAlert) { $WeekQuotaAlert.FontSize = $alertFontSize }
     # Reserve space for both warning text and percentage without shifting the seam on refresh.
     $QuotaStubColumn.Width = [System.Windows.GridLength]::new(78 + [Math]::Ceiling(45.0 * [Math]::Max(0.0, $fs - 1.0)))
+    # At larger sizes reserve the subscription's natural width before fitting the title.
+    $headerCols = $QuotaPlanBadge.Parent.Parent.ColumnDefinitions
+    $star = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+    $headerCols[1].Width = if ($fs -ge 1.15) { $star } else { [System.Windows.GridLength]::Auto }
+    $headerCols[2].Width = if ($fs -ge 1.15) { [System.Windows.GridLength]::Auto } else { $star }
+    $QuotaResetNotice.MaxWidth = if ($fs -ge 1.15) { $QuotaPlanText.MaxWidth + 8 } else { [double]::PositiveInfinity }
     $metaDock = if ($fs -ge 1.15) { [System.Windows.Controls.Dock]::Top } else { [System.Windows.Controls.Dock]::Left }
     [System.Windows.Controls.DockPanel]::SetDock($QuotaPlanBadge, $metaDock)
     $QuotaPlanBadge.HorizontalAlignment = if ($fs -ge 1.15) { "Right" } else { "Left" }
@@ -4500,6 +4535,8 @@ function Request-AgentPetExit {
 $script:lastShortRemaining = $null
 $script:lastWeekRemaining  = $null
 $script:lastQuotaObject    = $null
+$script:showProResetRow      = $false
+$script:resetCardCount     = $null
 $script:refreshingUntil    = [DateTime]::MinValue
 
 function Format-ResetCountdown([long]$resetsAtEpoch) {
@@ -4533,12 +4570,23 @@ function Update-QuotaColors {
     $t = Get-CurrentTheme
     $normalBar = $BrushConv.ConvertFromString($t.BarBrush)
     $normalPct = $BrushConv.ConvertFromString($t.PercentText)
-    $lowBrush   = $BrushConv.ConvertFromString("#FFB55300")
-    $criticalBrush = $BrushConv.ConvertFromString("#FFCF3628")
+    $lowBrush   = $BrushConv.ConvertFromString($t.QuotaLow)
+    $criticalBrush = $BrushConv.ConvertFromString($t.QuotaCritical)
     foreach ($row in @(
         @{ remaining = $script:lastShortRemaining; label = $ShortLabel; percent = $ShortPercent; value = $ShortPercentValue; bar = $ShortBar; alert = $ShortQuotaAlert }
         @{ remaining = $script:lastWeekRemaining; label = $WeekLabel; percent = $WeekPercent; value = $WeekPercentValue; bar = $WeekBar; alert = $WeekQuotaAlert }
     )) {
+        if ($script:showProResetRow -and $row.percent -eq $ShortPercent) {
+            $count = $script:resetCardCount
+            $ShortQuotaAlert.Visibility = "Collapsed"
+            $ShortQuotaAlert.Text = ""
+            $ShortPercentValue.Text = if ($null -ne $count) { [string]$count } else { "—" }
+            $ShortPercentValue.NextInline.Text = if ($null -ne $count) { " 张" } else { "" }
+            $ShortPercent.Foreground = if ($count -gt 0) { $normalPct } else { $ShortReset.Foreground }
+            $accessibleName = if ($null -ne $count) { "可用重置卡 $count 张" } else { "重置卡张数未提供" }
+            [System.Windows.Automation.AutomationProperties]::SetName($ShortPercent, $accessibleName)
+            continue
+        }
         $level = ""
         $barBrush = $normalBar
         $textBrush = $normalPct
@@ -4577,7 +4625,7 @@ function Apply-QuotaObject($qObj) {
     $script:refreshingUntil = [DateTime]::MinValue
     Set-RefreshButtonBusy $RefreshQuotaBtn $false
     if ($qObj.ok -eq $false) {
-        if ($ShortReset) { $ShortReset.Text = "请求失败" }
+        if ($script:showProResetRow) { $QuotaResetNotice.Text = "请求失败" } elseif ($ShortReset) { $ShortReset.Text = "请求失败" }
         return
     }
     $script:lastQuotaObject = $qObj
@@ -4592,6 +4640,7 @@ function Apply-QuotaObject($qObj) {
         }
         $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
 
+        $QuotaResetNotice.Text = ""
         if ($qObj.observedAt) {
             try {
                 $obs = if ([string]$qObj.observedAt -match '^\d+(\.\d+)?$') {
@@ -4612,6 +4661,17 @@ function Apply-QuotaObject($qObj) {
             }
         }
 
+        if ($qObj.source -eq "offline") { $QuotaResetNotice.Text = "离线快照" }
+        # A successful snapshot replaces both windows, including one absent after an account switch.
+        $script:lastShortRemaining = $null
+        $script:lastWeekRemaining = $null
+        $script:resetCardCount = $null
+        $ShortReset.Text = "未提供"
+        $WeekReset.Text = "未提供"
+        $WeekLabel.Text = "每周"
+        $isPro = $label -in @("Pro", "Pro Lite", "Pro Max", "Prolite", "Promax")
+        $singlePro = $isPro -and @($qObj.windows).Count -eq 1
+        $lowerResetEpoch = 0
         if ($qObj.windows) {
             foreach ($w in $qObj.windows) {
                 $resetsAt = if ($null -ne $w.resetsAt) { [long]$w.resetsAt } else { 0 }
@@ -4625,10 +4685,14 @@ function Apply-QuotaObject($qObj) {
                     $resetText = Format-ResetCountdown $resetsAt
                 }
 
-                if ($w.id -eq "fiveHour" -or $w.label -eq "5h" -or $w.minutes -eq 300) {
+                # Older monitors inferred fiveHour for a lone primary with no duration.
+                $unknownCycle = $singlePro -and ($w.id -eq "unspecified" -or ($w.key -eq "primary" -and $null -eq $w.minutes -and $w.id -eq "fiveHour"))
+                if (-not $unknownCycle -and ($w.id -eq "fiveHour" -or $w.label -eq "5h" -or $w.minutes -eq 300)) {
                     $script:lastShortRemaining = $rem
                     $ShortReset.Text = $resetText
-                } elseif ($w.id -eq "weekly" -or $w.label -eq "Weekly" -or $w.minutes -eq 10080) {
+                } elseif ($unknownCycle -or $w.id -eq "weekly" -or $w.label -eq "Weekly" -or $w.minutes -eq 10080) {
+                    if ($unknownCycle) { $WeekLabel.Text = "当前额度" }
+                    $lowerResetEpoch = $resetsAt
                     $script:lastWeekRemaining = $rem
                     $WeekReset.Text = $resetText
                 } else {
@@ -4638,6 +4702,35 @@ function Apply-QuotaObject($qObj) {
             }
         }
 
+        $script:showProResetRow = $isPro -and
+            $null -eq $script:lastShortRemaining -and $null -ne $script:lastWeekRemaining
+        $showClock = $false
+        if ($script:showProResetRow) {
+            $script:resetCardCount = $qObj.resetCardCount
+            $ShortLabel.Text = "重置卡"
+            $QuotaShortCaption.Text = if ($null -eq $script:resetCardCount) { "张数未提供" } else { "可用张数" }
+            $showClock = $null -eq $script:resetCardCount -and $lowerResetEpoch -gt $nowEpoch
+            if ($showClock) {
+                $localReset = [DateTimeOffset]::FromUnixTimeSeconds($lowerResetEpoch).LocalDateTime
+                $ShortLabel.Text = "下次重置"
+                $QuotaShortCaption.Text = Format-ResetCountdown $lowerResetEpoch
+                $QuotaClockDay.Text = if ($localReset.Date -eq [DateTime]::Today) { "今天" } elseif ($localReset.Date -eq [DateTime]::Today.AddDays(1)) { "明天" } else { $localReset.ToString("MM-dd") }
+                $QuotaClockTime.Text = $localReset.ToString("HH:mm")
+                $WeekReset.Text = "已用 $(100 - $script:lastWeekRemaining)%"
+            }
+        } else {
+            $ShortLabel.Text = "5 小时"
+        }
+        $ShortTrack.Visibility = if ($script:showProResetRow) { "Collapsed" } else { "Visible" }
+        $ShortReset.Visibility = $ShortTrack.Visibility
+        $QuotaShortCaption.Visibility = if ($script:showProResetRow) { "Visible" } else { "Collapsed" }
+        $ShortPercent.Visibility = if ($showClock) { "Collapsed" } else { "Visible" }
+        $QuotaResetClock.Visibility = if ($showClock) { "Visible" } else { "Collapsed" }
+        # Reserve the same number column for both stubs only in the replacement layout.
+        foreach ($column in @($ShortStubValueColumn, $WeekStubValueColumn)) {
+            if ($script:showProResetRow) { $column.SharedSizeGroup = "ProStubNumber" }
+            else { $column.ClearValue([System.Windows.Controls.ColumnDefinition]::SharedSizeGroupProperty) }
+        }
         Update-QuotaColors
     } catch {
         # P1-3: Throttled diagnostic logging for quota apply errors without dumping full object
@@ -4666,14 +4759,18 @@ function Request-QuotaRefresh {
         [System.IO.File]::WriteAllText($RefreshFlagPath, ([DateTimeOffset]::new($now)).ToUnixTimeMilliseconds().ToString(), [System.Text.Encoding]::UTF8)
         $script:refreshingUntil = $now.AddSeconds(14.0)
         Set-RefreshButtonBusy $RefreshQuotaBtn $true
-        if ($ShortReset) {
+        if ($script:showProResetRow) {
+            $QuotaResetNotice.Text = "刷新中..."
+        } elseif ($ShortReset) {
             $ShortReset.Text = "刷新中..."
         }
     } catch {
         Log-Throttled "QuotaRefresh" "写入 Codex 额度刷新标记失败：$($_.Exception.Message)" 30
         $script:refreshingUntil = [DateTime]::MinValue
         Set-RefreshButtonBusy $RefreshQuotaBtn $false
-        if ($ShortReset) {
+        if ($script:showProResetRow) {
+            $QuotaResetNotice.Text = "请求失败"
+        } elseif ($ShortReset) {
             $ShortReset.Text = "请求失败"
         }
     }
@@ -5000,8 +5097,12 @@ function Update-DeepSeekBalanceRatioAndLegend($cnyInfo, [string]$statusKind, [bo
         if ($showPct) {
             $tPct = [int][Math]::Round(($topNum / $sumVal) * 100.0)
             $gPct = [Math]::Max(0, 100 - $tPct)
-            $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance) (${tPct}%)"
-            if ($DeepSeekGrantText) { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance) (${gPct}%)" }
+            $topShare = "${tPct}%"
+            $grantShare = "${gPct}%"
+            if ($topNum -gt 0 -and $topNum / $sumVal -lt 0.01) { $topShare = "<1%"; $grantShare = ">99%" }
+            elseif ($grantNum / $sumVal -lt 0.01) { $grantShare = "<1%"; $topShare = ">99%" }
+            $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance) ($topShare)"
+            if ($DeepSeekGrantText) { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance) ($grantShare)" }
         } else {
             $DeepSeekBreakdownText.Text = "充值 ¥$($cnyInfo.toppedUpBalance)"
             if ($DeepSeekGrantText) { $DeepSeekGrantText.Text = "赠金 ¥$($cnyInfo.grantedBalance)" }
@@ -5020,28 +5121,16 @@ function Update-DeepSeekBalanceRatioAndLegend($cnyInfo, [string]$statusKind, [bo
         if ($DeepSeekGrantLegend) { $DeepSeekGrantLegend.Visibility = [System.Windows.Visibility]::Collapsed }
     }
 
-    if ($BrushConv) {
-        try {
-            if ($DeepSeekGrantDot) {
-                if ($hasGrant -and $grantNum -gt 0.0001) {
-                    $DeepSeekGrantDot.Fill = $DeepSeekGrantBar.Background
-                    $DeepSeekGrantDot.Opacity = 1.0
-                } else {
-                    $mHex = if ($themeObj -and $themeObj.MutedText) { $themeObj.MutedText } else { "#FFA66838" }
-                    $DeepSeekGrantDot.Fill = $BrushConv.ConvertFromString($mHex)
-                    $DeepSeekGrantDot.Opacity = 0.45
-                }
-            }
-            if ($DeepSeekGrantText -and $themeObj) {
-                $txtHex = if ($hasGrant -and $grantNum -gt 0.0001) { $themeObj.SubText } else { $themeObj.MutedText }
-                if ($txtHex) { $DeepSeekGrantText.Foreground = $BrushConv.ConvertFromString($txtHex) }
-            }
-        } catch {}
+    if ($DeepSeekGrantDot) {
+        $DeepSeekGrantDot.Opacity = if ($hasGrant -and $grantNum -gt 0.0001) { 1.0 } else { 0.45 }
     }
 
     if ($DeepSeekFillBar -and $DeepSeekGrantBar -and $DeepSeekToppedUpCol -and $DeepSeekGrantCol) {
+        # One 5-DIP hatch tile plus the gap; the legend still reports the real share.
+        $DeepSeekGrantCol.MinWidth = 0
         if ($sumVal -gt 0.0001 -and $hasTop -and $hasGrant) {
             $hasBothSegs = ($topNum -gt 0.0001 -and $grantNum -gt 0.0001)
+            if ($hasBothSegs) { $DeepSeekGrantCol.MinWidth = 6.5 }
             $DeepSeekToppedUpCol.Width = [System.Windows.GridLength]::new([Math]::Max(0.0, $topNum / $sumVal), [System.Windows.GridUnitType]::Star)
             $DeepSeekGrantCol.Width    = [System.Windows.GridLength]::new([Math]::Max(0.0, $grantNum / $sumVal), [System.Windows.GridUnitType]::Star)
             if ($topNum -gt 0.0001) {

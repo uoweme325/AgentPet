@@ -2165,8 +2165,108 @@ try {
             Measure-AppliedContrast 'DeepSeekStatusNotice' $DeepSeekStatusNotice.Foreground.Color $testGradientStop.Color $testCardColor 4.5
         }
         Measure-AppliedContrast 'DeepSeekFillBar' $DeepSeekFillBar.Background.Color $DeepSeekRatioTrack.Background.Color $testCardColor 3
-        Measure-AppliedContrast 'DeepSeekGrantBar' $DeepSeekGrantBar.Background.Color $DeepSeekRatioTrack.Background.Color $testCardColor 3
+        $hatch = $DeepSeekGrantBar.Background
+        $paper = $hatch.Drawing.Children[0].Brush
+        $ink = $hatch.Drawing.Children[1].Pen.Brush
+        $theme = Get-CurrentTheme
+        if ($hatch.TileMode -ne 'Tile' -or $ink.Color -ne $ColorConv.ConvertFromString($theme.GrantInk) -or
+            $paper.Color -ne $ColorConv.ConvertFromString($theme.GrantPaper) -or $DeepSeekGrantDot.Stroke.Color -ne $ink.Color -or
+            $DeepSeekGrantDot.Fill.Color.A -ne 0 -or $DeepSeekGrantText.Foreground.Color -ne $DeepSeekBreakdownText.Foreground.Color) {
+            throw "Grant texture or legend mismatch for $testRole"
+        }
+        Measure-AppliedContrast 'DeepSeekGrantBar' $ink.Color $DeepSeekRatioTrack.Background.Color $testCardColor 3
+        Measure-AppliedContrast 'DeepSeekGrantHatch' $ink.Color $paper.Color $testCardColor 3
     }
+
+    # The same WPF window must handle sign-in changes without keeping values from the previous account.
+    Set-ActiveBubblePanel 'quota'
+    $next = [DateTimeOffset]::UtcNow.AddHours(3).ToUnixTimeSeconds()
+    $weekly = [pscustomobject]@{ id='weekly'; remaining=42; resetsAt=$next }
+    $plusWeek = [pscustomobject]@{ id='weekly'; remaining=71; resetsAt=($next + 86400) }
+    $short = [pscustomobject]@{ id='fiveHour'; remaining=19; resetsAt=$next }
+    foreach ($fs in @(1.0, 1.4)) {
+        $Config.FontScale = $fs
+        Update-FontScale
+        foreach ($style in @('lineart','embossed')) {
+            $Config.QuotaStampStyle = $style
+            Update-Theme
+            $size = [System.Windows.Size]::new($BubbleBorder.Width, $BubbleBorder.Height)
+            foreach ($count in @(2,0)) {
+                Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Pro';windows=@($weekly);resetCardCount=$count})
+                Update-Theme
+                Pump-Wpf
+                if ($ShortLabel.Text -ne '重置卡' -or $QuotaShortCaption.Text -ne '可用张数' -or
+                    $ShortPercentValue.Text -ne [string]$count -or $ShortPercentValue.NextInline.Text.Trim() -ne '张' -or
+                    $ShortQuotaAlert.IsVisible -or $ShortTrack.IsVisible -or $ShortReset.IsVisible -or $WeekPercentValue.Text -ne '42' -or
+                    -not $shortStamp.IsVisible -or -not $weekStamp.IsVisible) { throw "Pro row did not restore after account switch: $count" }
+                $topX = $shortStamp.TranslatePoint([System.Windows.Point]::new($shortStamp.ActualWidth/2,0),$QuotaPanel).X
+                $weekX = $weekStamp.TranslatePoint([System.Windows.Point]::new($weekStamp.ActualWidth/2,0),$QuotaPanel).X
+                if ([Math]::Abs($topX - $weekX) -gt 0.1 -or $BubbleBorder.Width -ne $size.Width -or $BubbleBorder.Height -ne $size.Height) {
+                    throw "Pro stamp alignment or dimensions changed at $fs"
+                }
+                Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Plus';windows=@($short,$plusWeek)})
+                Pump-Wpf
+                if ($QuotaPlanText.Text -ne 'Plus' -or $ShortLabel.Text -ne '5 小时' -or $ShortPercentValue.Text -ne '19' -or
+                    $ShortPercentValue.NextInline.Text -ne '%' -or $WeekPercentValue.Text -ne '71' -or $WeekReset.Text -ne (Format-ResetCountdown $plusWeek.resetsAt) -or
+                    -not $ShortTrack.IsVisible -or $ShortBar.ActualWidth -le 0 -or
+                    -not $ShortReset.IsVisible -or $ShortReset.Text -notmatch '重置' -or -not $ShortQuotaAlert.IsVisible -or
+                    $QuotaShortCaption.IsVisible -or $QuotaResetClock.IsVisible -or $ShortStubValueColumn.SharedSizeGroup) { throw "Stale Pro row after switching to Plus" }
+            }
+        }
+        Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Pro';windows=@($weekly)})
+        Pump-Wpf
+        if (-not $QuotaResetClock.IsVisible -or $QuotaClockTime.Text -notmatch '^[0-9]{2}:[0-9]{2}$' -or $ShortLabel.Text -ne '下次重置') { throw 'Unknown count must use weekly reset time' }
+        Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Pro';windows=@($short,$weekly);resetCardCount=2})
+        Pump-Wpf
+        if ($QuotaResetClock.IsVisible -or -not $ShortTrack.IsVisible -or $ShortLabel.Text -ne '5 小时') { throw 'A real five-hour limit takes precedence' }
+        Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Plus';windows=@($weekly)})
+        if ($ShortPercentValue.Text -ne '—' -or $ShortReset.Text -ne '未提供') { throw 'Missing Plus window retained a previous account value' }
+        Apply-QuotaObject ([pscustomobject]@{ok=$true;planLabel='Plus';windows=@($short)})
+        if ($WeekPercentValue.Text -ne '—' -or $WeekReset.Text -ne '未提供') { throw 'Missing weekly window retained a previous account value' }
+    }
+    $Config.FontScale = 1.0
+    Update-FontScale
+    Set-TestQuotaRemaining 80 80
+
+    $Config.FontScale = 1.4
+    Update-FontScale
+    foreach ($plan in @('Pro Lite','Pro Max')) {
+        foreach ($win in @(
+            [pscustomobject]@{id='unspecified';remaining=42;resetsAt=$next}
+            [pscustomobject]@{key='primary';id='fiveHour';label='5h';minutes=$null;remaining=42;resetsAt=$next}
+        )) {
+            Apply-QuotaObject ([pscustomobject]@{planLabel=$plan;observedAt=[DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds();windows=@($win);resetCardCount=2})
+            Pump-Wpf
+            $natural = [System.Windows.Controls.TextBlock]::new()
+            foreach ($prop in @('Text','FontSize','FontFamily','FontWeight')) { $natural.$prop = $QuotaPlanText.$prop }
+            $natural.Measure([System.Windows.Size]::new(999,999))
+            if ($QuotaPlanText.ActualWidth + 0.5 -lt $natural.DesiredSize.Width -or $QuotaPlanText.Text -ne $plan -or
+                $ShortLabel.Text -ne '重置卡' -or $ShortPercentValue.Text -ne '2' -or $WeekLabel.Text -ne '当前额度' -or $WeekPercentValue.Text -ne '42') { throw "Clipped plan badge or incorrect unknown-cycle ticket: $plan" }
+        }
+    }
+    Set-TestQuotaRemaining 25 10
+    if ($WeekLabel.Text -ne '每周' -or $ShortLabel.Text -ne '5 小时') { throw 'Period labels must recover after an incomplete Pro snapshot' }
+    foreach ($role in @('claude','dragon','gemini','deepseek','zcode')) {
+        $Config.Character = $role
+        Update-Theme
+        $theme = Get-CurrentTheme
+        foreach ($row in @(@($ShortPercent,$ShortQuotaAlert,$ShortBar,$theme.QuotaLow),@($WeekPercent,$WeekQuotaAlert,$WeekBar,$theme.QuotaCritical))) {
+            $expected = $ColorConv.ConvertFromString($row[3])
+            if ($row[0].Foreground.Color -ne $expected -or $row[1].Foreground.Color -ne $expected -or $row[2].Background.Color -ne $expected) { throw "Quota warning theme mismatch: $role" }
+            Measure-AppliedContrast $row[0].Name $expected $Window.Resources['QuotaStubBrush'].Color $BubbleBorder.Background.Color 4.5
+        }
+    }
+    Set-ActiveBubblePanel 'deepseek'
+    $tiny = [pscustomobject]@{currency='CNY';totalBalance='1000.00';toppedUpBalance='999.99';grantedBalance='0.01'}
+    Update-DeepSeekBalanceRatioAndLegend $tiny 'ok' $false
+    Pump-Wpf
+    if ($DeepSeekGrantBar.ActualWidth -lt 4 -or $DeepSeekGrantText.Text -notlike '*<1%*' -or $DeepSeekBreakdownText.Text -notlike '*>99%*') { throw 'Positive sub-percent grant disappeared' }
+    Update-DeepSeekBalanceRatioAndLegend $zeroGrantBal.balances[0] 'ok' $false
+    if ($DeepSeekGrantCol.MinWidth -ne 0 -or $DeepSeekGrantBar.IsVisible) { throw 'Zero grant retained a minimum segment' }
+    $Config.FontScale = 1
+    Update-FontScale
+    Set-ActiveBubblePanel 'quota'
+    Set-TestQuotaRemaining 80 80
 
     # Case 25b: QuotaStampStyle lineart stamps & Tray <-> WPF 2-option menu sync
     $Config.TrayEnabled = $true

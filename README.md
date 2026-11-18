@@ -30,10 +30,10 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 ## 🚀 下载与使用
 
-前往 [v1.6.4 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.4) 下载：
+前往 [v1.6.5 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.5) 下载：
 
-- **日常使用**：`AgentPet_v1.6.4.zip`
-- **源码与测试**：`AgentPet-v1.6.4-GitHub.zip`
+- **日常使用**：`AgentPet_v1.6.5.zip`
+- **源码与测试**：`AgentPet-v1.6.5-GitHub.zip`
 
 解压后双击 **`启动 AgentPet.bat`**。需要桌面快捷方式时，运行 **`创建桌面快捷方式.bat`**。
 
@@ -44,6 +44,16 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 - 桌宠运行于 Windows，基于 PowerShell 和 WPF。
 - Agent 工作状态监控需要可用的 **Node.js** 运行时。
 - DeepSeek 余额功能需要本机运行 **DeepSeek Harness（DSH）**，并在 DSH 中完成账户或服务商配置。
+
+## 📝 v1.6.5 更新日志
+
+- **Codex 重置卡**。Pro 系列订阅仅返回周额度时，票夹上行显示可用张数。张数未知时可查看下次重置时间。切换到 Plus 后会恢复该账号的五小时和每周额度。
+- **额度告警随角色换色**。五小时和每周额度各自显示「偏低」或「紧张」，百分比、提示和进度条使用同一档颜色。
+- **大字号与不完整数据**。140% 字号下可完整显示 Pro Max 和 Pro Lite。Pro 仅返回一个未标明周期的主窗口时，以「当前额度」显示。
+- **DeepSeek 赠金斜纹**。五个角色都可通过实心段和斜纹段区分充值与赠金。赠金占比不足 1% 时，仍可看到纹理和实际金额。
+- **来源图标**。更新 Codex、Antigravity 和 DeepSeek Harness 的图标，调整余额标题旁的图标对齐。
+
+[查看 v1.6.5 发布说明与校验文件](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.5)
 
 ## 📝 v1.6.4 更新日志
 

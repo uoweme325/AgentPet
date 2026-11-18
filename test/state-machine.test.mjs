@@ -98,12 +98,44 @@ function writeDshFixture(dshDir, name, recordRows, mtimeMs) {
 try {
   const {
     AgentMonitor,
+    parseCodexRateLimits,
     atomicWriteJson,
     writeJsonWithRetry,
     flushPendingWrites,
     dispatchRuntimeWrite,
     pendingWrites
   } = await import('../runtime/agent-monitor.mjs');
+
+  const weekly = { usedPercent: 58, windowDurationMins: 10080 };
+  const fiveHour = { usedPercent: 15, windowDurationMins: 300 };
+  const pro = { planType: 'pro', primary: null, secondary: weekly };
+  const plus = { planType: 'plus', primary: fiveHour, secondary: weekly };
+  for (const [credits, expected] of [
+    [{ availableCount: 2, credits: [] }, 2], [{ availableCount: 0 }, 0],
+    [null, null], [undefined, null], [{ availableCount: -1 }, null], [{ availableCount: 1.5 }, null],
+  ]) {
+    const q = parseCodexRateLimits({ rateLimitsByLimitId: { codex: pro }, rateLimitResetCredits: credits }, 'plus');
+    assert.equal(q.planLabel, 'Pro');
+    assert.equal(q.resetCardCount, expected);
+    assert.deepEqual(q.windows.map(w => w.id), ['weekly']);
+  }
+  for (const plan of ['pro', 'promax', 'prolite']) {
+    const parse = (primary, secondary) => parseCodexRateLimits({
+      rateLimits: { primary, secondary }, rateLimitResetCredits: { availableCount: 2 },
+    }, plan);
+    const missing = parse({ usedPercent: 58 });
+    assert.deepEqual(missing.windows.map(w => [w.id, w.remaining]), [['unspecified', 42]]);
+    assert.equal(missing.resetCardCount, 2);
+    assert.deepEqual(parse(fiveHour).windows.map(w => w.id), ['fiveHour']);
+    assert.deepEqual(parse(weekly).windows.map(w => w.id), ['weekly']);
+    assert.deepEqual(parse({ usedPercent: 17 }, weekly).windows.map(w => w.id), ['fiveHour', 'weekly']);
+  }
+  assert.equal(parseCodexRateLimits({ rateLimits: { primary: { usedPercent: 20 } } }, 'plus').windows[0].id, 'fiveHour');
+  const qPlus = parseCodexRateLimits({ rateLimits: plus, rateLimitsByLimitId: {} }, 'pro');
+  assert.equal(qPlus.planLabel, 'Plus');
+  assert.equal(qPlus.resetCardCount, null);
+  assert.deepEqual(qPlus.windows.map(w => w.id), ['fiveHour', 'weekly']);
+  assert.equal(parseCodexRateLimits({ rateLimitsByLimitId: { other: plus }, rateLimits: plus }), null);
 
   const t0 = 1_793_540_000_000;
 
@@ -1085,6 +1117,28 @@ Write-Output "WO36_VERIFIED_OK"
       // 1 小时前的普通工作扫描仍为空闲
       assert.strictEqual(r1h.m.checkCodex(now0 + 200), null, '1h old session must remain idle for normal work scan');
     }
+
+    const switched = r1m.m;
+    switched.lastLiveQuotaAt = now0;
+    let fallback;
+    switched.onChange = q => { fallback = q; };
+    fs.utimesSync(r1m.f, new Date(), new Date());
+    switched.emitFallbackQuota();
+    assert.equal(fallback, undefined, 'Touching an old rollout must not undo a live account switch');
+    const newer = JSON.parse(fs.readFileSync(r1m.f, 'utf8'));
+    newer.timestamp = new Date(now0 + 1000).toISOString();
+    newer.payload.rate_limits.plan_type = 'plus';
+    fs.appendFileSync(r1m.f, JSON.stringify(newer) + '\n');
+    switched.emitFallbackQuota();
+    assert.equal(fallback.planLabel, 'Plus');
+    assert.equal(fallback.source, 'offline');
+    assert.equal(fallback.resetCardCount, null);
+
+    newer.payload.rate_limits = { plan_type: 'promax', primary: { used_percent: 58 } };
+    fs.appendFileSync(r1m.f, JSON.stringify(newer) + '\n');
+    switched.emitFallbackQuota();
+    assert.equal(fallback.planLabel, 'Pro Max');
+    assert.deepEqual(fallback.windows.map(w => [w.id, w.remaining]), [['unspecified', 42]]);
 
     const r6d = testQuotaAtAge(6 * 86400_000, 'none');
     assert.strictEqual(r6d.firstCount, 1, '6d old quota must emit');
