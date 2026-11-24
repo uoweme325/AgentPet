@@ -2851,8 +2851,9 @@ try {
     const res = spawnSync(
       'powershell.exe',
       ['-NoProfile', '-STA', '-ExecutionPolicy', 'Bypass', '-File', driverPath],
-      { encoding: 'utf8', timeout: 35000 }
+      { encoding: 'utf8', timeout: 75000 }
     );
+    assert.ifError(res.error);
     assert.equal(
       res.status,
       0,

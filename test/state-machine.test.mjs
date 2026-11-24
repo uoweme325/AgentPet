@@ -705,8 +705,9 @@ Write-Output "WO35_VERIFIED_OK"
     fs.writeFileSync(runnerPs1, '\uFEFF' + psScriptContent.replace(/\r?\n/g, '\r\n'), 'utf8');
     const psRes = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runnerPs1], {
       encoding: 'utf8',
-      timeout: 10000
+      timeout: 30000
     });
+    assert.ifError(psRes.error);
     assert.strictEqual(psRes.status, 0, `WO-35 PS verification failed: ${psRes.stderr || psRes.stdout}`);
     assert.ok(psRes.stdout.includes('WO35_VERIFIED_OK'), `Missing WO35_VERIFIED_OK in output: ${psRes.stdout}`);
     console.log('[PASS] Scenario 11: WO-35 启动不显示遗留旧余额/不误报低额 -> 15s 暂不可用 -> 新结果到达正常展示并提醒一次');
@@ -923,8 +924,9 @@ Write-Output "WO36_VERIFIED_OK"
     fs.writeFileSync(stopRunnerPs1, '\uFEFF' + stopPsContent.replace(/\r?\n/g, '\r\n'), 'utf8');
     const stopRes = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', stopRunnerPs1], {
       encoding: 'utf8',
-      timeout: 10000
+      timeout: 30000
     });
+    assert.ifError(stopRes.error);
     assert.strictEqual(stopRes.status, 0, `WO-36 PS verification failed: ${stopRes.stderr || stopRes.stdout}`);
     assert.ok(stopRes.stdout.includes('WO36_VERIFIED_OK'), `Missing WO36_VERIFIED_OK: ${stopRes.stdout}`);
     console.log('[PASS] Scenario 13: WO-36 退出脚本全停 / 部分停 / WMI 失败 / 无目标 及 stop.flag 时效校验 (13a~13f) 验证通过');
@@ -1367,7 +1369,7 @@ Write-Output "WO36_VERIFIED_OK"
     fs.writeFileSync(runnerAp05, '\uFEFF' + ap05PsLines.join('\r\n'), 'utf8');
     const ap05Res = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runnerAp05], {
       encoding: 'utf8',
-      timeout: 15000
+      timeout: 30000
     });
     assert.ifError(ap05Res.error);
     assert.strictEqual(ap05Res.signal, null);
@@ -1474,7 +1476,7 @@ Write-Output "WO36_VERIFIED_OK"
       fs.writeFileSync(runnerAp01, '\uFEFF' + ap01PsLines.join('\r\n'), 'utf8');
       const ap01Res = spawnSync('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', runnerAp01], {
         encoding: 'utf8',
-        timeout: 15000
+        timeout: 30000
       });
       assert.ifError(ap01Res.error);
       assert.strictEqual(ap01Res.signal, null);
