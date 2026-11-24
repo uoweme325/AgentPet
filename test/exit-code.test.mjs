@@ -10,12 +10,14 @@ const testDir = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(testDir, '..');
 const monitorFileUrl = pathToFileURL(path.join(repoRoot, 'runtime', 'agent-monitor.mjs')).href;
 const nodeExe = process.execPath;
+// Keep the parent Node deadline longer than the nested PowerShell deadline.
+const wpfTimeoutMs = 90_000;
 const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agentpet-exitcode-'));
 
 console.log('=== Running Exit Code & Failure Cleanup Regression ===\n');
 
 // 辅助函数：在 os.tmpdir() 隔离目录下写入临时注入脚本并验证退出码与输出（不写仓库目录）
-function runInjectedScenario({ label, baseFile, targetPattern, replacePattern, expectedStatus, expectStderr, forbidStdout }) {
+function runInjectedScenario({ label, baseFile, targetPattern, replacePattern, expectedStatus, expectStderr, forbidStdout, timeout = 30_000 }) {
   console.log(`>> [SCENARIO] ${label}`);
   const baseSrc = fs.readFileSync(path.join(testDir, baseFile), 'utf8');
 
@@ -41,15 +43,16 @@ function runInjectedScenario({ label, baseFile, targetPattern, replacePattern, e
   let res = null;
   try {
     // 先 node --check 确保注入后的代码语法有效（排除语法错误导致的非零退出）
-    const checkRes = spawnSync(nodeExe, ['--check', tmpScript], { encoding: 'utf8' });
+    const checkRes = spawnSync(nodeExe, ['--check', tmpScript], { encoding: 'utf8', timeout: 5_000 });
+    assert.ifError(checkRes.error);
     if (checkRes.status !== 0) {
       throw new Error(`[SYNTAX CHECK FAILED] Injected script syntax is invalid: ${checkRes.stderr}`);
     }
 
-    // 运行故障子进程，限时 30000ms，捕获输出
+    // 运行故障子进程，在场景时限内捕获输出
     res = spawnSync(nodeExe, [tmpScript], {
       encoding: 'utf8',
-      timeout: 30000
+      timeout
     });
   } finally {
     try { if (fs.existsSync(tmpScript)) fs.unlinkSync(tmpScript); } catch {}
@@ -147,6 +150,7 @@ try {
   // 场景 6: state-machine.test.mjs 原样运行与断言失败非零退出
   runInjectedScenario({
     label: '6a. state-machine.test.mjs 原样运行',
+    timeout: 150_000,
     baseFile: 'state-machine.test.mjs',
     expectedStatus: 0,
     forbidStdout: 'FAILURE'
@@ -184,8 +188,9 @@ try {
     console.log('--- Scenario 8a: ui-layout-detail.test.mjs 正常通过零退出 ---');
     const cleanRes = spawnSync(process.execPath, [path.join(testDir, 'ui-layout-detail.test.mjs')], {
       encoding: 'utf8',
-      timeout: 30000
+      timeout: wpfTimeoutMs
     });
+    assert.ifError(cleanRes.error);
     assert.equal(cleanRes.status, 0, `expected status 0, got ${cleanRes.status}: ${cleanRes.stderr}`);
     assert.ok((cleanRes.stdout || '').includes('PASS: ui-layout-detail'), 'missing PASS line in 8a stdout');
     console.log('   [PASS] 8a. ui-layout-detail.test.mjs 原样运行');
@@ -194,10 +199,11 @@ try {
   runInjectedScenario({
     label: '8b. ui-layout-detail.test.mjs 断言失败非零退出',
     baseFile: 'ui-layout-detail.test.mjs',
+    timeout: wpfTimeoutMs,
     targetPattern: "assert.equal(data.detailOnBadgeHover.visible, false, 'hovering inline WorkSourceBadge must NOT open DetailWindow');",
     replacePattern: "assert.equal(data.detailOnBadgeHover.visible, true, 'hovering inline WorkSourceBadge must NOT open DetailWindow');",
     expectedStatus: 1,
-    expectStderr: '[ui-layout-detail.test.mjs FAILURE]',
+    expectStderr: '[ui-layout-detail.test.mjs FAILURE] AssertionError [ERR_ASSERTION]: hovering inline WorkSourceBadge must NOT open DetailWindow',
     forbidStdout: 'PASS: ui-layout-detail'
   });
 

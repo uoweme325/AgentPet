@@ -15,6 +15,13 @@ const tests = [
   path.join(testDir, 'exit-code.test.mjs')
 ];
 
+// Windows suites can launch several PowerShell/Node children sequentially.
+const suiteTimeoutsMs = {
+  'state-machine.test.mjs': 150_000,
+  'ui-layout-detail.test.mjs': 90_000,
+  'exit-code.test.mjs': 720_000
+};
+
 console.log('=== Running AgentPet Test Suite ===');
 let hasFailure = false;
 
@@ -22,12 +29,16 @@ for (const testFile of tests) {
   const relName = path.relative(path.join(testDir, '..'), testFile);
   console.log(`\n>> [RUN] ${relName}`);
 
+  const timeout = suiteTimeoutsMs[path.basename(testFile)] ?? 60_000;
   const res = spawnSync(process.execPath, [testFile], {
     stdio: 'inherit',
-    timeout: 60000
+    timeout
   });
 
-  if (res.error) {
+  if (res.error?.code === 'ETIMEDOUT') {
+    console.error(`>> [TIMEOUT] ${relName} exceeded ${timeout}ms`);
+    hasFailure = true;
+  } else if (res.error) {
     console.error(`>> [ERROR] ${relName} execution failed:`, res.error.message);
     hasFailure = true;
   } else if (res.signal) {
