@@ -42,7 +42,7 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 ### 使用前提
 
 - 桌宠运行于 Windows，基于 PowerShell 和 WPF。
-- Agent 工作状态监控需要可用的 **Node.js** 运行时。
+- Agent 工作状态监控推荐使用 **Node.js 24 LTS**。读取 DSH 的 `.zstd` 压缩会话日志需要 Zstandard 支持。使用 Node.js 22 LTS 时，须为 **22.15.0 或更新的 22.x**。
 - DeepSeek 余额功能需要本机运行 **DeepSeek Harness（DSH）**，并在 DSH 中完成账户或服务商配置。
 
 ### DSH 审批提醒
