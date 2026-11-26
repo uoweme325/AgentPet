@@ -17,7 +17,7 @@ function runWpfLayoutAndDetailSuite() {
   const psBytes = fs.readFileSync(ps1Path);
   assert.equal(psBytes.subarray(0, 3).toString('hex'), 'efbbbf', 'Windows PowerShell needs the script BOM');
   let ps1Source = psBytes.subarray(3).toString('utf8');
-  assert.ok(ps1Source.includes('"Local\\AgentPet_SingleInstance_Mutex_'), 'expected mutex declaration in AgentPet.ps1');
+  assert.ok(ps1Source.includes('"Local\\AgentPet_SingleInstance_Mutex'), 'expected mutex declaration in AgentPet.ps1');
   assert.ok(ps1Source.includes('function Start-AgentMonitor {'), 'expected Start-AgentMonitor in AgentPet.ps1');
   assert.ok(ps1Source.includes('$Window.Add_Loaded({'), 'expected $Window.Add_Loaded in AgentPet.ps1');
 
@@ -50,7 +50,7 @@ function runWpfLayoutAndDetailSuite() {
     );
 
     const uniqueMutex = `Local\\AgentPet_UITest_${process.pid}_${Date.now()}`;
-    ps1Source = ps1Source.replace(/Local\\AgentPet_SingleInstance_Mutex_[^"']+/g, uniqueMutex);
+    ps1Source = ps1Source.replace(/Local\\AgentPet_SingleInstance_Mutex[^"']*/g, uniqueMutex);
 
     const cutIdx = ps1Source.indexOf('$Window.Add_Loaded({');
     assert.ok(cutIdx > 0, 'failed to locate $Window.Add_Loaded cutoff');

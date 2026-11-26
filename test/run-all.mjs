@@ -8,6 +8,7 @@ const tests = [
   path.join(testDir, 'balance-stale.test.mjs'),
   path.join(testDir, 'port-cache.test.mjs'),
   path.join(testDir, 'state-machine.test.mjs'),
+  path.join(testDir, 'dsh-approval.test.mjs'),
   path.join(testDir, 'async-question.test.mjs'),
   path.join(testDir, 'hover-detail.test.mjs'),
   path.join(testDir, 'ui-layout-detail.test.mjs'),

@@ -1,7 +1,7 @@
 ﻿Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Drawing, System.Windows.Forms
 
 $ErrorActionPreference = 'Continue'
-$script:AppVersion = "1.6.5"
+$script:AppVersion = "1.6.6"
 $BaseDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }
 
 # ============================================================================
@@ -82,7 +82,7 @@ $script:MonPidPath = Join-Path (Join-Path $BaseDir "runtime") "monitor.pid"
 $script:InstanceMutex = $null
 $mutexCreated = $false
 try {
-    $script:InstanceMutex = New-Object System.Threading.Mutex($true, "Local\AgentPet_SingleInstance_Mutex_p", [ref]$mutexCreated)
+    $script:InstanceMutex = New-Object System.Threading.Mutex($true, "Local\AgentPet_SingleInstance_Mutex", [ref]$mutexCreated)
 } catch [System.Threading.AbandonedMutexException] {
     Write-PetLog "Previous instance terminated abnormally (abandoned mutex). Ownership acquired."
     $mutexCreated = $true

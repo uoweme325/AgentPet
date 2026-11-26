@@ -82,6 +82,9 @@ process.on('exit', code => {
 const SCAN_MS = 500;
 const ACTIVE_MAX_AGE_MS = 180_000;
 const WAITING_MAX_AGE_MS = 300_000;
+const DSH_APPROVAL_TIMEOUT_MS = 30 * 60_000;
+const DSH_APPROVAL_FUTURE_TOLERANCE_MS = 2000;
+const DSH_ZSTD_TAIL_BYTES = 64 * 1024;
 const TERMINAL_HOLD_MS = 8_000;
 const HANDOFF_MAX_AGE_MS = 15 * 60_000;
 const APPROVAL_INFER_DELAY_MS = 8_000;
@@ -1032,7 +1035,7 @@ function queryCodexRateLimits(cliPath, timeoutMs = 12000) {
     send({
       id: 1,
       method: 'initialize',
-      params: { clientInfo: { name: 'agent_pet', title: 'AgentPet', version: '2.0.0' } }
+      params: { clientInfo: { name: 'agent_pet', title: 'AgentPet', version: '1.6.6' } }
     });
   });
 }
@@ -1238,6 +1241,7 @@ function inspectCodexTurnLifecycle(lines) {
 function isStateFresh(state, now) {
   if (!state || !state.state) return false;
   const age = now - (state.at || 0);
+  if (state.source === 'DSH' && state.state === 'approval') return isDshApprovalFresh(state.at, now);
   if (state.kind === 'handoff') return age < HANDOFF_MAX_AGE_MS;
   if (isHeldState(state)) return age < WAITING_MAX_AGE_MS;
   if (state.state === 'success' || state.state === 'result' || state.state === 'error' || state.state === 'idle') {
@@ -1271,6 +1275,108 @@ function refreshDynamicState(state, now, stallEnabled, stallMs) {
 
 function isHeldState(state) {
   return Boolean(state && (state.inFlight || state.state === 'waiting' || state.state === 'approval' || state.state === 'stalled'));
+}
+
+function dshPendingCalls(rows) {
+  const pending = rows?.sessionStats?.val?.pendingCalls || rows?.pendingCalls?.val;
+  return Object.entries(pending || {}).map(([key, value]) => ({
+    id: value?.callId || value?.id || key, value
+  }));
+}
+
+function isDshApprovalFresh(askedAt, now) {
+  return Number.isFinite(askedAt) && askedAt > 0
+    && askedAt <= now + DSH_APPROVAL_FUTURE_TOLERANCE_MS && now - askedAt < DSH_APPROVAL_TIMEOUT_MS;
+}
+
+function dshZstdFrameStarts(bytes) {
+  const starts = [];
+  let offset = 0;
+  while (offset < bytes.length) {
+    if (offset + 4 > bytes.length) return null;
+    const magic = bytes.readUInt32LE(offset);
+    starts.push(offset);
+    if ((magic & 0xfffffff0) === 0x184d2a50) {
+      if (offset + 8 > bytes.length) return null;
+      offset += 8 + bytes.readUInt32LE(offset + 4);
+    } else {
+      if (magic !== 0xfd2fb528 || offset + 5 > bytes.length) return null;
+      const descriptor = bytes[offset + 4];
+      if (descriptor & 8) return null; // Reserved bit in the frame header.
+      const singleSegment = Boolean(descriptor & 32);
+      const dictionaryBytes = [0, 1, 2, 4][descriptor & 3];
+      const contentSizeBytes = [singleSegment ? 1 : 0, 2, 4, 8][descriptor >>> 6];
+      offset += 5 + (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes;
+      let block;
+      do {
+        if (offset + 3 > bytes.length) return null;
+        block = bytes.readUIntLE(offset, 3);
+        const type = (block >>> 1) & 3;
+        if (type === 3) return null;
+        offset += 3 + (type === 1 ? 1 : block >>> 3);
+      } while (!(block & 1));
+      if (descriptor & 4) offset += 4;
+    }
+    if (offset > bytes.length) return null;
+  }
+  return starts;
+}
+
+function hasCompleteDshTurnStart(bytes) {
+  const marker = '"turn/start"';
+  for (let at = bytes.lastIndexOf(marker); at > 0; at = bytes.lastIndexOf(marker, at - 1)) {
+    const start = bytes.lastIndexOf(10, at - 1);
+    const end = bytes.indexOf(10, at);
+    if (start < 0 || end < 0) continue;
+    try {
+      const event = JSON.parse(bytes.toString('utf8', start + 1, end));
+      if (event.type === 'turn/start' && event.data) return true;
+    } catch {}
+  }
+  return false;
+}
+
+function decodeDshZstdJournal(bytes, fileOffset) {
+  const starts = dshZstdFrameStarts(bytes);
+  if (!starts) return null;
+  const parts = [];
+  let end = bytes.length;
+  for (let index = starts.length - 1; index >= 0;) {
+    let start = starts[index--];
+    while (index >= 0 && end - starts[index] <= DSH_ZSTD_TAIL_BYTES) start = starts[index--];
+    const part = zlib.zstdDecompressSync(bytes.subarray(start, end), { chunkSize: 128 * 1024 });
+    parts.push(part);
+    // A suffix is authoritative only if it contains a complete start of the latest turn.
+    const offset = fileOffset + start;
+    if (offset === 0 || hasCompleteDshTurnStart(part)) {
+      return { decoded: parts.length === 1 ? part : Buffer.concat(parts.reverse()), zstdOffset: offset };
+    }
+    end = start;
+  }
+  return null;
+}
+
+function readDshZstdRange(resolved, offset) {
+  const fd = fs.openSync(resolved.file, 'r');
+  try {
+    const bytes = Buffer.allocUnsafe(resolved.size - offset);
+    let read = 0;
+    while (read < bytes.length) {
+      const count = fs.readSync(fd, bytes, read, bytes.length - read, offset + read);
+      if (!count) return null;
+      read += count;
+    }
+    const stat = fs.fstatSync(fd);
+    if (stat.size !== resolved.size || stat.mtimeMs !== resolved.mtimeMs
+      || stat.ctimeMs !== resolved.ctimeMs || stat.ino !== resolved.ino || stat.dev !== resolved.dev) return null;
+    return bytes;
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function dshCallTime(value) {
+  return Number(value && typeof value === 'object' ? (value.at || value.startTime || value.time) : value);
 }
 
 function isSameProjectMonitor(pid, expectedScriptPath) {
@@ -1374,6 +1480,7 @@ class AgentMonitor {
     this.antigravityDbCache = new Map();
     this.antigravityTranscriptCache = new Map();
     this.dshStateCache = new Map();
+    this.dshDiagnostics = new Set();
     this.dshLogDirCache = new Map();
     this.isProbe = options.isProbe || false;
 
@@ -3086,6 +3193,7 @@ class AgentMonitor {
     const dshDirs = this.paths.dshDirs || resolveDshDirs();
     if (now - this.lastDshSessionScan >= 2000 || this.dshSessionCandidates === null) {
       this.lastDshSessionScan = now;
+      const previousJournals = new Map(this.dshSessionCandidates?.map(({ file, journal }) => [file, journal]));
       const candidates = [];
       for (const dshDir of dshDirs) {
         try {
@@ -3094,7 +3202,19 @@ class AgentMonitor {
             const fp = path.join(dshDir, file);
             try {
               const st = fs.statSync(fp);
-              candidates.push({ file: fp, mtime: st.mtimeMs });
+              const cached = this.dshStateCache.get(fp);
+              const log = this.resolveDshSessionLog(fp);
+              const activeSince = Math.max(st.mtimeMs, log?.mtimeMs || 0);
+              let coldCalls;
+              if (now - activeSince >= DSH_APPROVAL_TIMEOUT_MS && cached?.state?.state !== 'approval') {
+                if (this.dshSessionCandidates !== null) continue;
+                // On startup an old projection is relevant only if its own live call still awaits a decision.
+                coldCalls = dshPendingCalls(JSON.parse(fs.readFileSync(fp, 'utf8')).record?.rows);
+                if (!coldCalls.length) continue;
+              }
+              const journal = this.readDshLogState(fp, previousJournals.get(fp) ?? cached?.journal, log);
+              if (coldCalls && !coldCalls.some(call => call.id === journal?.approval?.callId)) continue;
+              candidates.push({ file: fp, mtime: st.mtimeMs, journal });
             } catch {}
           }
         } catch {}
@@ -3109,12 +3229,16 @@ class AgentMonitor {
       const ageLimit = cachedState === undefined
         ? WAITING_MAX_AGE_MS
         : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
-      if (now - candidate.mtime >= ageLimit) continue;
+      const activityAt = Math.max(candidate.mtime, candidate.journal?.lastTime || 0);
+      const approvalFresh = isDshApprovalFresh(candidate.journal?.approval?.at, now);
+      const approvalWindowChanged = cached && cached.approvalFresh !== approvalFresh;
+      // Only fresh approvals bypass normal aging. Recheck once at either edge of the window.
+      if (now - activityAt >= ageLimit && !approvalFresh && !approvalWindowChanged) continue;
       let rawState = cachedState;
       const needsLogRecheck = this.isPendingDshStepBoundary(cachedState, candidate.mtime, now);
-      if (!cached || cached.mtime !== candidate.mtime || needsLogRecheck) {
-        rawState = this.checkDshSingle(now, candidate.file, candidate.mtime);
-        this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, state: rawState });
+      if (!cached || cached.mtime !== candidate.mtime || cached.journal !== candidate.journal || needsLogRecheck || approvalWindowChanged) {
+        rawState = this.checkDshSingle(now, candidate.file, candidate.mtime, candidate.journal);
+        this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, journal: candidate.journal, state: rawState, approvalFresh });
       }
       const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
@@ -3202,8 +3326,9 @@ class AgentMonitor {
         const ver = m[1] ? parseInt(m[1], 10) : 0;
         const isRaw = !m[2];
         const fp = path.join(targetDir, fn);
-        let mtimeMs = 0;
-        try { mtimeMs = fs.statSync(fp).mtimeMs; } catch { continue; }
+        let stat;
+        try { stat = fs.statSync(fp); } catch { continue; }
+        const mtimeMs = stat.mtimeMs;
         if (
           ver > bestVer
           || (ver === bestVer && (mtimeMs > bestMtime || (mtimeMs === bestMtime && isRaw && !bestRaw)))
@@ -3211,7 +3336,10 @@ class AgentMonitor {
           bestVer = ver;
           bestMtime = mtimeMs;
           bestRaw = isRaw;
-          bestFile = { file: fp, compressed: !isRaw };
+          bestFile = {
+            file: fp, compressed: !isRaw, mtimeMs, size: stat.size,
+            ctimeMs: stat.ctimeMs, ino: stat.ino, dev: stat.dev
+          };
         }
       }
     } catch {
@@ -3220,63 +3348,125 @@ class AgentMonitor {
     return bestFile;
   }
 
-  readDshTurnOutcome(projSessionFile, expectedLastTurn = 0) {
-    const resolved = this.resolveDshSessionLog(projSessionFile);
-    if (!resolved) return null;
-    let text = '';
-    try {
-      if (resolved.compressed) {
-        if (typeof zlib.zstdDecompressSync !== 'function') return null;
-        text = zlib.zstdDecompressSync(fs.readFileSync(resolved.file)).toString('utf8');
-      } else {
-        text = fs.readFileSync(resolved.file, 'utf8');
-      }
-    } catch {
-      return null;
-    }
-    const lines = text.trim().split(/\r?\n/);
-    const targetTurn = Number.isFinite(Number(expectedLastTurn)) && Number(expectedLastTurn) > 0
-      ? Number(expectedLastTurn)
-      : null;
-    let endEntry = null;
-    for (let i = lines.length - 1; i >= 0; i--) {
-      let e;
-      try { e = JSON.parse(lines[i]); } catch { continue; }
-      if (!e || typeof e !== 'object') continue;
-      if (e.type === 'turn/start' || e.type === 'step/start') {
-        if (!endEntry) return null; // Log shows an open turn/step newer than any turn/end
-        if (e.type === 'turn/start' && e.data?.turn === endEntry.data?.turn) {
-          return {
-            turnNum: Number(endEntry.data?.turn ?? targetTurn ?? 0),
-            startSeq: e.seq ?? endEntry.seq,
-            turnStartedAtMs: Number(e.time) || 0,
-            endSeq: endEntry.seq,
-            endTimeMs: Number(endEntry.time) || 0,
-            reasonKind: String(endEntry.data?.reason?.kind || '').toLowerCase(),
-            errorMessage: endEntry.data?.reason?.error?.message ? String(endEntry.data.reason.error.message) : ''
-          };
-        }
-        continue;
-      }
-      if (!endEntry && e.type === 'turn/end') {
-        const eTurn = Number(e.data?.turn ?? 0);
-        if (targetTurn !== null && eTurn !== targetTurn) return null;
-        endEntry = e;
-      }
-    }
-    if (!endEntry) return null;
-    return {
-      turnNum: Number(endEntry.data?.turn ?? targetTurn ?? 0),
-      startSeq: endEntry.seq,
-      turnStartedAtMs: 0,
-      endSeq: endEntry.seq,
-      endTimeMs: Number(endEntry.time) || 0,
-      reasonKind: String(endEntry.data?.reason?.kind || '').toLowerCase(),
-      errorMessage: endEntry.data?.reason?.error?.message ? String(endEntry.data.reason.error.message) : ''
-    };
+  logDshOnce(key, message) {
+    if (this.dshDiagnostics.has(key)) return;
+    if (this.dshDiagnostics.size >= 512) this.dshDiagnostics.delete(this.dshDiagnostics.values().next().value);
+    this.dshDiagnostics.add(key);
+    writeErrorLog(message);
   }
 
-  checkDshSingle(now, forcedFile = null, forcedMtime = 0) {
+  readDshLogState(projSessionFile, previous, resolved = this.resolveDshSessionLog(projSessionFile)) {
+    if (!resolved) return null;
+    const sameFile = previous?.file === resolved.file && previous.ino === resolved.ino && previous.dev === resolved.dev;
+    if (sameFile && previous.mtimeMs === resolved.mtimeMs && previous.size === resolved.size
+      && previous.ctimeMs === resolved.ctimeMs) return previous;
+    if (resolved.compressed && typeof zlib.zstdDecompressSync !== 'function') {
+      this.logDshOnce('zstd-missing', 'DSH: 缺少 zlib.zstdDecompressSync，无法读取压缩会话日志。');
+      return null;
+    }
+    let decoded, zstdOffset = 0;
+    try {
+      if (resolved.compressed) {
+        let tail;
+        if (sameFile && previous.zstdOffset > 0 && resolved.size > previous.size) {
+          const bytes = readDshZstdRange(resolved, previous.zstdOffset);
+          if (bytes) {
+            try { tail = decodeDshZstdJournal(bytes, previous.zstdOffset); } catch {}
+          }
+        }
+        tail ??= decodeDshZstdJournal(fs.readFileSync(resolved.file), 0);
+        if (!tail) return previous || null;
+        ({ decoded, zstdOffset } = tail);
+      } else {
+        decoded = fs.readFileSync(resolved.file);
+      }
+    } catch {
+      // A compressed snapshot may still be in the middle of a write. Retry on the next scan.
+      return previous || null;
+    }
+    const journal = { ...resolved, zstdOffset, lastTime: 0, lastSeq: 0, turnNum: 0, approval: null,
+      hadApproval: false, blockedAt: 0, unattributedAt: 0, hasQuestionCall: false, question: null,
+      resumedCalls: new Map(), nonRunningCalls: new Set(), outcome: null };
+    const decisions = new Map();
+    const results = new Set();
+    let pastStep = false;
+    // Parse the latest turn in reverse so results and decisions are known before their calls.
+    let end = decoded.length;
+    while (end > 0) {
+      const start = decoded.lastIndexOf(10, end - 1) + 1;
+      const line = decoded.toString('utf8', start, end);
+      end = start - 1;
+      if (!/"(?:turn\/(?:start|end)|step\/(?:start|end)|approval\/(?:asked|decided)|tool\/result)"/.test(line)
+        && !(line.includes('"tool/call"') && line.includes('"ask_user_question"'))) continue;
+      let event;
+      try { event = JSON.parse(line); } catch { continue; }
+      const data = event?.data;
+      if (!data) continue;
+      const at = Number(event.time) || 0;
+      journal.lastTime = Math.max(journal.lastTime, at);
+      journal.lastSeq = Math.max(journal.lastSeq, Number(event.seq) || 0);
+      if (event.type === 'turn/start') {
+        journal.turnNum = Number(data.turn) || 0;
+        if (journal.outcome && journal.outcome.turnNum === journal.turnNum) {
+          journal.outcome.startSeq = event.seq;
+          journal.outcome.turnStartedAtMs = at;
+        }
+        break;
+      }
+      if (event.type === 'turn/end') {
+        if (!pastStep && !journal.outcome) {
+          journal.turnNum = Number(data.turn) || 0;
+          const reasonKind = String(data.reason?.kind || '').toLowerCase();
+          journal.outcome = { turnNum: journal.turnNum, startSeq: event.seq, endSeq: event.seq,
+            turnStartedAtMs: 0, endTimeMs: at, reasonKind: reasonKind === 'aborted' ? 'interrupted' : reasonKind,
+            errorMessage: String(data.reason?.error?.message || '') };
+        }
+        pastStep = true;
+      } else if (event.type === 'step/start' || event.type === 'step/end') {
+        pastStep = true;
+      } else if (event.type === 'approval/decided' && data.id && !decisions.has(data.id)) {
+        decisions.set(data.id, { at, outcome: data.outcome });
+      } else if (event.type === 'tool/result') {
+        results.add(data.message?.toolCallId || data.callId);
+      } else if (event.type === 'tool/call' && data.name === 'ask_user_question' && data.callId) {
+        // A question may remain in pendingCalls after its answer while the projection catches up.
+        journal.nonRunningCalls.add(data.callId);
+        if (!pastStep) {
+          journal.hasQuestionCall = true;
+          if (!journal.question && !results.has(data.callId)) {
+            const args = tryParseJsonObject(data.arguments);
+            journal.question = { at, questions: Array.isArray(args?.questions) ? args.questions : [] };
+          }
+        }
+      } else if (event.type === 'approval/asked' && data.id) {
+        journal.hadApproval = true;
+        const decision = decisions.get(data.id);
+        const denied = decision && decision.outcome !== 'allowed-once';
+        if (!pastStep && denied) {
+          journal.blockedAt = Math.max(journal.blockedAt, decision.at);
+          if (!data.callId) journal.unattributedAt = Math.max(journal.unattributedAt, decision.at);
+          if (!['rejected', 'cancelled', 'unavailable', 'denied', 'canceled', 'deny', 'expired'].includes(decision.outcome)) {
+            this.logDshOnce(`outcome:${projSessionFile}:${data.id}`, 'DSH approval: unknown outcome; execution not confirmed.');
+          }
+        }
+        if (pastStep || (data.callId && results.has(data.callId)) || denied) {
+          if (data.callId) journal.nonRunningCalls.add(data.callId);
+        } else if (decision) {
+          if (data.callId) journal.resumedCalls.set(data.callId, Math.max(decision.at, journal.resumedCalls.get(data.callId) || 0));
+        } else {
+          // An outstanding request is not proof that its tool is executing, even after timeout.
+          if (data.callId) journal.nonRunningCalls.add(data.callId);
+          else journal.unattributedAt = Math.max(journal.unattributedAt, at);
+          if (!journal.approval) {
+            journal.approval = { at, id: data.id, callId: data.callId, toolName: data.toolName, reason: finalizeTaskDetail(data.reason) };
+          }
+        }
+      }
+    }
+    return journal;
+  }
+
+  checkDshSingle(now, forcedFile = null, forcedMtime = 0, journal) {
     const dshDirs = this.paths.dshDirs || resolveDshDirs();
     let latestFile = forcedFile;
     let latestMtime = forcedMtime;
@@ -3319,16 +3509,19 @@ class AgentMonitor {
       return null;
     }
 
-    // Fast mtime cache with freshness check (Diagnostics Fix 1)
+    if (journal === undefined) journal = this.readDshLogState(latestFile, this.cachedDshJournal);
     if (
       !forcedFile
       && this.cachedDsh.file === latestFile
       && this.cachedDsh.mtime === latestMtime
+      && this.cachedDshJournal === journal
+      && !(this.cachedDsh.state?.state === 'approval' && !isDshApprovalFresh(this.cachedDsh.state.at, now))
       && !this.isPendingDshStepBoundary(this.cachedDsh.state, latestMtime, now)
     ) {
       return refreshDynamicState(this.cachedDsh.state, now, this.stallEnabled, this.stallMs);
     }
 
+    this.cachedDshJournal = journal;
     try {
       const data = JSON.parse(fs.readFileSync(latestFile, 'utf8'));
       const rows = data.record?.rows || {};
@@ -3337,7 +3530,6 @@ class AgentMonitor {
       const sessionStats = rows.sessionStats?.val;
       const userQuestions = rows.userQuestions?.val;
       const todos = rows.todos?.val;
-      const pendingCalls = sessionStats?.pendingCalls || rows.pendingCalls?.val;
 
       const rawTitle = String(rows.title?.val || '').trim();
       let defaultTask = truncate(rawTitle);
@@ -3347,6 +3539,10 @@ class AgentMonitor {
         ? Number(turnBoundary.lastTurn)
         : 0;
       const dshTurnId = dshLastTurn > 0 ? `dsh-turn:${dshLastTurn}` : '';
+      // The journal and the projection are persisted independently.
+      if ((journal?.turnNum && journal.turnNum < dshLastTurn)
+        || (journal && journal.lastSeq < Number(turnBoundary?.openTurnStartSeq || 0))
+        || (journal && journal.lastSeq < Number(turnBoundary?.lastStepBoundary?.seq || 0))) journal = null;
       if (Array.isArray(turns) && turns.length > 0) {
         rawTurnPrompt = String(turns[turns.length - 1].prompt || '').trim();
         if (!defaultTask) defaultTask = truncate(rawTurnPrompt);
@@ -3372,42 +3568,54 @@ class AgentMonitor {
         return finalizeTaskDetail(merged.join('\n'));
       };
 
-      const hasQuestions = userQuestions?.questions?.active?.length > 0;
-      if (hasQuestions) {
-        const qTexts = userQuestions.questions.active
+      if (journal?.approval && isDshApprovalFresh(journal.approval.at, now)) {
+        const tool = cleanSummary(String(journal.approval.toolName || '工具'));
+        const res = { source: 'DSH', state: 'approval', task: truncate(`请求批准：${tool}`),
+          taskDetail: buildDshContextDetail([journal.approval.reason || tool]),
+          at: journal.approval.at,
+          ...(journal.turnNum ? { turnId: `dsh-turn:${journal.turnNum}` } : {}) };
+        this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
+        return res;
+      }
+      if (journal?.approval?.at > now + DSH_APPROVAL_FUTURE_TOLERANCE_MS) {
+        const ahead = journal.approval.at - now;
+        this.logDshOnce('approval-clock-skew', `DSH approval clock skew: request timestamp is ${ahead} ms ahead of local time.`);
+      } else if (journal?.approval) {
+        this.logDshOnce(`expired:${latestFile}:${journal.approval.id}`, 'DSH approval expired without fresh confirmation.');
+      }
+      const journalOutcome = journal?.outcome;
+      const turnEnded = journalOutcome && (!dshLastTurn || journal.turnNum === dshLastTurn)
+        && (journal.hadApproval || journalOutcome.reasonKind === 'interrupted');
+      const activityAt = journal?.approval ? journal.lastTime
+        : (journal?.hadApproval || turnEnded ? Math.max(latestMtime, journal.lastTime) : latestMtime);
+      const projectedQuestions = userQuestions?.questions?.active;
+      const question = journal?.question;
+      if (!turnEnded && (question || (!journal?.hasQuestionCall && projectedQuestions?.length > 0))) {
+        const qTexts = (question?.questions || projectedQuestions)
           .map(q => formatDetailFieldValue(q?.question || q?.prompt || q?.text || q?.title || q?.header))
           .filter(Boolean);
         const res = {
           source: 'DSH',
           state: 'waiting',
-          task: finalTask || '等待主人答复选择题',
+          task: todoTask || defaultTask || '等待主人答复选择题',
           taskDetail: buildDshContextDetail(qTexts),
-          at: latestMtime
+          at: question?.at || latestMtime
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
         return res;
       }
 
       // Check pendingCalls (Issue 2: filter out raw call_ IDs)
-      let hasPending = false;
-      let toolName = null;
-      let firstPendingCall = null;
-      if (Array.isArray(pendingCalls) && pendingCalls.length > 0) {
-        hasPending = true;
-        firstPendingCall = pendingCalls[0];
-        toolName = firstPendingCall?.name || firstPendingCall?.toolName;
-      } else if (pendingCalls && typeof pendingCalls === 'object') {
-        const keys = Object.keys(pendingCalls);
-        if (keys.length > 0) {
-          hasPending = true;
-          const val = pendingCalls[keys[0]];
-          if (val && typeof val === 'object') {
-            firstPendingCall = val;
-            toolName = val.name || val.toolName;
-          }
+      const calls = dshPendingCalls(rows).filter(call => !journal?.nonRunningCalls.has(call.id)
+        && (!journal?.unattributedAt || dshCallTime(call.value) > journal.unattributedAt));
+      if (journal && journal.lastTime >= latestMtime) {
+        for (const [id, at] of journal.resumedCalls) {
+          if (!journal.nonRunningCalls.has(id) && !calls.some(call => call.id === id)) calls.push({ id, value: at });
         }
       }
-      if (hasPending) {
+      if (calls.length && !turnEnded) {
+        const firstPendingCall = calls[0].value;
+        const toolName = firstPendingCall?.name || firstPendingCall?.toolName;
         const validToolName = (toolName && !/^call_/i.test(toolName)) ? cleanSummary(toolName) : null;
         const cleanRawToolName = (toolName && !/^call_/i.test(String(toolName).trim())) ? String(toolName).trim() : '';
         const callObj = (firstPendingCall && typeof firstPendingCall === 'object') ? firstPendingCall : {};
@@ -3426,8 +3634,9 @@ class AgentMonitor {
         } else if (cleanRawToolName) {
           callLines.push(cleanRawToolName);
         }
-        const values = Array.isArray(pendingCalls) ? pendingCalls : Object.values(pendingCalls || {});
-        const stamps = values.map(v => Number(v && typeof v === 'object' ? (v.at || v.startTime || v.time) : v)).filter(Number.isFinite);
+        const stamps = calls.map(({ id, value }) => {
+          return journal?.resumedCalls.get(id) || dshCallTime(value);
+        }).filter(Number.isFinite);
         const startedAt = stamps.length ? Math.max(...stamps) : latestMtime;
         const ageMs = now - startedAt;
         const stalled = this.stallEnabled && ageMs >= this.stallMs && ageMs < 300000;
@@ -3448,15 +3657,17 @@ class AgentMonitor {
         return res;
       }
 
-      if (turnBoundary?.openTurnStartSeq != null) {
+      if (turnBoundary?.openTurnStartSeq != null && !turnEnded) {
         if (sessionStats?.openStep) {
-          const isGenerating = Boolean(sessionStats.openStep.firstTokenTime);
+          const blockedAt = Math.max(journal?.blockedAt || 0, journal?.approval?.at || 0);
+          const tokenAt = sessionStats.openStep.firstTokenTime;
+          const isGenerating = blockedAt ? Number(tokenAt) > blockedAt : Boolean(tokenAt);
           const res = {
             source: 'DSH',
             state: isGenerating ? 'working' : 'thinking',
             task: finalTask || (isGenerating ? '正在生成回复…' : '正在思考梳理…'),
             taskDetail: buildDshContextDetail(),
-            at: latestMtime,
+            at: activityAt,
             ...(dshTurnId ? { turnId: dshTurnId } : {})
           };
           this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
@@ -3467,18 +3678,18 @@ class AgentMonitor {
           state: 'thinking',
           task: finalTask || '正在整理思路…',
           taskDetail: buildDshContextDetail(),
-          at: latestMtime,
+          at: activityAt,
           ...(dshTurnId ? { turnId: dshTurnId } : {})
         };
         this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
         return res;
       }
 
-      if (turnBoundary?.lastStepBoundary?.kind === 'end') {
-        if (now - latestMtime < TERMINAL_HOLD_MS) {
+      if (turnBoundary?.lastStepBoundary?.kind === 'end' || turnEnded) {
+        if (now - activityAt < TERMINAL_HOLD_MS) {
           const dshTurnCount = Array.isArray(turns) ? turns.length : 0;
           const targetTurn = dshLastTurn || dshTurnCount;
-          const logOutcome = this.readDshTurnOutcome(latestFile, targetTurn);
+          const logOutcome = (!targetTurn || journal?.outcome?.turnNum === targetTurn) ? journal?.outcome : null;
           if (logOutcome) {
             const turnNum = logOutcome.turnNum || targetTurn;
             const resolvedTurnId = turnNum > 0
@@ -3504,7 +3715,7 @@ class AgentMonitor {
                 state: mapped.state,
                 task: mapped.task,
                 taskDetail: buildDshContextDetail(mapped.detailExtra),
-                at: latestMtime,
+                at: eventAt,
                 ...(turnNum > 0 ? { turnId: resolvedTurnId } : {}),
                 ...(turnStartedAtMs > 0 ? { turnStartedAtMs } : {}),
                 completion: makeCompletion({

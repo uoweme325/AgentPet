@@ -30,10 +30,10 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 ## 🚀 下载与使用
 
-前往 [v1.6.5 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.5) 下载：
+前往 [v1.6.6 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.6) 下载：
 
-- **日常使用**：`AgentPet_v1.6.5.zip`
-- **源码与测试**：`AgentPet-v1.6.5-GitHub.zip`
+- **日常使用**：`AgentPet_v1.6.6.zip`
+- **源码与测试**：`AgentPet-v1.6.6-GitHub.zip`
 
 解压后双击 **`启动 AgentPet.bat`**。需要桌面快捷方式时，运行 **`创建桌面快捷方式.bat`**。
 
@@ -44,6 +44,20 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 - 桌宠运行于 Windows，基于 PowerShell 和 WPF。
 - Agent 工作状态监控需要可用的 **Node.js** 运行时。
 - DeepSeek 余额功能需要本机运行 **DeepSeek Harness（DSH）**，并在 DSH 中完成账户或服务商配置。
+
+### DSH 审批提醒
+
+DSH 发出权限请求时，桌宠显示「等待确认」。如果会话一直没有决定或结束事件，提醒会在请求发出 30 分钟后自动收起。这个期限只影响桌宠的提醒，审批本身仍由 DSH 管理。
+
+## 📝 v1.6.6 更新日志
+
+- **DSH 权限审批**。原生审批会显示「等待确认」。允许、拒绝或取消后，桌宠按实际进度更新。停止并归档的回合按中止收尾，过期审批会让出气泡。
+- **DSH 普通选择题**。原生提问会显示「等待回答」，提交选项后解除等待。
+- **DSH 压缩日志**。按 Zstandard 独立帧读取当前回合。连续追加时复用已验证的帧偏移，减少读取及解压量，保留原有扫描周期。
+- **审批提醒期限**。没有决定或结束事件时，桌宠提示在 30 分钟后收起。DSH 继续管理审批本身。
+- **启动与回归**。统一桌宠的单实例锁名，更新 Codex 额度查询的客户端版本标识。新增 Windows 自动回归，调整测试超时预算，并加入 DSH 专项用例。
+
+[查看 v1.6.6 发布说明与校验文件](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.6)
 
 ## 📝 v1.6.5 更新日志
 
