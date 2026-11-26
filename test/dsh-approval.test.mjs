@@ -235,6 +235,20 @@ function replay(format) {
   assert.notEqual(monitor.checkDsh(now - 2001)?.state, 'approval');
   assert.equal(countClockWarnings(), beforeSkew + 1, 'future-dated approval is diagnosed once');
   assert.equal(monitor.checkDsh(now - 2000)?.state, 'approval', 'clock catch-up releases the cached approval without a new file write');
+
+  now += 2100;
+  writeProjection(15, { call_valid: now, call_future: now });
+  append('turn/start', { turn: 15 });
+  append('step/start', { turn: 15, step: 1 });
+  append('approval/asked', { id: 'valid', callId: 'call_valid', toolName: 'read' });
+  now += 5000;
+  append('approval/asked', { id: 'future', callId: 'call_future', toolName: 'write' });
+  assert.match(monitor.checkDsh(now - 2001)?.task ?? '', /read/, 'a future request must not mask a valid approval in the same step');
+  assert.match(monitor.checkDsh(now - 2000)?.task ?? '', /write/, 'the selected approval can switch between valid requests without a new file write');
+  append('approval/decided', { id: 'future', outcome: 'rejected' });
+  assert.match(monitor.checkDsh(now + 2100)?.task ?? '', /read/, 'rejecting one request leaves the other approval visible');
+  append('approval/decided', { id: 'valid', outcome: 'rejected' });
+  assert.equal(monitor.checkDsh(now + 4200)?.state, 'thinking', 'rejecting both requests ends approval without a false running state');
   console.log('[PASS] DSH approval lifecycle (' + format + ')');
 }
 

@@ -1289,6 +1289,10 @@ function isDshApprovalFresh(askedAt, now) {
     && askedAt <= now + DSH_APPROVAL_FUTURE_TOLERANCE_MS && now - askedAt < DSH_APPROVAL_TIMEOUT_MS;
 }
 
+function findFreshDshApproval(journal, now) {
+  return journal?.approvals.find(approval => isDshApprovalFresh(approval.at, now)) ?? null;
+}
+
 function dshZstdFrameStarts(bytes) {
   const starts = [];
   let offset = 0;
@@ -3213,7 +3217,7 @@ class AgentMonitor {
                 if (!coldCalls.length) continue;
               }
               const journal = this.readDshLogState(fp, previousJournals.get(fp) ?? cached?.journal, log);
-              if (coldCalls && !coldCalls.some(call => call.id === journal?.approval?.callId)) continue;
+              if (coldCalls && !journal?.approvals.some(approval => coldCalls.some(call => call.id === approval.callId))) continue;
               candidates.push({ file: fp, mtime: st.mtimeMs, journal });
             } catch {}
           }
@@ -3230,15 +3234,15 @@ class AgentMonitor {
         ? WAITING_MAX_AGE_MS
         : (isHeldState(cachedState) ? WAITING_MAX_AGE_MS : ACTIVE_MAX_AGE_MS);
       const activityAt = Math.max(candidate.mtime, candidate.journal?.lastTime || 0);
-      const approvalFresh = isDshApprovalFresh(candidate.journal?.approval?.at, now);
-      const approvalWindowChanged = cached && cached.approvalFresh !== approvalFresh;
-      // Only fresh approvals bypass normal aging. Recheck once at either edge of the window.
-      if (now - activityAt >= ageLimit && !approvalFresh && !approvalWindowChanged) continue;
+      const approval = findFreshDshApproval(candidate.journal, now);
+      const approvalChanged = cached && cached.approval !== approval;
+      // Recheck the selection when the clock enters or leaves any request's valid window.
+      if (now - activityAt >= ageLimit && !approval && !approvalChanged) continue;
       let rawState = cachedState;
       const needsLogRecheck = this.isPendingDshStepBoundary(cachedState, candidate.mtime, now);
-      if (!cached || cached.mtime !== candidate.mtime || cached.journal !== candidate.journal || needsLogRecheck || approvalWindowChanged) {
+      if (!cached || cached.mtime !== candidate.mtime || cached.journal !== candidate.journal || needsLogRecheck || approvalChanged) {
         rawState = this.checkDshSingle(now, candidate.file, candidate.mtime, candidate.journal);
-        this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, journal: candidate.journal, state: rawState, approvalFresh });
+        this.dshStateCache.set(candidate.file, { mtime: candidate.mtime, journal: candidate.journal, state: rawState, approval });
       }
       const state = refreshDynamicState(rawState, now, this.stallEnabled, this.stallMs);
       if (state && isStateFresh(state, now)) {
@@ -3384,7 +3388,7 @@ class AgentMonitor {
       // A compressed snapshot may still be in the middle of a write. Retry on the next scan.
       return previous || null;
     }
-    const journal = { ...resolved, zstdOffset, lastTime: 0, lastSeq: 0, turnNum: 0, approval: null,
+    const journal = { ...resolved, zstdOffset, lastTime: 0, lastSeq: 0, turnNum: 0, approvals: [],
       hadApproval: false, blockedAt: 0, unattributedAt: 0, hasQuestionCall: false, question: null,
       resumedCalls: new Map(), nonRunningCalls: new Set(), outcome: null };
     const decisions = new Map();
@@ -3402,7 +3406,8 @@ class AgentMonitor {
       try { event = JSON.parse(line); } catch { continue; }
       const data = event?.data;
       if (!data) continue;
-      const at = Number(event.time) || 0;
+      const timestamp = Number(event.time);
+      const at = Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
       journal.lastTime = Math.max(journal.lastTime, at);
       journal.lastSeq = Math.max(journal.lastSeq, Number(event.seq) || 0);
       if (event.type === 'turn/start') {
@@ -3457,9 +3462,9 @@ class AgentMonitor {
           // An outstanding request is not proof that its tool is executing, even after timeout.
           if (data.callId) journal.nonRunningCalls.add(data.callId);
           else journal.unattributedAt = Math.max(journal.unattributedAt, at);
-          if (!journal.approval) {
-            journal.approval = { at, id: data.id, callId: data.callId, toolName: data.toolName, reason: finalizeTaskDetail(data.reason) };
-          }
+          journal.approvals.push({
+            at, id: data.id, callId: data.callId, toolName: data.toolName, reason: finalizeTaskDetail(data.reason)
+          });
         }
       }
     }
@@ -3515,7 +3520,7 @@ class AgentMonitor {
       && this.cachedDsh.file === latestFile
       && this.cachedDsh.mtime === latestMtime
       && this.cachedDshJournal === journal
-      && !(this.cachedDsh.state?.state === 'approval' && !isDshApprovalFresh(this.cachedDsh.state.at, now))
+      && (this.cachedDsh.approval ?? null) === findFreshDshApproval(journal, now)
       && !this.isPendingDshStepBoundary(this.cachedDsh.state, latestMtime, now)
     ) {
       return refreshDynamicState(this.cachedDsh.state, now, this.stallEnabled, this.stallMs);
@@ -3568,25 +3573,29 @@ class AgentMonitor {
         return finalizeTaskDetail(merged.join('\n'));
       };
 
-      if (journal?.approval && isDshApprovalFresh(journal.approval.at, now)) {
-        const tool = cleanSummary(String(journal.approval.toolName || '工具'));
+      for (const request of journal?.approvals ?? []) {
+        if (request.at > now + DSH_APPROVAL_FUTURE_TOLERANCE_MS) {
+          const ahead = request.at - now;
+          this.logDshOnce('approval-clock-skew', `DSH approval clock skew: request timestamp is ${ahead} ms ahead of local time.`);
+        } else if (!isDshApprovalFresh(request.at, now)) {
+          this.logDshOnce(`expired:${latestFile}:${request.id}`, 'DSH approval expired without fresh confirmation.');
+        }
+      }
+      const approval = findFreshDshApproval(journal, now);
+      if (approval) {
+        const tool = cleanSummary(String(approval.toolName || '工具'));
         const res = { source: 'DSH', state: 'approval', task: truncate(`请求批准：${tool}`),
-          taskDetail: buildDshContextDetail([journal.approval.reason || tool]),
-          at: journal.approval.at,
+          taskDetail: buildDshContextDetail([approval.reason || tool]),
+          at: approval.at,
           ...(journal.turnNum ? { turnId: `dsh-turn:${journal.turnNum}` } : {}) };
-        this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res };
+        this.cachedDsh = { file: latestFile, mtime: latestMtime, state: res, approval };
         return res;
       }
-      if (journal?.approval?.at > now + DSH_APPROVAL_FUTURE_TOLERANCE_MS) {
-        const ahead = journal.approval.at - now;
-        this.logDshOnce('approval-clock-skew', `DSH approval clock skew: request timestamp is ${ahead} ms ahead of local time.`);
-      } else if (journal?.approval) {
-        this.logDshOnce(`expired:${latestFile}:${journal.approval.id}`, 'DSH approval expired without fresh confirmation.');
-      }
+      const lastPendingApproval = journal?.approvals[0];
       const journalOutcome = journal?.outcome;
       const turnEnded = journalOutcome && (!dshLastTurn || journal.turnNum === dshLastTurn)
         && (journal.hadApproval || journalOutcome.reasonKind === 'interrupted');
-      const activityAt = journal?.approval ? journal.lastTime
+      const activityAt = lastPendingApproval ? journal.lastTime
         : (journal?.hadApproval || turnEnded ? Math.max(latestMtime, journal.lastTime) : latestMtime);
       const projectedQuestions = userQuestions?.questions?.active;
       const question = journal?.question;
@@ -3659,7 +3668,7 @@ class AgentMonitor {
 
       if (turnBoundary?.openTurnStartSeq != null && !turnEnded) {
         if (sessionStats?.openStep) {
-          const blockedAt = Math.max(journal?.blockedAt || 0, journal?.approval?.at || 0);
+          const blockedAt = Math.max(journal?.blockedAt || 0, lastPendingApproval?.at || 0);
           const tokenAt = sessionStats.openStep.firstTokenTime;
           const isGenerating = blockedAt ? Number(tokenAt) > blockedAt : Boolean(tokenAt);
           const res = {

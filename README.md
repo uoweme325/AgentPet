@@ -30,10 +30,10 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 
 ## 🚀 下载与使用
 
-前往 [v1.6.6 发布页面](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.6) 下载：
+前往 [v1.6.6 发布页](https://github.com/uoweme325/AgentPet/releases/tag/v1.6.6) 下载合并版：
 
-- **日常使用**：`AgentPet_v1.6.6.zip`
-- **源码与测试**：`AgentPet-v1.6.6-GitHub.zip`
+- **日常使用**：[Windows 便携版](https://github.com/uoweme325/AgentPet/releases/download/v1.6.6/AgentPet_v1.6.6-merged.zip)
+- **源码与测试**：[合并版源码包](https://github.com/uoweme325/AgentPet/releases/download/v1.6.6/AgentPet-v1.6.6-merged-GitHub.zip)
 
 解压后双击 **`启动 AgentPet.bat`**。需要桌面快捷方式时，运行 **`创建桌面快捷方式.bat`**。
 
@@ -48,6 +48,12 @@ AgentPet 是一款 Windows 桌宠，支持联动 **Antigravity（反重力）、
 ### DSH 审批提醒
 
 DSH 发出权限请求时，桌宠显示「等待确认」。如果会话一直没有决定或结束事件，提醒会在请求发出 30 分钟后自动收起。这个期限只影响桌宠的提醒，审批本身仍由 DSH 管理。
+
+## 📝 v1.6.6 合并更新
+
+- 同一 DSH 会话有多条未决审批时，会逐条判断时间戳。超前的请求不会遮住仍有效的审批，处理其中一条后仍会提示其余有效审批。
+- 使用说明明确推荐 Node.js 24 LTS。使用 Node.js 22 LTS 读取 DSH 压缩日志时需要 22.15.0 或更新的 22.x。
+- 源码包包含新增的并发审批回归，Windows 测试沿用各套件的超时设置。
 
 ## 📝 v1.6.6 更新日志
 
