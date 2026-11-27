@@ -11,6 +11,7 @@ const tests = [
   path.join(testDir, 'dsh-approval.test.mjs'),
   path.join(testDir, 'async-question.test.mjs'),
   path.join(testDir, 'hover-detail.test.mjs'),
+  path.join(testDir, 'single-instance.test.ps1'),
   path.join(testDir, 'ui-layout-detail.test.mjs'),
   path.join(testDir, 'task-complete-sound.test.mjs'),
   path.join(testDir, 'exit-code.test.mjs')
@@ -31,7 +32,10 @@ for (const testFile of tests) {
   console.log(`\n>> [RUN] ${relName}`);
 
   const timeout = suiteTimeoutsMs[path.basename(testFile)] ?? 60_000;
-  const res = spawnSync(process.execPath, [testFile], {
+  const isPowerShell = path.extname(testFile) === '.ps1';
+  const command = isPowerShell ? 'powershell.exe' : process.execPath;
+  const args = isPowerShell ? ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', testFile] : [testFile];
+  const res = spawnSync(command, args, {
     stdio: 'inherit',
     timeout
   });

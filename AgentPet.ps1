@@ -79,19 +79,25 @@ $script:MonPidPath = Join-Path (Join-Path $BaseDir "runtime") "monitor.pid"
 # ============================================================================
 # 1. Single-Instance Named Mutex Guard (Issue 8 & DeepSeek Review Fix)
 # ============================================================================
-$script:InstanceMutex = $null
+# Both published lock names must stay open until shutdown has finished cleaning the runtime files.
+$script:InstanceMutexes = @()
 $mutexCreated = $false
 try {
-    $script:InstanceMutex = New-Object System.Threading.Mutex($true, "Local\AgentPet_SingleInstance_Mutex", [ref]$mutexCreated)
-} catch [System.Threading.AbandonedMutexException] {
-    Write-PetLog "Previous instance terminated abnormally (abandoned mutex). Ownership acquired."
-    $mutexCreated = $true
+    foreach ($name in @("Local\AgentPet_SingleInstance_Mutex", "Local\AgentPet_SingleInstance_Mutex_p")) {
+        $mutexCreated = $false
+        $handle = [System.Threading.Mutex]::new($false, $name, [ref]$mutexCreated)
+        $script:InstanceMutexes += $handle
+        if (-not $mutexCreated) { break }
+    }
 } catch {
-    Write-PetLog "Mutex error: $($_.Exception.Message). Continuing startup as single instance."
-    $mutexCreated = $true
+    foreach ($handle in $script:InstanceMutexes) { $handle.Dispose() }
+    Write-PetLog "Unable to establish the single-instance guard: $($_.Exception.Message)"
+    [System.Windows.Forms.MessageBox]::Show("无法检查桌宠是否已经启动，请查看运行日志。", "AgentPet 提示") | Out-Null
+    exit 1
 }
 
 if (-not $mutexCreated) {
+    foreach ($handle in $script:InstanceMutexes) { $handle.Dispose() }
     Write-PetLog "Another active instance is currently running. Signaling wake.flag..."
     $wakeFlag = Join-Path $BaseDir "wake.flag"
     try { [System.IO.File]::WriteAllText($wakeFlag, [DateTime]::UtcNow.Ticks.ToString()) } catch {}
@@ -7897,12 +7903,6 @@ $Window.Add_Closed({
         if ($script:TrayIconBitmap) { try { $script:TrayIconBitmap.Dispose() } catch {}; $script:TrayIconBitmap = $null }
         if ($script:TrayIconHandle -ne [IntPtr]::Zero) { try { [AgentPetNative]::DestroyIcon($script:TrayIconHandle) } catch {}; $script:TrayIconHandle = [IntPtr]::Zero }
     } catch {}
-    try {
-        if ($script:InstanceMutex) {
-            $script:InstanceMutex.ReleaseMutex()
-            $script:InstanceMutex.Dispose()
-        }
-    } catch {}
     # P0-1: Wait and confirm monitor termination before cleaning PID files
     if ($script:MonitorProc -and (-not $script:MonitorProc.HasExited)) {
         try {
@@ -7933,6 +7933,7 @@ $Window.Add_Closed({
             Remove-Item $script:AppPidPath -Force -ErrorAction SilentlyContinue
         }
     } catch {}
+    foreach ($handle in $script:InstanceMutexes) { $handle.Dispose() }
     Write-PetLog "Window Closed event completed."
 })
 

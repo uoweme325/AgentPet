@@ -1241,6 +1241,7 @@ function inspectCodexTurnLifecycle(lines) {
 function isStateFresh(state, now) {
   if (!state || !state.state) return false;
   const age = now - (state.at || 0);
+  if (state.source === 'DSH' && age < -DSH_APPROVAL_FUTURE_TOLERANCE_MS) return false;
   if (state.source === 'DSH' && state.state === 'approval') return isDshApprovalFresh(state.at, now);
   if (state.kind === 'handoff') return age < HANDOFF_MAX_AGE_MS;
   if (isHeldState(state)) return age < WAITING_MAX_AGE_MS;
@@ -3195,7 +3196,7 @@ class AgentMonitor {
 
   checkDsh(now) {
     const dshDirs = this.paths.dshDirs || resolveDshDirs();
-    if (now - this.lastDshSessionScan >= 2000 || this.dshSessionCandidates === null) {
+    if (now < this.lastDshSessionScan || now - this.lastDshSessionScan >= 2000 || this.dshSessionCandidates === null) {
       this.lastDshSessionScan = now;
       const previousJournals = new Map(this.dshSessionCandidates?.map(({ file, journal }) => [file, journal]));
       const candidates = [];
@@ -3216,7 +3217,7 @@ class AgentMonitor {
                 coldCalls = dshPendingCalls(JSON.parse(fs.readFileSync(fp, 'utf8')).record?.rows);
                 if (!coldCalls.length) continue;
               }
-              const journal = this.readDshLogState(fp, previousJournals.get(fp) ?? cached?.journal, log);
+              const journal = this.readDshLogState(fp, previousJournals.get(fp) ?? cached?.journal, log, now);
               if (coldCalls && !journal?.approvals.some(approval => coldCalls.some(call => call.id === approval.callId))) continue;
               candidates.push({ file: fp, mtime: st.mtimeMs, journal });
             } catch {}
@@ -3359,7 +3360,7 @@ class AgentMonitor {
     writeErrorLog(message);
   }
 
-  readDshLogState(projSessionFile, previous, resolved = this.resolveDshSessionLog(projSessionFile)) {
+  readDshLogState(projSessionFile, previous, resolved = this.resolveDshSessionLog(projSessionFile), now = Date.now()) {
     if (!resolved) return null;
     const sameFile = previous?.file === resolved.file && previous.ino === resolved.ino && previous.dev === resolved.dev;
     if (sameFile && previous.mtimeMs === resolved.mtimeMs && previous.size === resolved.size
@@ -3407,7 +3408,9 @@ class AgentMonitor {
       const data = event?.data;
       if (!data) continue;
       const timestamp = Number(event.time);
-      const at = Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
+      const rawAt = Number.isFinite(timestamp) && timestamp > 0 ? timestamp : 0;
+      // Keep the original request time for the approval window, never for ranking unrelated work.
+      const at = rawAt <= now + DSH_APPROVAL_FUTURE_TOLERANCE_MS ? rawAt : 0;
       journal.lastTime = Math.max(journal.lastTime, at);
       journal.lastSeq = Math.max(journal.lastSeq, Number(event.seq) || 0);
       if (event.type === 'turn/start') {
@@ -3430,7 +3433,10 @@ class AgentMonitor {
       } else if (event.type === 'step/start' || event.type === 'step/end') {
         pastStep = true;
       } else if (event.type === 'approval/decided' && data.id && !decisions.has(data.id)) {
-        decisions.set(data.id, { at, outcome: data.outcome });
+        // A decision is still authoritative if the producer clock is skewed.
+        const decisionAt = at || (resolved.mtimeMs <= now + DSH_APPROVAL_FUTURE_TOLERANCE_MS ? resolved.mtimeMs : 0);
+        decisions.set(data.id, { at: decisionAt, outcome: data.outcome });
+        journal.lastTime = Math.max(journal.lastTime, decisionAt);
       } else if (event.type === 'tool/result') {
         results.add(data.message?.toolCallId || data.callId);
       } else if (event.type === 'tool/call' && data.name === 'ask_user_question' && data.callId) {
@@ -3463,7 +3469,7 @@ class AgentMonitor {
           if (data.callId) journal.nonRunningCalls.add(data.callId);
           else journal.unattributedAt = Math.max(journal.unattributedAt, at);
           journal.approvals.push({
-            at, id: data.id, callId: data.callId, toolName: data.toolName, reason: finalizeTaskDetail(data.reason)
+            at: rawAt, id: data.id, callId: data.callId, toolName: data.toolName, reason: finalizeTaskDetail(data.reason)
           });
         }
       }
@@ -3514,7 +3520,7 @@ class AgentMonitor {
       return null;
     }
 
-    if (journal === undefined) journal = this.readDshLogState(latestFile, this.cachedDshJournal);
+    if (journal === undefined) journal = this.readDshLogState(latestFile, this.cachedDshJournal, undefined, now);
     if (
       !forcedFile
       && this.cachedDsh.file === latestFile
@@ -3595,7 +3601,7 @@ class AgentMonitor {
       const journalOutcome = journal?.outcome;
       const turnEnded = journalOutcome && (!dshLastTurn || journal.turnNum === dshLastTurn)
         && (journal.hadApproval || journalOutcome.reasonKind === 'interrupted');
-      const activityAt = lastPendingApproval ? journal.lastTime
+      const activityAt = lastPendingApproval ? (journal.lastTime || latestMtime)
         : (journal?.hadApproval || turnEnded ? Math.max(latestMtime, journal.lastTime) : latestMtime);
       const projectedQuestions = userQuestions?.questions?.active;
       const question = journal?.question;
@@ -3668,7 +3674,9 @@ class AgentMonitor {
 
       if (turnBoundary?.openTurnStartSeq != null && !turnEnded) {
         if (sessionStats?.openStep) {
-          const blockedAt = Math.max(journal?.blockedAt || 0, lastPendingApproval?.at || 0);
+          const requestAt = lastPendingApproval?.at || 0;
+          const blockedAt = Math.max(journal?.blockedAt || 0,
+            requestAt <= now + DSH_APPROVAL_FUTURE_TOLERANCE_MS ? requestAt : activityAt);
           const tokenAt = sessionStats.openStep.firstTokenTime;
           const isGenerating = blockedAt ? Number(tokenAt) > blockedAt : Boolean(tokenAt);
           const res = {

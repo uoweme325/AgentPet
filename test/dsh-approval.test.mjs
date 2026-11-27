@@ -249,6 +249,24 @@ function replay(format) {
   assert.match(monitor.checkDsh(now + 2100)?.task ?? '', /read/, 'rejecting one request leaves the other approval visible');
   append('approval/decided', { id: 'valid', outcome: 'rejected' });
   assert.equal(monitor.checkDsh(now + 4200)?.state, 'thinking', 'rejecting both requests ends approval without a false running state');
+  now += 2100;
+  const oldTime = now;
+  writeProjection(16, { call_skew: oldTime }, {});
+  append('turn/start', { turn: 16 });
+  now += 71000;
+  append('approval/asked', { id: 'ahead', callId: 'call_skew', toolName: 'write' });
+  fs.utimesSync(log, oldTime / 1000, oldTime / 1000);
+  monitor.checkDsh(oldTime + 100);
+  peerWorking(oldTime + 11000);
+  const coldMonitor = new AgentMonitor({ isProbe: true });
+  coldMonitor.paths.dshDirs = [sessions];
+  for (const reader of [monitor, coldMonitor]) {
+    const current = reader.checkDsh(oldTime + 11100);
+    assert.equal(current?.rawId, 'session-peer.json', 'a future approval cannot promote an older thinking session');
+    assert.equal(current.state, 'working');
+    assert.ok(current.sessions.every(s => s.at <= oldTime + 11100), 'no future activity leaks into the session list');
+    assert.equal(reader.checkDsh(now - 2000)?.state, 'approval', 'approval still appears when the clock catches up');
+  }
   console.log('[PASS] DSH approval lifecycle (' + format + ')');
 }
 

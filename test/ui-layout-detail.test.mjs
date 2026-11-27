@@ -50,7 +50,7 @@ function runWpfLayoutAndDetailSuite() {
     );
 
     const uniqueMutex = `Local\\AgentPet_UITest_${process.pid}_${Date.now()}`;
-    ps1Source = ps1Source.replace(/Local\\AgentPet_SingleInstance_Mutex[^"']*/g, uniqueMutex);
+    ps1Source = ps1Source.replaceAll('Local\\AgentPet_SingleInstance_Mutex', uniqueMutex);
 
     const cutIdx = ps1Source.indexOf('$Window.Add_Loaded({');
     assert.ok(cutIdx > 0, 'failed to locate $Window.Add_Loaded cutoff');
